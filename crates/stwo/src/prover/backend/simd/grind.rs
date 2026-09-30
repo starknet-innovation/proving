@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::simd::cmp::SimdPartialOrd;
 use std::simd::num::SimdUint;
 use std::simd::u32x16;
@@ -15,9 +16,13 @@ use crate::core::vcs::blake2_hash::Blake2sHasherGeneric;
 use crate::prover::backend::simd::blake2s::hash_16;
 use crate::prover::backend::simd::m31::{N_LANES, PackedM31};
 
-// Note: GRIND_LOW_BITS is a cap on how much extra time we need to wait for all threads to finish.
-// It must be <= 30 if we want to guarantee that the lowest 32 bits of the nonce are < 2^31 - 1.
+// GRIND_LOW_BITS must be <= 30 if we want to guarantee that the lowest 32 bits of the nonce are
+// < 2^31 - 1.
 const GRIND_LOW_BITS: u32 = 20;
+// Threads take work in units of this many low bits, so once a solution is found no thread keeps
+// grinding a stale unit for long. The nonce found does not depend on it.
+#[cfg(feature = "parallel")]
+const GRIND_UNIT_BITS: u32 = 16;
 
 impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> for SimdBackend {
     /// Outputs the smallest nonce of the form `(a << 32) | b`, where `0 <= a < 2^31 - 1` and
@@ -40,11 +45,18 @@ impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> f
 
         #[cfg(not(feature = "parallel"))]
         let res = (0..)
-            .find_map(|hi| grind_blake::<IS_M31_OUTPUT>(prefixed_digest, hi, pow_bits))
+            .find_map(|hi| {
+                grind_blake::<IS_M31_OUTPUT>(prefixed_digest, hi, 0..1 << GRIND_LOW_BITS, pow_bits)
+            })
             .expect("Grind failed to find a solution.");
 
         #[cfg(feature = "parallel")]
-        let res = parallel_grind(prefixed_digest, pow_bits, grind_blake::<IS_M31_OUTPUT>);
+        let res = parallel_grind(
+            prefixed_digest,
+            pow_bits,
+            GRIND_LOW_BITS,
+            grind_blake::<IS_M31_OUTPUT>,
+        );
 
         assert!(
             ((res >> 32) as u32) < P,
@@ -58,7 +70,12 @@ impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> f
     }
 }
 
-fn grind_blake<const IS_M31_OUTPUT: bool>(digest: &[u32], hi: u32, pow_bits: u32) -> Option<u64> {
+fn grind_blake<const IS_M31_OUTPUT: bool>(
+    digest: &[u32],
+    hi: u32,
+    lows: Range<u32>,
+    pow_bits: u32,
+) -> Option<u64> {
     const DIGEST_SIZE: usize = std::mem::size_of::<[u32; 8]>();
     const NONCE_SIZE: usize = std::mem::size_of::<u64>();
     let zero: u32x16 = u32x16::splat(0);
@@ -67,9 +84,9 @@ fn grind_blake<const IS_M31_OUTPUT: bool>(digest: &[u32], hi: u32, pow_bits: u32
 
     let state: [_; 8] = std::array::from_fn(|i| u32x16::splat(digest[i]));
 
-    let mut attempt_low = offsets_vec;
+    let mut attempt_low = offsets_vec + u32x16::splat(lows.start);
     let attempt_high = u32x16::splat(hi);
-    for low in (0..(1 << GRIND_LOW_BITS)).step_by(N_LANES) {
+    for low in lows.step_by(N_LANES) {
         let msgs = std::array::from_fn(|i| match i {
             0..=7 => state[i],
             8 => attempt_low,
@@ -90,41 +107,38 @@ fn grind_blake<const IS_M31_OUTPUT: bool>(digest: &[u32], hi: u32, pow_bits: u32
 
 // Deterministically finds the smallest nonce that satisfies:
 // `hash(digest, nonce).trailing_zeros() >= pow_bits`.
+// Units of `1 << GRIND_UNIT_BITS` low nonces are handed out in nonce order, so every unit below
+// the first solution is searched, and a thread stops after at most one short unit.
 #[cfg(feature = "parallel")]
-fn parallel_grind<GRIND, DIGEST>(digest: DIGEST, pow_bits: u32, grind: GRIND) -> u64
+fn parallel_grind<GRIND, DIGEST>(digest: DIGEST, pow_bits: u32, low_bits: u32, grind: GRIND) -> u64
 where
-    GRIND: Fn(DIGEST, u32, u32) -> Option<u64> + Send + Sync,
+    GRIND: Fn(DIGEST, u32, Range<u32>, u32) -> Option<u64> + Send + Sync,
     DIGEST: Send + Sync + Copy,
 {
     use core::sync::atomic::Ordering;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::AtomicU64;
 
-    let n_workers = rayon::current_num_threads() as u32;
-    let next_chunk = AtomicU32::new(n_workers);
-    let smallest_good_chunk = AtomicU32::new(u32::MAX);
+    let unit_bits = low_bits.min(GRIND_UNIT_BITS);
+    let log_units_per_hi = low_bits - unit_bits;
+    let n_workers = rayon::current_num_threads() as u64;
+    let next_unit = AtomicU64::new(n_workers);
+    let smallest_good_unit = AtomicU64::new(u64::MAX);
     let found = (0..n_workers)
         .into_par_iter()
         .filter_map(|thread_id| {
-            let mut chunk_id = thread_id;
+            let mut unit = thread_id;
             loop {
-                if let Some(found) = grind(digest, chunk_id, pow_bits) {
-                    // Signal higher chunk handlers to stop.
-                    let current_smallest_chunk = smallest_good_chunk.load(Ordering::Relaxed);
-                    if chunk_id < current_smallest_chunk {
-                        // If fails, it means that another thread found a solution.
-                        // Every thread that found an answer returns it, the results are compared.
-                        let _ = smallest_good_chunk.compare_exchange(
-                            current_smallest_chunk,
-                            chunk_id,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
-                    }
+                let hi = (unit >> log_units_per_hi) as u32;
+                let start = ((unit & ((1 << log_units_per_hi) - 1)) << unit_bits) as u32;
+                if let Some(found) = grind(digest, hi, start..start + (1 << unit_bits), pow_bits) {
+                    // Signal higher units to stop. Every thread that found an answer returns
+                    // it, and the results are compared.
+                    smallest_good_unit.fetch_min(unit, Ordering::Relaxed);
                     return Some(found);
                 }
-                // Assign the next chunk to this thread.
-                chunk_id = next_chunk.fetch_add(1, Ordering::Relaxed);
-                if chunk_id >= smallest_good_chunk.load(Ordering::Relaxed) {
+                // Assign the next unit to this thread.
+                unit = next_unit.fetch_add(1, Ordering::Relaxed);
+                if unit >= smallest_good_unit.load(Ordering::Relaxed) {
                     break;
                 }
             }
@@ -172,11 +186,11 @@ pub mod poseidon252 {
             ]);
             #[cfg(not(feature = "parallel"))]
             let res = (0..)
-                .find_map(|hi| grind_poseidon(prefixed_digest, hi, pow_bits))
+                .find_map(|hi| grind_poseidon(prefixed_digest, hi, 0..1 << GRIND_LOW_BITS, pow_bits))
                 .expect("Grind failed to find a solution.");
 
             #[cfg(feature = "parallel")]
-            let res = parallel_grind(prefixed_digest, pow_bits, grind_poseidon);
+            let res = parallel_grind(prefixed_digest, pow_bits, GRIND_LOW_BITS, grind_poseidon);
 
             assert!(
                 ((res >> 32) as u32) < P,
@@ -186,9 +200,14 @@ pub mod poseidon252 {
         }
     }
 
-    fn grind_poseidon(digest: FieldElement252, chunk_id: u32, pow_bits: u32) -> Option<u64> {
-        for low in 0..(1 << GRIND_LOW_BITS) {
-            let nonce = low | ((chunk_id as u64) << 32);
+    fn grind_poseidon(
+        digest: FieldElement252,
+        chunk_id: u32,
+        lows: Range<u32>,
+        pow_bits: u32,
+    ) -> Option<u64> {
+        for low in lows {
+            let nonce = u64::from(low) | ((chunk_id as u64) << 32);
             let hash = starknet_crypto::poseidon_hash(digest, nonce.into());
             let trailing_zeros =
                 u128::from_be_bytes(hash.to_bytes_be()[16..].try_into().unwrap()).trailing_zeros();
