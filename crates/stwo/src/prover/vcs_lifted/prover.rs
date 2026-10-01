@@ -66,7 +66,9 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             let sorted_columns = columns.into_iter().sorted_by_key(|c| c.len()).collect_vec();
             let max_log_size = sorted_columns.last().unwrap().len().ilog2();
             assert!(lifting_log_size >= max_log_size, "{lifting_log_size} < {max_log_size}");
-            B::build_layers(&sorted_columns, lifting_log_size)
+            // The lowest layers may be left empty; `decommit` recomputes the hashes it needs
+            // from the columns.
+            B::build_layers_sparse(&sorted_columns, lifting_log_size)
         };
         layers.reverse();
 
@@ -112,6 +114,11 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
 
         let mut prev_layer_queries: Vec<usize> =
             query_positions.iter().copied().sorted().dedup().collect();
+        // The lowest layers may not have been materialized by the commitment (see
+        // `MerkleOpsLifted::build_layers_sparse`): the hashes of those layers that the
+        // decommitment reads are recomputed here, from the columns.
+        let n_omitted_layers = self.layers.iter().rev().take_while(|layer| layer.is_empty()).count();
+        let omitted_layers = self.recompute_omitted_layers(&prev_layer_queries, &columns);
         // The largest log size of a layer is equal to `self.layers.len() - 1`. We start iterating
         // from the layer of log size `self.layers.len() - 2` so that we always have a previous
         // layer available for the computation.
@@ -125,22 +132,30 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             // Each layer node is a hash of column values as previous layer hashes.
             // Prepare the previous layer hashes to read from.
             let prev_layer_hashes = self.layers.get(layer_log_size + 1).unwrap();
+            // The height of the previous layer above the leaves.
+            let prev_layer_level = max_log_size - (layer_log_size + 1);
+            let prev_layer_hash_at = |index: usize| {
+                if prev_layer_level < n_omitted_layers {
+                    omitted_layers[prev_layer_level][&index]
+                } else {
+                    prev_layer_hashes.at(index)
+                }
+            };
             // All chunks have either length 1 (only one child is present) or 2 (both children are
             // present).
             for queries_chunk in prev_layer_queries.as_slice().chunk_by(|a, b| a ^ 1 == *b) {
                 let first = queries_chunk[0];
                 // If the brother of `first` was not queried before, add its hash to the witness.
                 if queries_chunk.len() == 1 {
-                    decommitment.hash_witness.push(prev_layer_hashes.at(first ^ 1))
+                    decommitment.hash_witness.push(prev_layer_hash_at(first ^ 1))
                 }
                 let curr_index = first >> 1;
                 curr_layer_queries.push(curr_index);
 
                 // Add the previous layer hashes to all_node_values.
+                all_node_values_for_layer.insert(2 * curr_index, prev_layer_hash_at(2 * curr_index));
                 all_node_values_for_layer
-                    .insert(2 * curr_index, prev_layer_hashes.at(2 * curr_index));
-                all_node_values_for_layer
-                    .insert(2 * curr_index + 1, prev_layer_hashes.at(2 * curr_index + 1));
+                    .insert(2 * curr_index + 1, prev_layer_hash_at(2 * curr_index + 1));
             }
             // Propagate queries to the next layer.
             prev_layer_queries = curr_layer_queries;
@@ -154,6 +169,51 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
                 aux: MerkleDecommitmentLiftedAux { all_node_values },
             },
         )
+    }
+
+    /// Recomputes, for every layer that the commitment left empty (see
+    /// [`MerkleOpsLifted::build_layers_sparse`]), the hashes that the decommitment of the sorted
+    /// and deduplicated `query_positions` reads: both children of every node on a query's path.
+    /// Entry `level` of the result maps the positions of the layer `level` above the leaves.
+    fn recompute_omitted_layers(
+        &self,
+        query_positions: &[usize],
+        columns: &[&Col<B, BaseField>],
+    ) -> Vec<HashMap<usize, H::Hash>> {
+        let n_omitted = self.layers.iter().rev().take_while(|layer| layer.is_empty()).count();
+        if n_omitted == 0 || query_positions.is_empty() {
+            return vec![];
+        }
+        let lifting_log_size = self.layers.len() as u32 - 1;
+        // The leaves that the recomputation starts from: for every query, the aligned block of
+        // `1 << n_omitted` leaves around it, which holds the sibling of every node on the query's
+        // path through the omitted layers.
+        let leaf_positions: Vec<usize> = query_positions
+            .iter()
+            .map(|position| position >> n_omitted)
+            .dedup()
+            .flat_map(|block| (block << n_omitted)..((block + 1) << n_omitted))
+            .collect();
+        // The leaves are hashed from the columns in the order the commitment hashed them.
+        let sorted_columns = columns.iter().copied().sorted_by_key(|c| c.len()).collect_vec();
+        let leaves = B::leaf_hashes_at(&sorted_columns, lifting_log_size, &leaf_positions);
+        let mut layers: Vec<HashMap<usize, H::Hash>> =
+            vec![HashMap::from_iter(leaf_positions.iter().copied().zip(leaves))];
+        for level in 1..n_omitted {
+            let prev = &layers[level - 1];
+            let nodes = prev
+                .keys()
+                .map(|position| position >> 1)
+                .sorted()
+                .dedup()
+                .map(|position| {
+                    let children = (prev[&(2 * position)], prev[&(2 * position + 1)]);
+                    (position, H::hash_children(children))
+                })
+                .collect();
+            layers.push(nodes);
+        }
+        layers
     }
 
     pub fn root(&self) -> H::Hash {

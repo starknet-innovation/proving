@@ -63,4 +63,9 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     fn set(&mut self, index: usize, value: T);
     /// Splits the column into two halves.
     fn split_at_mid(self) -> (Self, Self);
+    /// Shortens the column to `len` elements while keeping its allocation, and returns whether
+    /// it did; a backend that does not support it leaves the column as it was.
+    fn truncate(&mut self, _len: usize) -> bool {
+        false
+    }
 }

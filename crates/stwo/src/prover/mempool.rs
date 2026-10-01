@@ -41,12 +41,35 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
         })
     }
 
-    /// Takes a buffer from the pool, or allocates a new zero-initialized one if none is available.
+    /// Takes a buffer of exactly `1 << log_size` elements from the pool, if one is available.
+    pub fn try_take(&self, log_size: u32) -> Option<Col<B, BaseField>> {
+        self.pools.get_mut(&log_size).and_then(|mut pool| pool.pop())
+    }
+
+    /// Takes a buffer from the pool, or allocates a new uninitialized one if none is available.
+    ///
+    /// Without a buffer of the exact size, the smallest larger idle buffer is shortened to the
+    /// requested size (where the backend supports it): its pages are already resident, which the
+    /// pages of a fresh allocation are not.
     pub fn take_or_alloc(&self, log_size: u32) -> Col<B, BaseField> {
-        self.pools
-            .get_mut(&log_size)
-            .and_then(|mut pool| pool.pop())
-            .unwrap_or_else(|| unsafe { Col::<B, BaseField>::uninitialized(1 << log_size) })
+        if let Some(buffer) = self.try_take(log_size) {
+            return buffer;
+        }
+        let larger = self
+            .pools
+            .iter()
+            .filter(|entry| *entry.key() > log_size && !entry.value().is_empty())
+            .map(|entry| *entry.key())
+            .min();
+        if let Some(larger) = larger {
+            if let Some(mut buffer) = self.try_take(larger) {
+                if buffer.truncate(1 << log_size) {
+                    return buffer;
+                }
+                self.give_back(larger, buffer);
+            }
+        }
+        unsafe { Col::<B, BaseField>::uninitialized(1 << log_size) }
     }
 
     /// Returns a buffer to the pool. The caller is responsible for ensuring the buffer's log_size

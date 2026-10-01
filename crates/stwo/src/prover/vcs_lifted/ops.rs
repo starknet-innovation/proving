@@ -4,7 +4,7 @@ use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
-use crate::prover::backend::{Col, ColumnOps};
+use crate::prover::backend::{Col, Column, ColumnOps};
 
 /// Trait for performing Merkle operations on a commitment scheme.
 pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
@@ -30,6 +30,29 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
             layers.push(Self::build_next_layer(layers.last().unwrap()));
         }
         layers
+    }
+
+    /// Like [`Self::build_layers`], but a backend may leave the lowest layers empty (of length
+    /// 0) instead of materializing them: the prover recomputes the few hashes of those layers
+    /// that a decommitment needs with [`Self::leaf_hashes_at`] and
+    /// [`MerkleHasherLifted::hash_children`]. The layers that are kept are identical to the ones
+    /// [`Self::build_layers`] builds.
+    fn build_layers_sparse(
+        columns: &[&Col<Self, BaseField>],
+        lifting_log_size: u32,
+    ) -> Vec<Col<Self, H::Hash>> {
+        Self::build_layers(columns, lifting_log_size)
+    }
+
+    /// The leaves at `positions` of the tree that [`Self::build_leaves`] builds for `columns`
+    /// (sorted increasingly by length, as for [`Self::build_leaves`]) and `lifting_log_size`.
+    fn leaf_hashes_at(
+        columns: &[&Col<Self, BaseField>],
+        lifting_log_size: u32,
+        positions: &[usize],
+    ) -> Vec<H::Hash> {
+        let leaves = Self::build_leaves(columns, lifting_log_size);
+        positions.iter().map(|&position| leaves.at(position)).collect()
     }
 }
 

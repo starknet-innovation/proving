@@ -1,4 +1,5 @@
 use std::array;
+use std::collections::HashMap;
 use std::simd::u32x16;
 
 use bytemuck::{cast_slice, cast_slice_mut};
@@ -130,11 +131,7 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
         columns: &[&Col<Self, BaseField>],
         lifting_log_size: u32,
     ) -> Vec<Col<Self, Blake2sHash>> {
-        let fusable = !columns.is_empty()
-            && columns.first().unwrap().len() >= N_LANES
-            && lifting_log_size >= LOG_N_LANES + FUSED_LEVELS
-            && columns.last().unwrap().data.len().ilog2() + LOG_N_LANES == lifting_log_size;
-        if !fusable {
+        if !fusable(columns, lifting_log_size) {
             let mut layers = vec![<Self as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
                 columns,
                 lifting_log_size,
@@ -185,6 +182,114 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
         }
         layers
     }
+
+    /// Like [`Self::build_layers`], but the leaves and the first [`FUSED_LEVELS`] inner layers,
+    /// which the tile pass only ever writes, are left empty: a decommitment reads a few dozen
+    /// hashes of them, which [`Self::leaf_hashes_at`] recomputes from the columns. Every stored
+    /// layer is identical to the one [`Self::build_layers`] builds.
+    fn build_layers_sparse(
+        columns: &[&Col<Self, BaseField>],
+        lifting_log_size: u32,
+    ) -> Vec<Col<Self, Blake2sHash>> {
+        if !fusable(columns, lifting_log_size) {
+            return <Self as MerkleOpsLifted<Blake2sMerkleHasher>>::build_layers(
+                columns,
+                lifting_log_size,
+            );
+        }
+        let plan = LeavesPlan::new(columns);
+
+        // Every tile of `TILE` states is reduced to one state of the layer `FUSED_LEVELS`.
+        let mut top: Vec<Blake2sHash> =
+            vec![Blake2sHash::default(); 1 << (lifting_log_size - FUSED_LEVELS)];
+        chunks_mut_iter(&mut top, N_HASHES_PER_SIMD_STATE).enumerate().for_each(
+            |(tile_index, dst)| {
+                let mut states = [INITIAL_STATE; TILE];
+                plan.compute_tile(tile_index * TILE, &mut states);
+                let mut n_states = TILE;
+                while n_states > 1 {
+                    // Hash pairs of states into the states of the next layer.
+                    n_states /= 2;
+                    for k in 0..n_states {
+                        states[k] = hash_state_pair(&states[2 * k], &states[2 * k + 1]);
+                    }
+                }
+                store_states(untranspose_states(states[0]), dst);
+            },
+        );
+
+        let mut layers: Vec<Vec<Blake2sHash>> = (0..FUSED_LEVELS).map(|_| Vec::new()).collect();
+        layers.push(top);
+        for _ in FUSED_LEVELS..lifting_log_size {
+            layers.push(<Self as MerkleOpsLifted<Blake2sMerkleHasher>>::build_next_layer(
+                layers.last().unwrap(),
+            ));
+        }
+        layers
+    }
+
+    /// See [`MerkleOpsLifted::leaf_hashes_at`]: the leaves are recomputed one packed row at a
+    /// time, through every pass, without the full-size state buffers of [`Self::build_leaves`].
+    fn leaf_hashes_at(
+        columns: &[&Col<Self, BaseField>],
+        lifting_log_size: u32,
+        positions: &[usize],
+    ) -> Vec<Blake2sHash> {
+        if columns.is_empty() || columns.first().unwrap().len() < N_LANES {
+            // The shapes that `build_leaves` hands to the CPU backend.
+            let leaves = <Self as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+                columns,
+                lifting_log_size,
+            );
+            return positions.iter().map(|&position| leaves[position]).collect();
+        }
+        let plan = LeavesPlan::new_lazy(columns);
+        // Every state of the largest domain stands for `1 << extra_log_ratio` states of the
+        // lifted domain, as in `build_leaves`.
+        let extra_log_ratio = lifting_log_size - LOG_N_LANES - plan.max_log_size;
+        let state_indices: Vec<usize> = positions
+            .iter()
+            .map(|&position| position >> (LOG_N_LANES + extra_log_ratio))
+            .sorted()
+            .dedup()
+            .collect();
+        let states: HashMap<usize, [u32x16; N_FELTS_IN_BLAKE_STATE]> =
+            parallel_iter!(&state_indices)
+                .map(|&state_index| (state_index, plan.compute_state(state_index)))
+                .collect();
+        positions
+            .iter()
+            .map(|&position| {
+                let lifted_index = position >> LOG_N_LANES;
+                let state_index = lifted_index >> extra_log_ratio;
+                let state = states[&state_index];
+                let lifted: [u32x16; N_FELTS_IN_BLAKE_STATE] =
+                    array::from_fn(|j| to_lifted_simd(state[j], extra_log_ratio, lifted_index));
+                // `store_states` writes the hashes `2k` and `2k + 1` from the `k`-th untransposed
+                // vector.
+                let lane = position % N_HASHES_PER_SIMD_STATE;
+                let words = untranspose_states(lifted)[lane / 2].to_array();
+                let offset = (lane % 2) * N_FELTS_IN_BLAKE_STATE;
+                let mut hash = Blake2sHash::default();
+                for (dst, word) in
+                    hash.0.chunks_exact_mut(N_BYTES_FELT).zip(&words[offset..offset + 8])
+                {
+                    dst.copy_from_slice(&word.to_le_bytes());
+                }
+                hash
+            })
+            .collect()
+    }
+}
+
+/// Whether [`MerkleOpsLifted::build_layers`] can hash `columns` tile by tile: the columns are
+/// large enough for the SIMD leaves, the tree is tall enough for the fused levels, and no lifting
+/// is needed beyond the largest column.
+fn fusable(columns: &[&Col<SimdBackend, BaseField>], lifting_log_size: u32) -> bool {
+    !columns.is_empty()
+        && columns.first().unwrap().len() >= N_LANES
+        && lifting_log_size >= LOG_N_LANES + FUSED_LEVELS
+        && columns.last().unwrap().data.len().ilog2() + LOG_N_LANES == lifting_log_size
 }
 
 /// Number of inner layers that are built together with the leaves by
@@ -246,11 +351,24 @@ struct LeavesPlan<'a> {
     /// States of the last pass over a smaller domain, and the log size of this domain.
     lower_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]>,
     lower_log_size: Option<u32>,
+    /// The passes over a smaller domain than the largest one, in increasing order of log size.
+    lower_passes: Vec<Pass>,
 }
 
 impl<'a> LeavesPlan<'a> {
-    #[allow(clippy::uninit_vec)]
+    /// Plans the passes without computing any state: [`Self::compute_state`] computes the final
+    /// state of a single packed row of the largest domain from scratch.
+    fn new_lazy(columns: &'a [&'a Col<SimdBackend, BaseField>]) -> Self {
+        Self::plan(columns, false)
+    }
+
+    /// Plans the passes and computes the states of the passes over the smaller domains.
     fn new(columns: &'a [&'a Col<SimdBackend, BaseField>]) -> Self {
+        Self::plan(columns, true)
+    }
+
+    #[allow(clippy::uninit_vec)]
+    fn plan(columns: &'a [&'a Col<SimdBackend, BaseField>], compute_lower_states: bool) -> Self {
         // Note that, in this function, all variables that track log sizes
         // refer to the "size" in terms of PackedM31 (e.g. the log size of a column
         // of 4 PackedM31 elements is 2).
@@ -293,7 +411,11 @@ impl<'a> LeavesPlan<'a> {
         let n_lower = passes.iter().take_while(|pass| pass.log_size < max_log_size).count();
         let top_passes = passes.split_off(n_lower);
         let lower_passes = passes;
-        let lower_len = lower_passes.last().map_or(0, |pass| 1usize << pass.log_size);
+        let lower_len = if compute_lower_states {
+            lower_passes.last().map_or(0, |pass| 1usize << pass.log_size)
+        } else {
+            0
+        };
         // We use two buffers to hold the states of the previous and of the current pass. In every
         // iteration, a possibly larger chunk of the buffers is used. This saves memory allocations.
         // Safety: no index in `next_layer_states` and `prev_layer_states` is ever read without
@@ -305,7 +427,7 @@ impl<'a> LeavesPlan<'a> {
 
         // `None` stands for the initial state of the hash.
         let mut prev_log_size: Option<u32> = None;
-        for pass in &lower_passes {
+        for pass in lower_passes.iter().take(if compute_lower_states { usize::MAX } else { 0 }) {
             let log_ratio = pass.log_size - prev_log_size.unwrap_or(0);
             let prev_states: &[[u32x16; N_FELTS_IN_BLAKE_STATE]] = &prev_layer_states;
             let next_states = &mut next_layer_states[0..1 << pass.log_size];
@@ -327,7 +449,37 @@ impl<'a> LeavesPlan<'a> {
             max_log_size,
             lower_states: prev_layer_states,
             lower_log_size: prev_log_size,
+            lower_passes,
         }
+    }
+
+    /// Computes the final state of the packed row `state_index` of the largest domain from
+    /// scratch, through every pass; the lazily planned counterpart of [`Self::compute_tile`].
+    fn compute_state(&self, state_index: usize) -> [u32x16; N_FELTS_IN_BLAKE_STATE] {
+        let mut state = INITIAL_STATE;
+        let mut prev_log_size: Option<u32> = None;
+        for pass in self.lower_passes.iter().chain(&self.top_passes) {
+            let index = state_index >> (self.max_log_size - pass.log_size);
+            if let Some(prev_log_size) = prev_log_size {
+                let log_ratio = pass.log_size - prev_log_size;
+                state = array::from_fn(|j| to_lifted_simd(state[j], log_ratio, index));
+            }
+            hash_pass_tile(self.columns, pass, index, std::slice::from_mut(&mut state));
+            prev_log_size = Some(pass.log_size);
+        }
+        if let Some(prev_log_size) = prev_log_size {
+            let log_ratio = self.max_log_size - prev_log_size;
+            state = array::from_fn(|j| to_lifted_simd(state[j], log_ratio, state_index));
+        }
+        finalize_tile(
+            self.columns,
+            self.last_chunk_index,
+            &self.tail_log_ratios,
+            self.byte_count,
+            state_index,
+            std::slice::from_mut(&mut state),
+        );
+        state
     }
 
     /// Computes the final states `first_state..first_state + tile.len()` of the largest domain.

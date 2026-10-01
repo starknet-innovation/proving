@@ -119,6 +119,15 @@ impl Column<BaseField> for BaseColumn {
             Self { data: second, length: self.length - self.length / 2 },
         )
     }
+
+    fn truncate(&mut self, len: usize) -> bool {
+        if len > self.length {
+            return false;
+        }
+        self.data.truncate(len.div_ceil(N_LANES));
+        self.length = len;
+        true
+    }
 }
 
 impl FromIterator<BaseField> for BaseColumn {
