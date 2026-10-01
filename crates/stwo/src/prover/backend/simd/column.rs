@@ -16,7 +16,7 @@ use super::very_packed_m31::{
     N_VERY_PACKED_ELEMS, VeryPackedBaseField, VeryPackedQM31, VeryPackedSecureField,
 };
 use crate::core::fields::cm31::CM31;
-use crate::core::fields::m31::BaseField;
+use crate::core::fields::m31::{BaseField, P};
 use crate::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use crate::prover::backend::{Column, CpuBackend};
 use crate::prover::secure_column::SecureColumnByCoords;
@@ -98,8 +98,12 @@ impl Column<BaseField> for BaseColumn {
         self.length
     }
 
+    #[inline]
     fn at(&self, index: usize) -> BaseField {
-        self.data[index / N_LANES].to_array()[index % N_LANES]
+        // The scalar form of `self.data[..].to_array()[..]`: `to_array` reduces every lane to
+        // `[0, P)` as `min(x, x - P)`.
+        let x = self.data[index / N_LANES].into_simd()[index % N_LANES];
+        BaseField::from_u32_unchecked(x.min(x.wrapping_sub(P)))
     }
 
     fn set(&mut self, index: usize, value: BaseField) {
@@ -422,6 +426,7 @@ impl VeryPackedSecureColumnByCoordsMutSlice<'_> {
     /// # Safety
     ///
     /// `vec_index` must be a valid index.
+    #[inline]
     pub unsafe fn packed_at(&self, vec_index: usize) -> VeryPackedSecureField {
         VeryPackedQM31::from_very_packed_m31s(std::array::from_fn(|i| {
             *self.0[i].0.get_unchecked(vec_index)
@@ -431,6 +436,7 @@ impl VeryPackedSecureColumnByCoordsMutSlice<'_> {
     /// # Safety
     ///
     /// `vec_index` must be a valid index.
+    #[inline]
     pub unsafe fn set_packed(&mut self, vec_index: usize, value: VeryPackedSecureField) {
         let [a, b, c, d] = value.into_very_packed_m31s();
         *self.0[0].0.get_unchecked_mut(vec_index) = a;

@@ -3,7 +3,7 @@
 
 use std::array;
 use std::mem::transmute;
-use std::simd::u32x16;
+use std::simd::{simd_swizzle, u32x8, u32x16};
 
 use bytemuck::cast_slice;
 use itertools::Itertools;
@@ -355,6 +355,104 @@ pub fn untranspose_states(mut states: [u32x16; 8]) -> [u32x16; 8] {
     states
 }
 
+/// Applies [`u32::rotate_right(N)`] to each element of the 8-lane vector.
+#[inline(always)]
+fn rotate8<const N: u32>(x: u32x8) -> u32x8 {
+    (x >> N) | (x << (u32::BITS - N))
+}
+
+/// One BLAKE2s `G` mixing step on an 8-lane slice of the state.
+#[inline(always)]
+fn g8(v: &mut [u32x8; 16], a: usize, b: usize, c: usize, d: usize, x: u32x8, y: u32x8) {
+    v[a] = v[a] + v[b] + x;
+    v[d] = rotate8::<16>(v[d] ^ v[a]);
+    v[c] += v[d];
+    v[b] = rotate8::<12>(v[b] ^ v[c]);
+    v[a] = v[a] + v[b] + y;
+    v[d] = rotate8::<8>(v[d] ^ v[a]);
+    v[c] += v[d];
+    v[b] = rotate8::<7>(v[b] ^ v[c]);
+}
+
+/// One BLAKE2s round `R` on an 8-lane slice of the state.
+#[inline(always)]
+fn round8<const R: usize>(v: &mut [u32x8; 16], m: &[u32x8; 16]) {
+    let s = &SIGMA[R];
+    g8(v, 0, 4, 8, 12, m[s[0] as usize], m[s[1] as usize]);
+    g8(v, 1, 5, 9, 13, m[s[2] as usize], m[s[3] as usize]);
+    g8(v, 2, 6, 10, 14, m[s[4] as usize], m[s[5] as usize]);
+    g8(v, 3, 7, 11, 15, m[s[6] as usize], m[s[7] as usize]);
+    g8(v, 0, 5, 10, 15, m[s[8] as usize], m[s[9] as usize]);
+    g8(v, 1, 6, 11, 12, m[s[10] as usize], m[s[11] as usize]);
+    g8(v, 2, 7, 8, 13, m[s[12] as usize], m[s[13] as usize]);
+    g8(v, 3, 4, 9, 14, m[s[14] as usize], m[s[15] as usize]);
+}
+
+/// Compresses the low (`HI == false`) or high (`HI == true`) 8 of the 16 BLAKE2s instances.
+///
+/// A full 16-word state of 8-lane vectors exactly fills the 16 AVX2 vector registers, whereas the
+/// 16-lane state needs twice as many and spills on every step. Running the two halves one after
+/// the other keeps each of them in registers; the result is bit-identical.
+#[inline(never)]
+fn compress16_8lane<const HI: bool>(
+    h_vecs: &[u32x16; 8],
+    msg_vecs: &[u32x16; 16],
+    count_low: u32x16,
+    count_high: u32x16,
+    lastblock: u32x16,
+    lastnode: u32x16,
+) -> [u32x8; 8] {
+    let pick = |x: u32x16| -> u32x8 {
+        if HI {
+            simd_swizzle!(x, [8, 9, 10, 11, 12, 13, 14, 15])
+        } else {
+            simd_swizzle!(x, [0, 1, 2, 3, 4, 5, 6, 7])
+        }
+    };
+    let h: [u32x8; 8] = std::array::from_fn(|i| pick(h_vecs[i]));
+    let m: [u32x8; 16] = std::array::from_fn(|i| pick(msg_vecs[i]));
+    let mut v = [
+        h[0],
+        h[1],
+        h[2],
+        h[3],
+        h[4],
+        h[5],
+        h[6],
+        h[7],
+        u32x8::splat(IV[0]),
+        u32x8::splat(IV[1]),
+        u32x8::splat(IV[2]),
+        u32x8::splat(IV[3]),
+        u32x8::splat(IV[4]) ^ pick(count_low),
+        u32x8::splat(IV[5]) ^ pick(count_high),
+        u32x8::splat(IV[6]) ^ pick(lastblock),
+        u32x8::splat(IV[7]) ^ pick(lastnode),
+    ];
+
+    round8::<0>(&mut v, &m);
+    round8::<1>(&mut v, &m);
+    round8::<2>(&mut v, &m);
+    round8::<3>(&mut v, &m);
+    round8::<4>(&mut v, &m);
+    round8::<5>(&mut v, &m);
+    round8::<6>(&mut v, &m);
+    round8::<7>(&mut v, &m);
+    round8::<8>(&mut v, &m);
+    round8::<9>(&mut v, &m);
+
+    [
+        h[0] ^ v[0] ^ v[8],
+        h[1] ^ v[1] ^ v[9],
+        h[2] ^ v[2] ^ v[10],
+        h[3] ^ v[3] ^ v[11],
+        h[4] ^ v[4] ^ v[12],
+        h[5] ^ v[5] ^ v[13],
+        h[6] ^ v[6] ^ v[14],
+        h[7] ^ v[7] ^ v[15],
+    ]
+}
+
 /// Compresses 16 blake2s instances.
 pub fn compress16(
     h_vecs: [u32x16; 8],
@@ -364,46 +462,15 @@ pub fn compress16(
     lastblock: u32x16,
     lastnode: u32x16,
 ) -> [u32x16; 8] {
-    let mut v = [
-        h_vecs[0],
-        h_vecs[1],
-        h_vecs[2],
-        h_vecs[3],
-        h_vecs[4],
-        h_vecs[5],
-        h_vecs[6],
-        h_vecs[7],
-        u32x16::splat(IV[0]),
-        u32x16::splat(IV[1]),
-        u32x16::splat(IV[2]),
-        u32x16::splat(IV[3]),
-        u32x16::splat(IV[4]) ^ count_low,
-        u32x16::splat(IV[5]) ^ count_high,
-        u32x16::splat(IV[6]) ^ lastblock,
-        u32x16::splat(IV[7]) ^ lastnode,
-    ];
-
-    round(&mut v, msg_vecs, 0);
-    round(&mut v, msg_vecs, 1);
-    round(&mut v, msg_vecs, 2);
-    round(&mut v, msg_vecs, 3);
-    round(&mut v, msg_vecs, 4);
-    round(&mut v, msg_vecs, 5);
-    round(&mut v, msg_vecs, 6);
-    round(&mut v, msg_vecs, 7);
-    round(&mut v, msg_vecs, 8);
-    round(&mut v, msg_vecs, 9);
-
-    [
-        h_vecs[0] ^ v[0] ^ v[8],
-        h_vecs[1] ^ v[1] ^ v[9],
-        h_vecs[2] ^ v[2] ^ v[10],
-        h_vecs[3] ^ v[3] ^ v[11],
-        h_vecs[4] ^ v[4] ^ v[12],
-        h_vecs[5] ^ v[5] ^ v[13],
-        h_vecs[6] ^ v[6] ^ v[14],
-        h_vecs[7] ^ v[7] ^ v[15],
-    ]
+    let lo = compress16_8lane::<false>(
+        &h_vecs, &msg_vecs, count_low, count_high, lastblock, lastnode,
+    );
+    let hi = compress16_8lane::<true>(
+        &h_vecs, &msg_vecs, count_low, count_high, lastblock, lastnode,
+    );
+    std::array::from_fn(|i| {
+        simd_swizzle!(lo[i], hi[i], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    })
 }
 
 #[cfg(test)]

@@ -48,10 +48,9 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             return Self { layers: vec![B::build_leaves(&[], lifting_log_size)] };
         }
 
-        let mut layers: Vec<Col<B, H::Hash>> = Vec::new();
-        // We enter this branch only during FRI commit phase, in which we commit 4 columns of the
-        // same size. In particular, we don't need to sort the columns by size.
-        if log_rows_per_leaf > 0 {
+        // We enter the first branch only during FRI commit phase, in which we commit 4 columns of
+        // the same size. In particular, we don't need to sort the columns by size.
+        let mut layers: Vec<Col<B, H::Hash>> = if log_rows_per_leaf > 0 {
             // TODO(Leo): add support for higher log_rows_per_leaf sizes.
             assert_eq!(
                 log_rows_per_leaf, 2,
@@ -62,17 +61,13 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             let packed_columns = B::pack_leaves_input(&columns);
             let max_log_size = packed_columns[0].len().ilog2();
             assert!(lifting_log_size >= max_log_size);
-            layers.push(B::build_leaves(&packed_columns.iter().collect_vec(), lifting_log_size));
+            B::build_layers(&packed_columns.iter().collect_vec(), lifting_log_size)
         } else {
             let sorted_columns = columns.into_iter().sorted_by_key(|c| c.len()).collect_vec();
             let max_log_size = sorted_columns.last().unwrap().len().ilog2();
             assert!(lifting_log_size >= max_log_size, "{lifting_log_size} < {max_log_size}");
-            layers.push(B::build_leaves(&sorted_columns, lifting_log_size));
-        }
-
-        (0..lifting_log_size).for_each(|_| {
-            layers.push(B::build_next_layer(layers.last().unwrap()));
-        });
+            B::build_layers(&sorted_columns, lifting_log_size)
+        };
         layers.reverse();
 
         Self { layers }
