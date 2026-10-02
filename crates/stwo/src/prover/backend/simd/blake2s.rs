@@ -462,12 +462,10 @@ pub fn compress16(
     lastblock: u32x16,
     lastnode: u32x16,
 ) -> [u32x16; 8] {
-    let lo = compress16_8lane::<false>(
-        &h_vecs, &msg_vecs, count_low, count_high, lastblock, lastnode,
-    );
-    let hi = compress16_8lane::<true>(
-        &h_vecs, &msg_vecs, count_low, count_high, lastblock, lastnode,
-    );
+    let lo =
+        compress16_8lane::<false>(&h_vecs, &msg_vecs, count_low, count_high, lastblock, lastnode);
+    let hi =
+        compress16_8lane::<true>(&h_vecs, &msg_vecs, count_low, count_high, lastblock, lastnode);
     std::array::from_fn(|i| {
         simd_swizzle!(lo[i], hi[i], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
     })

@@ -1,5 +1,7 @@
 use std::iter::zip;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use itertools::Itertools;
 use tracing::{Level, span};
 
@@ -105,21 +107,43 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     //
     //   ∑_k (# of distinct sample points per log size k).
     //
-    zip(columns.iter().flatten(), samples_with_randomness.iter().flatten())
-        .sorted_by_key(|(c, _)| c.domain.log_size())
-        .group_by(|(c, _)| c.domain.log_size())
-        .into_iter()
-        .for_each(|(_, tuples)| {
-            let (columns, samples_with_randomness): (Vec<_>, Vec<_>) = tuples.unzip();
-            // TODO: slice.
-            let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
-            B::accumulate_numerators(
-                &columns,
-                &sample_batches,
-                &mut accumulated_numerators_vec,
-                log_blowup_factor,
-            )
-        });
+    // Every (log_size, sample_point) accumulation has its own buffer, so they are computed
+    // concurrently: the small log sizes do not split into enough row chunks to occupy the
+    // threads on their own. The order of the vector is the sequential one.
+    let groups: Vec<(Vec<_>, Vec<ColumnSampleBatch>)> =
+        zip(columns.iter().flatten(), samples_with_randomness.iter().flatten())
+            .sorted_by_key(|(c, _)| c.domain.log_size())
+            .group_by(|(c, _)| c.domain.log_size())
+            .into_iter()
+            .map(|(_, tuples)| {
+                let (columns, samples_with_randomness): (Vec<_>, Vec<_>) = tuples.unzip();
+                // TODO: slice.
+                let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
+                (columns, sample_batches)
+            })
+            .collect();
+    let accumulate_batch = |columns: &[&CircleEvaluation<B, BaseField, BitReversedOrder>],
+                            batch: &ColumnSampleBatch|
+     -> Vec<AccumulatedNumerators<B>> {
+        let mut acc = vec![];
+        B::accumulate_numerators(columns, std::slice::from_ref(batch), &mut acc, log_blowup_factor);
+        acc
+    };
+    #[cfg(feature = "parallel")]
+    let accumulations: Vec<Vec<AccumulatedNumerators<B>>> = groups
+        .par_iter()
+        .flat_map(|(columns, batches)| {
+            batches.par_iter().map(|batch| accumulate_batch(columns, batch))
+        })
+        .collect();
+    #[cfg(not(feature = "parallel"))]
+    let accumulations: Vec<Vec<AccumulatedNumerators<B>>> = groups
+        .iter()
+        .flat_map(|(columns, batches)| {
+            batches.iter().map(|batch| accumulate_batch(columns, batch))
+        })
+        .collect();
+    accumulated_numerators_vec.extend(accumulations.into_iter().flatten());
 
     // Group and accumulate the numerators per sample point: the accumulations (of different
     // lengths) get lifted and accumulated to a single vector. After this step, there is a single

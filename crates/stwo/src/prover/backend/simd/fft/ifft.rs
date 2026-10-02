@@ -53,6 +53,7 @@ pub unsafe fn ifft(values: *mut u32, twiddle_dbl: &[&[u32]], log_n_elements: usi
         &twiddle_dbl[3 + fft_layers_pre_transpose..],
         log_n_elements,
         fft_layers_post_transpose,
+        None,
     );
 }
 
@@ -129,11 +130,15 @@ pub unsafe fn ifft_lower_with_vecwise(
 ///
 /// `values` must have the same alignment as [`PackedBaseField`].
 /// `fft_layers` must be at least 4.
+///
+/// When `scale` is given, every value is multiplied by it after its last layer, while its chunk
+/// is still in cache; the result equals a separate multiplication pass over the whole array.
 pub unsafe fn ifft_lower_without_vecwise(
     values: *mut u32,
     twiddle_dbl: &[&[u32]],
     log_size: usize,
     fft_layers: usize,
+    scale: Option<PackedBaseField>,
 ) {
     assert!(log_size >= LOG_N_LANES as usize);
 
@@ -158,6 +163,13 @@ pub unsafe fn ifft_lower_without_vecwise(
                         index_h,
                     );
                 }
+            }
+        }
+        if let Some(scale) = scale {
+            let chunk = values.add(index_h << (fft_layers + LOG_N_LANES as usize));
+            for i in 0..1 << fft_layers {
+                let ptr = chunk.add(i << LOG_N_LANES as usize);
+                (PackedBaseField::load(ptr) * scale).store(ptr);
             }
         }
     });

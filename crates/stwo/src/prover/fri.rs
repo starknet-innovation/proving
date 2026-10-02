@@ -377,11 +377,8 @@ impl<B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriInnerLayerProver<
         };
         // The returned opened values are not used; see `FriFirstLayerProver::decommit` for why
         // the columns are passed when the leaves are not packed.
-        let columns: Vec<&Col<B, BaseField>> = if self.pack_leaves {
-            vec![]
-        } else {
-            self.evaluation.values.columns.iter().collect()
-        };
+        let columns: Vec<&Col<B, BaseField>> =
+            if self.pack_leaves { vec![] } else { self.evaluation.values.columns.iter().collect() };
         let (_, decommitment) = self.merkle_tree.decommit(&decommitment_positions, columns);
         let commitment = self.merkle_tree.root();
 

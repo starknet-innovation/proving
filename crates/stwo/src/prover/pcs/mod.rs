@@ -290,6 +290,12 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .map(|(v, x)| (v, x.decommitment, x.aux))
             .multiunzip();
 
+        // The FRI input column is no longer needed: its four coordinate buffers go back to the
+        // pool, where the next proof's evaluations of the same size reuse them.
+        for column in quotients.values.columns {
+            self.base_column_pool.give_back(lifting_log_size, column);
+        }
+
         // Return evaluation buffers to the memory pool for reuse (owned trees only).
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {

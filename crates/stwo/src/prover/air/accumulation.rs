@@ -5,6 +5,8 @@
 //!   f(p) = sum_i alpha^{N-1-i} u_i(P).
 
 use itertools::Itertools;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use tracing::{Level, span};
 
 use crate::core::air::Component;
@@ -168,10 +170,17 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
             };
             let twiddles_ref = owned_twiddles.as_ref().unwrap_or(twiddles);
 
-            SecureCirclePoly(eval.columns.map(|c| {
+            // The four coordinate columns are interpolated concurrently: each IFFT is parallel on
+            // its own, but one column at a time leaves most threads idle.
+            let interpolate = |c: Col<B, BaseField>| {
                 CircleEvaluation::<B, BaseField, BitReversedOrder>::new(domain, c)
                     .interpolate_with_twiddles(twiddles_ref)
-            }))
+            };
+            #[cfg(not(feature = "parallel"))]
+            let polys: Vec<_> = eval.columns.into_iter().map(interpolate).collect();
+            #[cfg(feature = "parallel")]
+            let polys: Vec<_> = eval.columns.into_par_iter().map(interpolate).collect();
+            SecureCirclePoly(polys.try_into().unwrap_or_else(|_| unreachable!("four coordinates")))
         } else {
             SecureCirclePoly(std::array::from_fn(|_| {
                 CircleCoefficients::new(Col::<B, BaseField>::zeros(1 << log_size))

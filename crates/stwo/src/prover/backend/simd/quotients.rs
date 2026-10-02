@@ -4,10 +4,12 @@ use std::simd::u64x8;
 use itertools::{Itertools, zip_eq};
 use num_traits::Zero;
 #[cfg(feature = "parallel")]
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 
 use super::SimdBackend;
-use super::column::CM31Column;
+use super::column::{BaseColumn, CM31Column};
 use super::domain::CircleDomainBitRevIterator;
 use super::m31::{LOG_N_LANES, PackedBaseField};
 use super::qm31::PackedSecureField;
@@ -186,15 +188,22 @@ impl QuotientOps for SimdBackend {
                 .itwiddles
                 .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
         };
+        // The four coordinate columns are interpolated and evaluated concurrently: each FFT is
+        // parallel on its own, but one column at a time leaves most threads idle.
+        let extend = |eval: BaseColumn| {
+            let poly = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                eval_subdomain,
+                eval,
+            )
+            .interpolate_with_twiddles(&subdomain_twiddles);
+            poly.evaluate_with_twiddles(eval_domain, twiddles).values
+        };
+        #[cfg(not(feature = "parallel"))]
+        let columns: Vec<BaseColumn> = quotients.columns.into_iter().map(extend).collect();
+        #[cfg(feature = "parallel")]
+        let columns: Vec<BaseColumn> = quotients.columns.into_par_iter().map(extend).collect();
         let evals = SecureColumnByCoords {
-            columns: quotients.columns.map(|eval| {
-                let poly = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
-                    eval_subdomain,
-                    eval,
-                )
-                .interpolate_with_twiddles(&subdomain_twiddles);
-                poly.evaluate_with_twiddles(eval_domain, twiddles).values
-            }),
+            columns: columns.try_into().unwrap_or_else(|_| unreachable!("four coordinates")),
         };
 
         SecureEvaluation::new(eval_domain, evals)
@@ -333,7 +342,8 @@ fn accumulate_numerators_on_subdomain(
                     PackedBaseField::reduce_simd(lanes.into_simd()) + neg_b[k]
                 });
                 unsafe {
-                    values_dst.set_packed(block_start + r, PackedSecureField::from_packed_m31s(coords));
+                    values_dst
+                        .set_packed(block_start + r, PackedSecureField::from_packed_m31s(coords));
                 }
             }
         }

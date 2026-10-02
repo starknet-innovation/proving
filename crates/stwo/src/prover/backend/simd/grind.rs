@@ -50,12 +50,8 @@ impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> f
             .expect("Grind failed to find a solution.");
 
         #[cfg(feature = "parallel")]
-        let res = parallel_grind(
-            prefixed_digest,
-            pow_bits,
-            GRIND_LOW_BITS,
-            grind_blake::<IS_M31_OUTPUT>,
-        );
+        let res =
+            parallel_grind(prefixed_digest, pow_bits, GRIND_LOW_BITS, grind_blake::<IS_M31_OUTPUT>);
 
         assert!(
             ((res >> 32) as u32) < P,
@@ -329,7 +325,9 @@ pub mod poseidon252 {
             ]);
             #[cfg(not(feature = "parallel"))]
             let res = (0..)
-                .find_map(|hi| grind_poseidon(prefixed_digest, hi, 0..1 << GRIND_LOW_BITS, pow_bits))
+                .find_map(|hi| {
+                    grind_poseidon(prefixed_digest, hi, 0..1 << GRIND_LOW_BITS, pow_bits)
+                })
                 .expect("Grind failed to find a solution.");
 
             #[cfg(feature = "parallel")]

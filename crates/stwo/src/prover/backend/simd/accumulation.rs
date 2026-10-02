@@ -1,10 +1,12 @@
-use itertools::{Itertools, zip_eq};
+use itertools::Itertools;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::core::fields::qm31::SecureField;
 use crate::prover::AccumulationOps;
 use crate::prover::backend::CpuBackend;
 use crate::prover::backend::simd::SimdBackend;
-use crate::prover::backend::simd::m31::{LOG_N_LANES, N_LANES, PackedM31};
+use crate::prover::backend::simd::m31::{N_LANES, PackedM31};
 use crate::prover::backend::simd::qm31::PackedSecureField;
 use crate::prover::backend::simd::utils::to_lifted_simd;
 use crate::prover::secure_column::SecureColumnByCoords;
@@ -49,29 +51,40 @@ impl AccumulationOps for SimdBackend {
         let first = cols_iter.next()?;
         assert!(!first.is_empty(), "Columns should be non-empty");
 
+        // Rows are processed by chunks, in parallel when the `parallel` feature is on: every
+        // chunk only reads the smaller accumulation and writes its own rows.
+        const CHUNK_SIZE: usize = 1 << 8;
+
         let mut prev = first;
         for mut col in cols_iter {
             // Perform the lift on the previous accumulation (which is of smaller size) and add it
             // to the current accumulation.
             let log_ratio = col.len().ilog2() - prev.len().ilog2();
-            for i in 0..col.len() >> LOG_N_LANES {
-                unsafe {
-                    let packed_before_lift: [PackedM31; 4] =
-                        prev.packed_at(i >> log_ratio).into_packed_m31s();
-                    let packed_after_lift: [PackedM31; 4] = std::array::from_fn(|j| {
-                        PackedM31::from_simd_unchecked(to_lifted_simd(
-                            packed_before_lift[j].into_simd(),
-                            log_ratio,
-                            i,
-                        ))
-                    });
-                    for (base_column, lift_value) in
-                        zip_eq(col.columns.iter_mut(), packed_after_lift)
-                    {
-                        base_column.data[i] += lift_value;
+            let prev_ref = &prev;
+
+            #[cfg(not(feature = "parallel"))]
+            let chunks = col.chunks_mut(CHUNK_SIZE);
+            #[cfg(feature = "parallel")]
+            let chunks = col.par_chunks_mut(CHUNK_SIZE);
+
+            chunks.enumerate().for_each(|(chunk_index, mut chunk)| {
+                let chunk_len = chunk.0[0].0.len();
+                for k in 0..chunk_len {
+                    let i = chunk_index * CHUNK_SIZE + k;
+                    for (j, base_column) in chunk.0.iter_mut().enumerate() {
+                        let before_lift = prev_ref.columns[j].data[i >> log_ratio].into_simd();
+                        // Safety: lifting only permutes lanes of reduced field elements.
+                        let lift_value = unsafe {
+                            PackedM31::from_simd_unchecked(to_lifted_simd(
+                                before_lift,
+                                log_ratio,
+                                i,
+                            ))
+                        };
+                        base_column.0[k] += lift_value;
                     }
                 }
-            }
+            });
             prev = col;
         }
         Some(prev)

@@ -1,5 +1,7 @@
 use hashbrown::HashMap;
 use itertools::Itertools;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use tracing::{Level, span};
 
 use super::ops::MerkleOpsLifted;
@@ -10,6 +12,7 @@ use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::{
     ExtendedMerkleDecommitmentLifted, MerkleDecommitmentLifted, MerkleDecommitmentLiftedAux,
 };
+use crate::parallel_iter;
 use crate::prover::backend::{Col, Column};
 
 /// Represents the prover side of a Merkle commitment scheme.
@@ -96,28 +99,30 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         columns: Vec<&Col<B, BaseField>>,
     ) -> (ColumnVec<Vec<BaseField>>, ExtendedMerkleDecommitmentLifted<H>) {
         // Prepare output buffers.
-        let mut queried_values: ColumnVec<Vec<BaseField>> = vec![];
         let mut decommitment = MerkleDecommitmentLifted::<H>::default();
         let mut all_node_values: Vec<HashMap<usize, <H as MerkleHasherLifted>::Hash>> = vec![];
 
-        // Compute the queried values.
+        // Compute the queried values: a few random reads per column, done column by column in
+        // parallel.
         let max_log_size = self.layers.len() - 1;
-        for col in columns.iter() {
-            let log_size = col.len().ilog2() as usize;
-            let shift = max_log_size - log_size;
-            let res: Vec<_> = query_positions
-                .iter()
-                .map(|pos| col.at((pos >> (shift + 1) << 1) + (pos & 1)))
-                .collect();
-            queried_values.push(res);
-        }
+        let queried_values: ColumnVec<Vec<BaseField>> = parallel_iter!(&columns)
+            .map(|col| {
+                let log_size = col.len().ilog2() as usize;
+                let shift = max_log_size - log_size;
+                query_positions
+                    .iter()
+                    .map(|pos| col.at((pos >> (shift + 1) << 1) + (pos & 1)))
+                    .collect()
+            })
+            .collect();
 
         let mut prev_layer_queries: Vec<usize> =
             query_positions.iter().copied().sorted().dedup().collect();
         // The lowest layers may not have been materialized by the commitment (see
         // `MerkleOpsLifted::build_layers_sparse`): the hashes of those layers that the
         // decommitment reads are recomputed here, from the columns.
-        let n_omitted_layers = self.layers.iter().rev().take_while(|layer| layer.is_empty()).count();
+        let n_omitted_layers =
+            self.layers.iter().rev().take_while(|layer| layer.is_empty()).count();
         let omitted_layers = self.recompute_omitted_layers(&prev_layer_queries, &columns);
         // The largest log size of a layer is equal to `self.layers.len() - 1`. We start iterating
         // from the layer of log size `self.layers.len() - 2` so that we always have a previous
@@ -153,7 +158,8 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
                 curr_layer_queries.push(curr_index);
 
                 // Add the previous layer hashes to all_node_values.
-                all_node_values_for_layer.insert(2 * curr_index, prev_layer_hash_at(2 * curr_index));
+                all_node_values_for_layer
+                    .insert(2 * curr_index, prev_layer_hash_at(2 * curr_index));
                 all_node_values_for_layer
                     .insert(2 * curr_index + 1, prev_layer_hash_at(2 * curr_index + 1));
             }
