@@ -231,6 +231,15 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Evaluate polynomials on open points.
         let samples = self.compute_samples(&sampled_points, lifting_log_size);
 
+        // Point samples are complete; subsequent quotient and opening paths use evaluations.
+        for tree in &mut self.trees.0 {
+            if let MaybeOwned::Owned(tree) = tree {
+                for poly in &mut tree.polynomials {
+                    drop(poly.coeffs.take());
+                }
+            }
+        }
+
         let sampled_values =
             samples.as_cols_ref().map_cols(|x| x.iter().map(|o| o.value).collect());
         channel.mix_felts(&sampled_values.clone().flatten_cols());
