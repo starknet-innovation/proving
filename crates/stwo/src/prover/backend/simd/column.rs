@@ -21,6 +21,46 @@ use crate::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use crate::prover::backend::{Column, CpuBackend};
 use crate::prover::secure_column::SecureColumnByCoords;
 
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn madvise(
+        addr: *mut core::ffi::c_void,
+        length: usize,
+        advice: core::ffi::c_int,
+    ) -> core::ffi::c_int;
+}
+
+/// Advises the kernel about a large buffer: `MADV_HUGEPAGE` on the whole pages it covers, so that
+/// transparent huge pages back it where the kernel allows them, and with `populate` also
+/// `MADV_POPULATE_WRITE`, which maps all of its pages in one call instead of one fault per page.
+/// Hints only: a no-op off Linux, for buffers below 2 MiB, and when the kernel declines.
+pub(crate) fn advise_pages<T>(data: &[T], populate: bool) {
+    #[cfg(target_os = "linux")]
+    {
+        const MADV_HUGEPAGE: core::ffi::c_int = 14;
+        const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
+        const PAGE: usize = 4096;
+        let bytes = std::mem::size_of_val(data);
+        if bytes < 1 << 21 {
+            return;
+        }
+        let start = (data.as_ptr() as usize + PAGE - 1) & !(PAGE - 1);
+        let end = (data.as_ptr() as usize + bytes) & !(PAGE - 1);
+        if end > start {
+            unsafe {
+                madvise(start as *mut core::ffi::c_void, end - start, MADV_HUGEPAGE);
+                if populate {
+                    madvise(start as *mut core::ffi::c_void, end - start, MADV_POPULATE_WRITE);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (data, populate);
+    }
+}
+
 /// An efficient structure for storing and operating on a arbitrary number of [`BaseField`] values.
 #[derive(Clone, Debug)]
 pub struct BaseColumn {
@@ -74,12 +114,11 @@ impl BaseColumn {
     }
 }
 
-unsafe impl Send for BaseColumn {}
-unsafe impl Sync for BaseColumn {}
 
 impl Column<BaseField> for BaseColumn {
     fn zeros(length: usize) -> Self {
         let data = vec![PackedBaseField::zeroed(); length.div_ceil(N_LANES)];
+        advise_pages(&data, false);
         Self { data, length }
     }
 
@@ -87,6 +126,7 @@ impl Column<BaseField> for BaseColumn {
     unsafe fn uninitialized(length: usize) -> Self {
         let mut data = Vec::with_capacity(length.div_ceil(N_LANES));
         data.set_len(length.div_ceil(N_LANES));
+        advise_pages(&data, false);
         Self { data, length }
     }
 
@@ -128,6 +168,19 @@ impl Column<BaseField> for BaseColumn {
         self.length = len;
         true
     }
+
+    #[allow(clippy::uninit_vec)]
+    fn grow(&mut self, len: usize) -> bool {
+        let n_vecs = len.div_ceil(N_LANES);
+        if len < self.length || n_vecs > self.data.capacity() {
+            return false;
+        }
+        // The new elements are left uninitialized, as by `uninitialized`: the caller writes them
+        // before reading them.
+        unsafe { self.data.set_len(n_vecs) };
+        self.length = len;
+        true
+    }
 }
 
 impl FromIterator<BaseField> for BaseColumn {
@@ -158,8 +211,6 @@ pub struct CM31Column {
     pub length: usize,
 }
 
-unsafe impl Send for CM31Column {}
-unsafe impl Sync for CM31Column {}
 
 impl Column<CM31> for CM31Column {
     fn zeros(length: usize) -> Self {
@@ -278,8 +329,6 @@ impl SecureColumn {
     }
 }
 
-unsafe impl Send for SecureColumn {}
-unsafe impl Sync for SecureColumn {}
 
 impl Column<SecureField> for SecureColumn {
     fn zeros(length: usize) -> Self {

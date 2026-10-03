@@ -3,6 +3,8 @@
 //! The [`BaseColumnPool`] manages reusable [`Col<B, BaseField>`] buffers for polynomial evaluation,
 //! avoiding repeated allocation/deallocation of large column buffers during proving.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use dashmap::DashMap;
 
 use crate::core::fields::m31::BaseField;
@@ -14,12 +16,15 @@ use crate::prover::backend::{Col, Column, ColumnOps};
 pub struct BaseColumnPool<B: ColumnOps<BaseField>> {
     /// Map from log_size -> stack of available buffers.
     pools: DashMap<u32, Vec<Col<B, BaseField>>>,
+    /// The largest log size requested so far: fresh buffers of nearly that size are allocated
+    /// with room to grow to the next size, so that later larger requests can reuse them.
+    largest_log_size: AtomicU32,
 }
 
 impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
     /// Creates a new empty base column pool.
     pub fn new() -> Self {
-        Self { pools: DashMap::new() }
+        Self { pools: DashMap::new(), largest_log_size: AtomicU32::new(0) }
     }
 
     /// Pre-allocates `count` zero-initialized buffers of size `1 << log_size`.
@@ -52,6 +57,7 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
     /// requested size (where the backend supports it): its pages are already resident, which the
     /// pages of a fresh allocation are not.
     pub fn take_or_alloc(&self, log_size: u32) -> Col<B, BaseField> {
+        let largest = self.largest_log_size.fetch_max(log_size, Ordering::Relaxed).max(log_size);
         if let Some(buffer) = self.try_take(log_size) {
             return buffer;
         }
@@ -69,7 +75,28 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
                 self.give_back(larger, buffer);
             }
         }
-        unsafe { Col::<B, BaseField>::uninitialized(1 << log_size) }
+        // A smaller idle buffer allocated with room to grow (see below), or shortened from a
+        // larger one, is grown back: its pages are resident or reserved, and nothing is copied.
+        for smaller in (log_size.saturating_sub(3)..log_size).rev() {
+            if let Some(mut pool) = self.pools.get_mut(&smaller) {
+                for i in 0..pool.len() {
+                    if pool[i].grow(1 << log_size) {
+                        return pool.swap_remove(i);
+                    }
+                }
+            }
+        }
+        // Fresh buffers close to the largest size seen are allocated with room for the next
+        // size: the capacity is only reserved, its pages are not touched before they are used.
+        let capacity_log_size =
+            if log_size + 3 >= largest { (log_size + 1).min(largest) } else { log_size };
+        unsafe {
+            let mut buffer = Col::<B, BaseField>::uninitialized(1 << capacity_log_size);
+            if capacity_log_size > log_size && !buffer.truncate(1 << log_size) {
+                buffer = Col::<B, BaseField>::uninitialized(1 << log_size);
+            }
+            buffer
+        }
     }
 
     /// Returns a buffer to the pool. The caller is responsible for ensuring the buffer's log_size

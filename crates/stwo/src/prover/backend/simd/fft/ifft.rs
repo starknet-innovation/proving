@@ -1,5 +1,6 @@
 //! Inverse fft.
 
+use std::cell::RefCell;
 use std::simd::{simd_swizzle, u32x2, u32x4, u32x16};
 
 use itertools::Itertools;
@@ -13,7 +14,7 @@ use crate::core::circle::Coset;
 use crate::core::utils::bit_reverse;
 use crate::parallel_iter;
 use crate::prover::backend::simd::m31::{LOG_N_LANES, PackedBaseField};
-use crate::prover::backend::simd::utils::UnsafeMut;
+use crate::prover::backend::simd::utils::{UnsafeConst, UnsafeMut};
 
 /// Performs an Inverse Circle Fast Fourier Transform (ICFFT) on the given values.
 ///
@@ -89,17 +90,33 @@ pub unsafe fn ifft_lower_with_vecwise(
     let values = UnsafeMut(values);
     parallel_iter!(0..1 << (log_size - fft_layers)).for_each(|index_h| {
         let values = values.get();
-        ifft_vecwise_loop(values, twiddle_dbl, fft_layers - VECWISE_FFT_BITS, index_h);
+        let loop_bits = fft_layers - VECWISE_FFT_BITS;
+        for index_l in 0..1 << loop_bits {
+            let index = (index_h << loop_bits) + index_l;
+            let mut val0 = PackedBaseField::load(values.add(index * 32).cast_const());
+            let mut val1 = PackedBaseField::load(values.add(index * 32 + 16).cast_const());
+            (val0, val1) = vecwise_ibutterflies(
+                val0,
+                val1,
+                std::array::from_fn(|i| *twiddle_dbl[0].get_unchecked(index * 8 + i)),
+                std::array::from_fn(|i| *twiddle_dbl[1].get_unchecked(index * 4 + i)),
+                std::array::from_fn(|i| *twiddle_dbl[2].get_unchecked(index * 2 + i)),
+            );
+            (val0, val1) =
+                simd_ibutterfly(val0, val1, u32x16::splat(*twiddle_dbl[3].get_unchecked(index)));
+            val0.store(values.add(index * 32));
+            val1.store(values.add(index * 32 + 16));
+        }
         for layer in (VECWISE_FFT_BITS..fft_layers).step_by(3) {
             match fft_layers - layer {
                 1 => {
-                    ifft1_loop(values, &twiddle_dbl[(layer - 1)..], layer, index_h);
+                    ifft1_loop::<false>(values, &twiddle_dbl[(layer - 1)..], layer, index_h);
                 }
                 2 => {
-                    ifft2_loop(values, &twiddle_dbl[(layer - 1)..], layer, index_h);
+                    ifft2_loop::<false>(values, &twiddle_dbl[(layer - 1)..], layer, index_h);
                 }
                 _ => {
-                    ifft3_loop(
+                    ifft3_loop::<false>(
                         values,
                         &twiddle_dbl[(layer - 1)..],
                         fft_layers - layer - 3,
@@ -149,13 +166,13 @@ pub unsafe fn ifft_lower_without_vecwise(
             let fixed_layer = layer + LOG_N_LANES as usize;
             match fft_layers - layer {
                 1 => {
-                    ifft1_loop(values, &twiddle_dbl[layer..], fixed_layer, index_h);
+                    ifft1_loop::<false>(values, &twiddle_dbl[layer..], fixed_layer, index_h);
                 }
                 2 => {
-                    ifft2_loop(values, &twiddle_dbl[layer..], fixed_layer, index_h);
+                    ifft2_loop::<false>(values, &twiddle_dbl[layer..], fixed_layer, index_h);
                 }
                 _ => {
-                    ifft3_loop(
+                    ifft3_loop::<false>(
                         values,
                         &twiddle_dbl[layer..],
                         fft_layers - layer - 3,
@@ -175,40 +192,144 @@ pub unsafe fn ifft_lower_without_vecwise(
     });
 }
 
-/// Runs the first 5 ifft layers across the entire array.
+/// The log of the size in bytes of the thread local buffer in which [`ifft_out_of_place`]
+/// computes a group of neighbouring blocks.
+const IFFT_SCRATCH_LOG_BYTES: usize = 17;
+/// The log of the number of elements in a 4 KiB page.
+const LOG_PAGE_ELEMENTS: usize = 10;
+/// The log of the number of pages touched by one task of [`ifft_out_of_place`] before the ifft.
+const LOG_PREFAULT_PAGES: usize = 5;
+
+thread_local! {
+    static IFFT_SCRATCH: RefCell<Vec<u32x16>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Computes [`ifft`] of `src` into `dst`, multiplying every result by `scale`: the result equals
+/// `ifft(dst)` after copying `src` to `dst`, followed by the multiplication.
 ///
-/// # Arguments
+/// The first pass (the vecwise layers and the layers below the transposition) and the
+/// transposition are fused: a group of neighbouring blocks is read from `src`, transformed in a
+/// thread local buffer, and stored to its transposed place in `dst` in contiguous runs. The last
+/// pass runs in place on `dst`, and applies `scale` while each chunk is in cache.
 ///
-/// - `values`: Pointer to the entire value array, aligned to 64 bytes.
-/// - `twiddle_dbl`: The doubles of the twiddle factors for each of the 5 ifft layers.
-/// - `high_bits`: The number of bits this loops needs to run on.
-/// - `index_h`: The higher part of the index, iterated by the caller.
+/// # Panics
+///
+/// Panics if `log_n_elements` is not larger than `CACHED_FFT_LOG_SIZE`.
 ///
 /// # Safety
 ///
-/// Behavior is undefined if `values` does not have the same alignment as [`PackedBaseField`].
-pub unsafe fn ifft_vecwise_loop(
-    values: *mut u32,
+/// Behavior is undefined if `src` and `dst` do not have the same alignment as
+/// [`PackedBaseField`], if they overlap, or if either has fewer than `1 << log_n_elements`
+/// elements.
+pub unsafe fn ifft_out_of_place(
+    src: *const u32,
+    dst: *mut u32,
     twiddle_dbl: &[&[u32]],
-    loop_bits: usize,
-    index_h: usize,
+    log_n_elements: usize,
+    scale: PackedBaseField,
 ) {
-    for index_l in 0..1 << loop_bits {
-        let index = (index_h << loop_bits) + index_l;
-        let mut val0 = PackedBaseField::load(values.add(index * 32).cast_const());
-        let mut val1 = PackedBaseField::load(values.add(index * 32 + 16).cast_const());
-        (val0, val1) = vecwise_ibutterflies(
-            val0,
-            val1,
-            std::array::from_fn(|i| *twiddle_dbl[0].get_unchecked(index * 8 + i)),
-            std::array::from_fn(|i| *twiddle_dbl[1].get_unchecked(index * 4 + i)),
-            std::array::from_fn(|i| *twiddle_dbl[2].get_unchecked(index * 2 + i)),
-        );
-        (val0, val1) =
-            simd_ibutterfly(val0, val1, u32x16::splat(*twiddle_dbl[3].get_unchecked(index)));
-        val0.store(values.add(index * 32));
-        val1.store(values.add(index * 32 + 16));
-    }
+    const VECWISE_FFT_BITS: usize = LOG_N_LANES as usize + 1;
+    assert!(log_n_elements > CACHED_FFT_LOG_SIZE as usize);
+
+    // As in `transpose_vecs`: a vector index is (a, b, c) with |a| = |c| = post and |b| = 0 or 1.
+    // The first pass acts on the blocks of fixed `a`, and the transposition moves the vector
+    // (a, b, c) to the place (c, b, a).
+    let log_n_vecs = log_n_elements - LOG_N_LANES as usize;
+    let post = log_n_vecs / 2;
+    let pre = log_n_vecs - post;
+    let fft_layers = pre + LOG_N_LANES as usize;
+    let block_vecs = 1usize << pre;
+    let block_elems = block_vecs << LOG_N_LANES;
+    let group_log = IFFT_SCRATCH_LOG_BYTES.saturating_sub(pre + 6).clamp(1, 4).min(post);
+    let group_size = 1usize << group_log;
+    let n_tasks = 1usize << (post - group_log);
+    let first_twiddles = &twiddle_dbl[..3 + pre];
+    assert_eq!(first_twiddles[0].len(), 1 << (log_n_elements - 2));
+
+    let src = UnsafeConst(src);
+    let dst = UnsafeMut(dst);
+
+    // The stores of the first pass reach each page of `dst` from several tasks at about the same
+    // time; if the page is not mapped yet, each of them would take a page fault for it.
+    let log_chunk = LOG_PAGE_ELEMENTS + LOG_PREFAULT_PAGES;
+    parallel_iter!(0..1usize << (log_n_elements - log_chunk)).for_each(|chunk| {
+        let dst = dst.get();
+        let first = chunk << log_chunk;
+        for page in 0..1usize << LOG_PREFAULT_PAGES {
+            dst.add(first + (page << LOG_PAGE_ELEMENTS)).write(0);
+        }
+    });
+
+    parallel_iter!(0..n_tasks).for_each(|task| {
+        let src = src.get();
+        let dst = dst.get();
+        let a0 = task << group_log;
+        IFFT_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            if scratch.len() < group_size * block_vecs {
+                scratch.resize(group_size * block_vecs, u32x16::splat(0));
+            }
+            let scr = scratch.as_mut_ptr() as *mut u32;
+            for i in 0..group_size {
+                // The block `a` of the first pass: the layers of `ifft_lower_with_vecwise`, read
+                // from `src` and computed in the scratch buffer.
+                let index_h = a0 + i;
+                let from = src.add(index_h * block_elems);
+                let to = scr.add(i * block_elems);
+                let loop_bits = fft_layers - VECWISE_FFT_BITS;
+                for index_l in 0..1 << loop_bits {
+                    let index = (index_h << loop_bits) + index_l;
+                    let mut val0 = PackedBaseField::load(from.add(index_l * 32));
+                    let mut val1 = PackedBaseField::load(from.add(index_l * 32 + 16));
+                    (val0, val1) = vecwise_ibutterflies(
+                        val0,
+                        val1,
+                        std::array::from_fn(|i| *first_twiddles[0].get_unchecked(index * 8 + i)),
+                        std::array::from_fn(|i| *first_twiddles[1].get_unchecked(index * 4 + i)),
+                        std::array::from_fn(|i| *first_twiddles[2].get_unchecked(index * 2 + i)),
+                    );
+                    (val0, val1) = simd_ibutterfly(
+                        val0,
+                        val1,
+                        u32x16::splat(*first_twiddles[3].get_unchecked(index)),
+                    );
+                    val0.store(to.add(index_l * 32));
+                    val1.store(to.add(index_l * 32 + 16));
+                }
+                for layer in (VECWISE_FFT_BITS..fft_layers).step_by(3) {
+                    match fft_layers - layer {
+                        1 => ifft1_loop::<true>(to, &first_twiddles[(layer - 1)..], layer, index_h),
+                        2 => ifft2_loop::<true>(to, &first_twiddles[(layer - 1)..], layer, index_h),
+                        _ => ifft3_loop::<true>(
+                            to,
+                            &first_twiddles[(layer - 1)..],
+                            fft_layers - layer - 3,
+                            layer,
+                            index_h,
+                        ),
+                    }
+                }
+            }
+            // The vector (b, c) of the block `a0 + i` goes to the place (c, b, a0 + i).
+            for bc in 0..block_vecs {
+                let b = bc >> post;
+                let c = bc & ((1 << post) - 1);
+                let out = dst.add(((c << pre) | (b << post) | a0) << LOG_N_LANES);
+                for i in 0..group_size {
+                    PackedBaseField::load(scr.add(i * block_elems + (bc << LOG_N_LANES)))
+                        .store(out.add(i << LOG_N_LANES));
+                }
+            }
+        });
+    });
+
+    ifft_lower_without_vecwise(
+        dst.get(),
+        &twiddle_dbl[3 + pre..],
+        log_n_elements,
+        post,
+        Some(scale),
+    );
 }
 
 /// Runs 3 ifft layers across the entire array.
@@ -225,7 +346,7 @@ pub unsafe fn ifft_vecwise_loop(
 /// # Safety
 ///
 /// Behavior is undefined if `values` does not have the same alignment as [`PackedBaseField`].
-pub unsafe fn ifft3_loop(
+pub unsafe fn ifft3_loop<const LOCAL: bool>(
     values: *mut u32,
     twiddle_dbl: &[&[u32]],
     loop_bits: usize,
@@ -234,7 +355,7 @@ pub unsafe fn ifft3_loop(
 ) {
     for index_l in 0..1 << loop_bits {
         let index = (index_h << loop_bits) + index_l;
-        let offset = index << (layer + 3);
+        let offset = if LOCAL { index_l << (layer + 3) } else { index << (layer + 3) };
         let twiddles0: [u32x16; 4] = std::array::from_fn(|i| {
             u32x16::splat(
                 *twiddle_dbl[0].get_unchecked((index * 4 + i) & (twiddle_dbl[0].len() - 1)),
@@ -268,8 +389,8 @@ pub unsafe fn ifft3_loop(
 /// # Safety
 ///
 /// Behavior is undefined if `values` does not have the same alignment as [`PackedBaseField`].
-unsafe fn ifft2_loop(values: *mut u32, twiddle_dbl: &[&[u32]], layer: usize, index: usize) {
-    let offset = index << (layer + 2);
+unsafe fn ifft2_loop<const LOCAL: bool>(values: *mut u32, twiddle_dbl: &[&[u32]], layer: usize, index: usize) {
+    let offset = if LOCAL { 0 } else { index << (layer + 2) };
     let twiddles0: [u32x16; 2] = std::array::from_fn(|i| {
         u32x16::splat(*twiddle_dbl[0].get_unchecked((index * 2 + i) & (twiddle_dbl[0].len() - 1)))
     });
@@ -293,8 +414,8 @@ unsafe fn ifft2_loop(values: *mut u32, twiddle_dbl: &[&[u32]], layer: usize, ind
 /// # Safety
 ///
 /// Behavior is undefined if `values` does not have the same alignment as [`PackedBaseField`].
-unsafe fn ifft1_loop(values: *mut u32, twiddle_dbl: &[&[u32]], layer: usize, index: usize) {
-    let offset = index << (layer + 1);
+unsafe fn ifft1_loop<const LOCAL: bool>(values: *mut u32, twiddle_dbl: &[&[u32]], layer: usize, index: usize) {
+    let offset = if LOCAL { 0 } else { index << (layer + 1) };
     let twiddles0: [u32x16; 1] = std::array::from_fn(|i| {
         u32x16::splat(*twiddle_dbl[0].get_unchecked((index + i) & (twiddle_dbl[0].len() - 1)))
     });

@@ -198,7 +198,7 @@ pub unsafe fn fft_lower_without_vecwise(
 
 /// The log of the size in bytes of the thread local buffer in which [`fft_subdomains`] computes a
 /// group of neighbouring blocks.
-const SCATTER_SCRATCH_LOG_BYTES: usize = 17;
+const SCATTER_SCRATCH_LOG_BYTES: usize = 16;
 /// The log of the number of elements in a 4 KiB page.
 const LOG_PAGE_ELEMENTS: usize = 10;
 /// The log of the number of pages touched by one task of [`fft_subdomains`] before the fft.

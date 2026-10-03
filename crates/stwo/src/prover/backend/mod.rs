@@ -68,4 +68,11 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     fn truncate(&mut self, _len: usize) -> bool {
         false
     }
+    /// Lengthens the column to `len` elements within its existing allocation, the new elements
+    /// being uninitialized as after [`Self::uninitialized`] (the caller writes them before reading
+    /// them), and returns whether it did; a backend that does not support it leaves the column as
+    /// it was.
+    fn grow(&mut self, _len: usize) -> bool {
+        false
+    }
 }

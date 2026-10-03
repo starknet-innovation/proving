@@ -39,6 +39,30 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         iter.map(|eval| eval.interpolate_with_twiddles(twiddles)).collect()
     }
 
+    /// [`Self::interpolate`] with the buffers of `pool` where the backend supports it: the
+    /// coefficients may be written to a buffer of the pool, and the evaluation buffer given back.
+    fn interpolate_pooled(
+        eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,
+        itwiddles: &TwiddleTree<Self>,
+        _pool: &BaseColumnPool<Self>,
+    ) -> CircleCoefficients<Self> {
+        Self::interpolate(eval, itwiddles)
+    }
+
+    /// [`Self::interpolate_columns`] through [`Self::interpolate_pooled`].
+    fn interpolate_columns_pooled(
+        columns: Vec<CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        twiddles: &TwiddleTree<Self>,
+        pool: &BaseColumnPool<Self>,
+    ) -> Vec<CircleCoefficients<Self>> {
+        #[cfg(feature = "parallel")]
+        let iter = columns.into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = columns.into_iter();
+
+        iter.map(|eval| Self::interpolate_pooled(eval, twiddles, pool)).collect()
+    }
+
     /// Evaluates the polynomial at a single point.
     /// Used by the [`CircleCoefficients::eval_at_point()`] function.
     fn eval_at_point(
