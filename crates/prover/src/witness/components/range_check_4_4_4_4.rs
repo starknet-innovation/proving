@@ -56,8 +56,7 @@ impl AddInputs for ClaimGenerator {
         });
     }
     fn add_input(&self, input: &InputType, relation_index: usize) {
-        self.mults[relation_index]
-            .increase_at(self.input_to_row.row(input).try_into().unwrap());
+        self.mults[relation_index].increase_at(self.input_to_row.row(input).try_into().unwrap());
     }
 }
 

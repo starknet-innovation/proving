@@ -60,6 +60,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         twiddles: &'a TwiddleTree<B>,
         base_column_pool: &'a BaseColumnPool<B>,
     ) -> Self {
+        base_column_pool.release_small_idle();
         CommitmentSchemeProver {
             trees: TreeVec::default(),
             config,

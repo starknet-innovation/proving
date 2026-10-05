@@ -70,6 +70,9 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
         if let Some(larger) = larger {
             if let Some(mut buffer) = self.try_take(larger) {
                 if buffer.truncate(1 << log_size) {
+                    // The tail of a larger buffer was resident; give those pages back to the
+                    // kernel instead of carrying them through the rest of the proof.
+                    buffer.release_spare();
                     return buffer;
                 }
                 self.give_back(larger, buffer);
@@ -96,6 +99,23 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
                 buffer = Col::<B, BaseField>::uninitialized(1 << log_size);
             }
             buffer
+        }
+    }
+
+    /// Drops the idle buffers that are more than two log sizes below the largest size requested
+    /// so far, and keeps the larger ones.
+    ///
+    /// Called when a proof starts on a pool another proof has filled: the large buffers are the
+    /// ones worth keeping resident, since the new proof's largest columns take them as they are
+    /// or grow into them, while the many small and mid-size ones hold gigabytes that it rarely
+    /// asks for and that are cheap to allocate again.
+    pub fn release_small_idle(&self) {
+        let largest = self.largest_log_size.load(Ordering::Relaxed);
+        let keep_from = largest.saturating_sub(2);
+        for mut entry in self.pools.iter_mut() {
+            if *entry.key() < keep_from {
+                entry.value_mut().clear();
+            }
         }
     }
 

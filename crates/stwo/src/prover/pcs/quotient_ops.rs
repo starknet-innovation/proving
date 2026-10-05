@@ -1,8 +1,8 @@
 use std::iter::zip;
 
+use itertools::Itertools;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use itertools::Itertools;
 use tracing::{Level, span};
 
 use crate::core::circle::CirclePoint;
@@ -139,9 +139,7 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     #[cfg(not(feature = "parallel"))]
     let accumulations: Vec<Vec<AccumulatedNumerators<B>>> = groups
         .iter()
-        .flat_map(|(columns, batches)| {
-            batches.iter().map(|batch| accumulate_batch(columns, batch))
-        })
+        .flat_map(|(columns, batches)| batches.iter().map(|batch| accumulate_batch(columns, batch)))
         .collect();
     accumulated_numerators_vec.extend(accumulations.into_iter().flatten());
 

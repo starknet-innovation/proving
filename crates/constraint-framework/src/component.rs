@@ -16,6 +16,7 @@ use stwo::core::pcs::{TreeSubspan, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::all_unique;
 
+use super::info::LogupCountPerRow;
 use super::preprocessed_columns::PreProcessedColumnId;
 use super::{EvalAtRow, InfoEvaluator, PREPROCESSED_TRACE_IDX, PointEvaluator};
 
@@ -108,7 +109,22 @@ pub struct FrameworkComponent<C: FrameworkEval> {
     pub(super) trace_locations: TreeVec<TreeSubspan>,
     pub(super) preprocessed_column_indices: Vec<usize>,
     pub(super) claimed_sum: SecureField,
-    info: InfoEvaluator,
+    info: ComponentInfo,
+}
+
+/// What the component keeps of its [`InfoEvaluator`] pass: plain data, so that the component can
+/// be shared between threads (the evaluator itself holds reference-counted operation counters).
+struct ComponentInfo {
+    mask_offsets: TreeVec<Vec<Vec<isize>>>,
+    n_constraints: usize,
+    logup_counts: LogupCountPerRow,
+}
+
+impl From<InfoEvaluator> for ComponentInfo {
+    fn from(info: InfoEvaluator) -> Self {
+        let InfoEvaluator { mask_offsets, n_constraints, logup_counts, .. } = info;
+        Self { mask_offsets, n_constraints, logup_counts }
+    }
 }
 
 impl<E: FrameworkEval> FrameworkComponent<E> {
@@ -141,7 +157,7 @@ impl<E: FrameworkEval> FrameworkComponent<E> {
                 }
             })
             .collect();
-        Self { eval, trace_locations, info, preprocessed_column_indices, claimed_sum }
+        Self { eval, trace_locations, info: info.into(), preprocessed_column_indices, claimed_sum }
     }
 
     pub fn trace_locations(&self) -> &[TreeSubspan] {

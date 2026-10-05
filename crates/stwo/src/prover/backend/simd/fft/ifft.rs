@@ -389,7 +389,12 @@ pub unsafe fn ifft3_loop<const LOCAL: bool>(
 /// # Safety
 ///
 /// Behavior is undefined if `values` does not have the same alignment as [`PackedBaseField`].
-unsafe fn ifft2_loop<const LOCAL: bool>(values: *mut u32, twiddle_dbl: &[&[u32]], layer: usize, index: usize) {
+unsafe fn ifft2_loop<const LOCAL: bool>(
+    values: *mut u32,
+    twiddle_dbl: &[&[u32]],
+    layer: usize,
+    index: usize,
+) {
     let offset = if LOCAL { 0 } else { index << (layer + 2) };
     let twiddles0: [u32x16; 2] = std::array::from_fn(|i| {
         u32x16::splat(*twiddle_dbl[0].get_unchecked((index * 2 + i) & (twiddle_dbl[0].len() - 1)))
@@ -414,7 +419,12 @@ unsafe fn ifft2_loop<const LOCAL: bool>(values: *mut u32, twiddle_dbl: &[&[u32]]
 /// # Safety
 ///
 /// Behavior is undefined if `values` does not have the same alignment as [`PackedBaseField`].
-unsafe fn ifft1_loop<const LOCAL: bool>(values: *mut u32, twiddle_dbl: &[&[u32]], layer: usize, index: usize) {
+unsafe fn ifft1_loop<const LOCAL: bool>(
+    values: *mut u32,
+    twiddle_dbl: &[&[u32]],
+    layer: usize,
+    index: usize,
+) {
     let offset = if LOCAL { 0 } else { index << (layer + 1) };
     let twiddles0: [u32x16; 1] = std::array::from_fn(|i| {
         u32x16::splat(*twiddle_dbl[0].get_unchecked((index + i) & (twiddle_dbl[0].len() - 1)))

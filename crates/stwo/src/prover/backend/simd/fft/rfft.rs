@@ -195,7 +195,6 @@ pub unsafe fn fft_lower_without_vecwise(
     });
 }
 
-
 /// The log of the size in bytes of the thread local buffer in which [`fft_subdomains`] computes a
 /// group of neighbouring blocks.
 const SCATTER_SCRATCH_LOG_BYTES: usize = 16;

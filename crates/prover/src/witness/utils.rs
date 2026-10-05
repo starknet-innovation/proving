@@ -22,7 +22,6 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::witness::preprocessed_trace::generate_preprocessed_commitment_root;
 
-
 /// A fast, deterministic hasher for the witness' lookup maps: their keys are small arrays of
 /// field elements, and SipHash dominates both the construction of the maps and the lookups.
 /// Iteration order is never relied on (the default hasher is randomized), so the choice of

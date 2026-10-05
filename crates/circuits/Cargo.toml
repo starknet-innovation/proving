@@ -9,6 +9,7 @@ edition.workspace = true
 test-utils = []
 
 [dependencies]
+rayon.workspace = true
 blake2.workspace = true
 hashbrown.workspace = true
 indexmap = { workspace = true, features = ["std"] }

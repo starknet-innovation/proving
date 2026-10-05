@@ -75,4 +75,8 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     fn grow(&mut self, _len: usize) -> bool {
         false
     }
+    /// Lets the pages behind the column's spare capacity (past its length) stop being resident
+    /// while keeping the allocation, so that a shortened column can still grow back into it; a
+    /// backend that does not support it does nothing.
+    fn release_spare(&mut self) {}
 }

@@ -292,12 +292,11 @@ struct Qm31OpsGates<'a> {
 ///
 /// `n_vars` is the total number of circuit variables, used as the first unused wire address for the
 /// permutation columns.
-fn add_qm31_ops_to_preprocessed_trace(
+fn qm31_ops_preprocessed_columns(
     gates: Qm31OpsGates<'_>,
     n_vars: usize,
     multiplicities: &[usize],
-    pp_trace: &mut PreProcessedTrace,
-) -> Qm31OpsTraceGenerator {
+) -> (Qm31OpsColumns, Qm31OpsTraceGenerator) {
     let Qm31OpsGates { add, sub, mul, pointwise_mul, permutation } = gates;
     let mut qm31_ops_columns: [_; N_QM31_OPS_PP_COLUMNS] = std::array::from_fn(|_| vec![]);
     fill_binary_op_columns(add, OpCode::Add, multiplicities, &mut qm31_ops_columns);
@@ -314,30 +313,28 @@ fn add_qm31_ops_to_preprocessed_trace(
 
     fill_permutation_columns(permutation, multiplicities, &mut qm31_ops_columns, n_vars);
 
-    Qm31OpsColumns::from(qm31_ops_columns).push_to(pp_trace);
-    qm31_ops_trace_generator
+    (Qm31OpsColumns::from(qm31_ops_columns), qm31_ops_trace_generator)
 }
 
 /// Adds the preprocessed columns of eq component to the preprocessed trace. If the component
 /// is empty, no columns are added. Preprocessed columns are in the following format:
 /// | in0_address | in1_address |
-fn add_eq_to_preprocessed_trace(eq: &[Eq], pp_trace: &mut PreProcessedTrace) {
+fn eq_preprocessed_columns(eq: &[Eq]) -> EqColumns {
     let mut columns = EqColumns::default();
     for Eq { in0, in1 } in eq {
         columns.eq_in0_address.push(*in0);
         columns.eq_in1_address.push(*in1);
     }
 
-    columns.push_to(pp_trace);
+    columns
 }
 
 /// Adds TripleXor gates to the preprocessed trace. Preprocessed columns are in the format:
 /// | input_addr_0 | input_addr_1 | input_addr_2 | output_addr | multiplicity |
-fn add_triple_xor_to_preprocessed_trace(
+fn triple_xor_preprocessed_columns(
     triple_xor: &[TripleXor],
     multiplicities: &[usize],
-    pp_trace: &mut PreProcessedTrace,
-) {
+) -> TripleXorColumns {
     let mut columns = TripleXorColumns::default();
     for TripleXor { input_a, input_b, input_c, out } in triple_xor.iter() {
         columns.triple_xor_input_addr_0.push(*input_a);
@@ -347,7 +344,7 @@ fn add_triple_xor_to_preprocessed_trace(
         columns.triple_xor_multiplicity.push(multiplicities[*out]);
     }
 
-    columns.push_to(pp_trace);
+    columns
 }
 
 /// Adds M31ToU32 gates to preprocessed trace columns.
@@ -364,25 +361,23 @@ fn fill_m31_to_u32_columns(
     }
 }
 
-fn add_m31_to_u32_to_preprocessed_trace(
+fn m31_to_u32_preprocessed_columns(
     m31_to_u32: &[M31ToU32],
     multiplicities: &[usize],
-    pp_trace: &mut PreProcessedTrace,
-) {
+) -> M31ToU32Columns {
     let mut columns: [_; N_M31_TO_U32_PP_COLUMNS] = std::array::from_fn(|_| vec![]);
     fill_m31_to_u32_columns(m31_to_u32, multiplicities, &mut columns);
 
-    M31ToU32Columns::from(columns).push_to(pp_trace);
+    M31ToU32Columns::from(columns)
 }
 
 /// Adds BlakeGGate gates to the preprocessed trace. Preprocessed columns are in the format:
 /// | input_addr_a | input_addr_b | input_addr_c | input_addr_d | input_addr_f0 | input_addr_f1 |
 /// | output_addr_a | output_addr_b | output_addr_c | output_addr_d | multiplicity |
-fn add_blake_g_gate_to_preprocessed_trace(
+fn blake_g_gate_preprocessed_columns(
     blake_g_gate: &[BlakeGGate],
     multiplicities: &[usize],
-    pp_trace: &mut PreProcessedTrace,
-) {
+) -> BlakeGGateColumns {
     let mut columns = BlakeGGateColumns::default();
     for BlakeGGate {
         input_a,
@@ -421,7 +416,7 @@ fn add_blake_g_gate_to_preprocessed_trace(
         columns.blake_g_gate_multiplicity.push(mult);
     }
 
-    columns.push_to(pp_trace);
+    columns
 }
 
 /// A collection of preprocessed columns, whose values are publicly acknowledged, and independent of
@@ -446,7 +441,7 @@ impl PreProcessedTrace {
     }
     /// Adds preprocessed columns that are fixed lookup tables, independent of the circuit's gates.
     ///
-    /// Unlike the per-component helpers (e.g. `add_eq_to_preprocessed_trace`), these columns do not
+    /// Unlike the per-component helpers (e.g. `eq_preprocessed_columns`), these columns do not
     /// depend on the circuit gates or their multiplicities. They provide constant lookup
     /// infrastructure referenced by certain components:
     /// - `seq_16`: the sequence `0..2^16`, used by `range_check_16`.
@@ -474,12 +469,16 @@ impl PreProcessedTrace {
 
     #[cfg(feature = "prover")]
     pub fn get_trace<B: Backend>(&self) -> Vec<CircleEvaluation<B, BaseField, BitReversedOrder>> {
-        let to_evaluation = |vec: &[usize]| {
+        use rayon::prelude::*;
+
+        let to_evaluation = |vec: &Vec<usize>| {
             let col = Col::<B, BaseField>::from_iter(vec.iter().cloned().map(BaseField::from));
             CircleEvaluation::new(CanonicCoset::new(col.len().ilog2()).circle_domain(), col)
         };
 
-        self.columns.values().map(|c| to_evaluation(c)).collect()
+        // The columns are converted independently; the order of the result is that of the map.
+        let columns: Vec<&Vec<usize>> = self.columns.values().collect();
+        columns.into_par_iter().map(to_evaluation).collect()
     }
 
     pub fn get_column(&self, id: &PreProcessedColumnId) -> &Vec<usize> {
@@ -571,20 +570,41 @@ impl PreprocessedCircuit {
         } = circuit;
 
         // Add Eq columns.
-        add_eq_to_preprocessed_trace(eq, &mut pp_trace);
-        // Add QM31 operations columns.
-        let qm31_ops_trace_generator = add_qm31_ops_to_preprocessed_trace(
-            Qm31OpsGates { add, sub, mul, pointwise_mul, permutation },
-            *n_vars,
-            &multiplicities,
-            &mut pp_trace,
+        // The components' columns are built independently and pushed in the fixed order.
+        let multiplicities = &multiplicities;
+        let (
+            (eq_columns, (qm31_ops_columns, qm31_ops_trace_generator)),
+            (triple_xor_columns, (m31_to_u32_columns, blake_g_gate_columns)),
+        ) = rayon::join(
+            || {
+                rayon::join(
+                    || eq_preprocessed_columns(eq),
+                    || {
+                        qm31_ops_preprocessed_columns(
+                            Qm31OpsGates { add, sub, mul, pointwise_mul, permutation },
+                            *n_vars,
+                            multiplicities,
+                        )
+                    },
+                )
+            },
+            || {
+                rayon::join(
+                    || triple_xor_preprocessed_columns(triple_xor, multiplicities),
+                    || {
+                        rayon::join(
+                            || m31_to_u32_preprocessed_columns(m31_to_u32, multiplicities),
+                            || blake_g_gate_preprocessed_columns(blake_g_gate, multiplicities),
+                        )
+                    },
+                )
+            },
         );
-        // Add TripleXor columns.
-        add_triple_xor_to_preprocessed_trace(triple_xor, &multiplicities, &mut pp_trace);
-        // Add M31ToU32 columns.
-        add_m31_to_u32_to_preprocessed_trace(m31_to_u32, &multiplicities, &mut pp_trace);
-        // Add BlakeGGate columns.
-        add_blake_g_gate_to_preprocessed_trace(blake_g_gate, &multiplicities, &mut pp_trace);
+        eq_columns.push_to(&mut pp_trace);
+        qm31_ops_columns.push_to(&mut pp_trace);
+        triple_xor_columns.push_to(&mut pp_trace);
+        m31_to_u32_columns.push_to(&mut pp_trace);
+        blake_g_gate_columns.push_to(&mut pp_trace);
 
         PreProcessedTrace::add_fixed_preprocessed_columns(&mut pp_trace);
         pp_trace.sort_by_size();

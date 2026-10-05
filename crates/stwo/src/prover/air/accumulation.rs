@@ -101,6 +101,35 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
     /// For each entry, a [ColumnAccumulator] is returned, expecting to accumulate `n_cols`
     /// evaluations of size `log_size`.
     /// The array size, `N`, is the number of different sizes.
+    /// An accumulator over the given random coefficient powers, see [`Self::columns`]: a group of
+    /// components run by [`crate::prover::air::ComponentProvers`] gets the powers of its members.
+    pub fn with_powers(
+        random_coeff_powers: Vec<SecureField>,
+        max_log_size: u32,
+        evaluation_mode: EvaluationMode,
+    ) -> Self {
+        let max_log_size = max_log_size as usize;
+        Self {
+            random_coeff_powers,
+            sub_accumulations: (0..(max_log_size + 1)).map(|_| None).collect(),
+            evaluation_mode,
+        }
+    }
+
+    /// The accumulated columns by log size, once every random coefficient power has been used.
+    pub fn into_sub_accumulations(self) -> Vec<Option<SecureColumnByCoords<B>>> {
+        assert_eq!(self.random_coeff_powers.len(), 0, "not all random coefficients were used");
+        self.sub_accumulations
+    }
+
+    /// An accumulator holding already accumulated columns by log size, ready to be finalized.
+    pub fn from_sub_accumulations(
+        sub_accumulations: Vec<Option<SecureColumnByCoords<B>>>,
+        evaluation_mode: EvaluationMode,
+    ) -> Self {
+        Self { random_coeff_powers: vec![], sub_accumulations, evaluation_mode }
+    }
+
     pub fn columns<const N: usize>(
         &mut self,
         n_cols_per_size: [(u32, usize); N],

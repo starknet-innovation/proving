@@ -35,29 +35,51 @@ unsafe extern "C" {
 /// `MADV_POPULATE_WRITE`, which maps all of its pages in one call instead of one fault per page.
 /// Hints only: a no-op off Linux, for buffers below 2 MiB, and when the kernel declines.
 pub(crate) fn advise_pages<T>(data: &[T], populate: bool) {
+    const MADV_HUGEPAGE: core::ffi::c_int = 14;
+    const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
+    let (start, len) = whole_pages(data.as_ptr() as usize, std::mem::size_of_val(data));
+    advise_range(start, len, MADV_HUGEPAGE);
+    if populate {
+        advise_range(start, len, MADV_POPULATE_WRITE);
+    }
+}
+
+/// Tells the kernel that the spare capacity of a buffer (the part past its length, which holds
+/// nothing the program reads before writing it again) need not stay resident: `MADV_DONTNEED`
+/// on the whole pages it covers, which frees them now and maps zero pages back on the next
+/// touch. A hint with the same scope as [`advise_pages`].
+pub(crate) fn release_pages<T>(spare: &[std::mem::MaybeUninit<T>]) {
+    const MADV_DONTNEED: core::ffi::c_int = 4;
+    let (start, len) = whole_pages(spare.as_ptr() as usize, std::mem::size_of_val(spare));
+    advise_range(start, len, MADV_DONTNEED);
+}
+
+/// The whole 4 KiB pages inside `[addr, addr + bytes)`, or an empty range for a buffer below
+/// 2 MiB, which is not worth a system call.
+fn whole_pages(addr: usize, bytes: usize) -> (usize, usize) {
+    const PAGE: usize = 4096;
+    if bytes < 1 << 21 {
+        return (0, 0);
+    }
+    let start = (addr + PAGE - 1) & !(PAGE - 1);
+    let end = (addr + bytes) & !(PAGE - 1);
+    (start, end.saturating_sub(start))
+}
+
+/// `madvise` on a page-aligned range; a no-op off Linux, for an empty range, and when the kernel
+/// declines (the advice is a hint and the program is correct without it).
+fn advise_range(start: usize, len: usize, advice: core::ffi::c_int) {
     #[cfg(target_os = "linux")]
     {
-        const MADV_HUGEPAGE: core::ffi::c_int = 14;
-        const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
-        const PAGE: usize = 4096;
-        let bytes = std::mem::size_of_val(data);
-        if bytes < 1 << 21 {
-            return;
-        }
-        let start = (data.as_ptr() as usize + PAGE - 1) & !(PAGE - 1);
-        let end = (data.as_ptr() as usize + bytes) & !(PAGE - 1);
-        if end > start {
+        if len > 0 {
             unsafe {
-                madvise(start as *mut core::ffi::c_void, end - start, MADV_HUGEPAGE);
-                if populate {
-                    madvise(start as *mut core::ffi::c_void, end - start, MADV_POPULATE_WRITE);
-                }
+                madvise(start as *mut core::ffi::c_void, len, advice);
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (data, populate);
+        let _ = (start, len, advice);
     }
 }
 
@@ -113,7 +135,6 @@ impl BaseColumn {
         SecureColumn { data, length }
     }
 }
-
 
 impl Column<BaseField> for BaseColumn {
     fn zeros(length: usize) -> Self {
@@ -181,6 +202,10 @@ impl Column<BaseField> for BaseColumn {
         self.length = len;
         true
     }
+
+    fn release_spare(&mut self) {
+        release_pages(self.data.spare_capacity_mut());
+    }
 }
 
 impl FromIterator<BaseField> for BaseColumn {
@@ -210,7 +235,6 @@ pub struct CM31Column {
     pub data: Vec<PackedCM31>,
     pub length: usize,
 }
-
 
 impl Column<CM31> for CM31Column {
     fn zeros(length: usize) -> Self {
@@ -328,7 +352,6 @@ impl SecureColumn {
         SecureColumnByCoords { columns: columns.map(|col| BaseColumn { data: col, length }) }
     }
 }
-
 
 impl Column<SecureField> for SecureColumn {
     fn zeros(length: usize) -> Self {
