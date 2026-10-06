@@ -5,6 +5,8 @@
 //!   f(p) = sum_i alpha^{N-1-i} u_i(P).
 
 use itertools::Itertools;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use tracing::{Level, span};
 
 use crate::core::air::Component;
@@ -99,6 +101,35 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
     /// For each entry, a [ColumnAccumulator] is returned, expecting to accumulate `n_cols`
     /// evaluations of size `log_size`.
     /// The array size, `N`, is the number of different sizes.
+    /// An accumulator over the given random coefficient powers, see [`Self::columns`]: a group of
+    /// components run by [`crate::prover::air::ComponentProvers`] gets the powers of its members.
+    pub fn with_powers(
+        random_coeff_powers: Vec<SecureField>,
+        max_log_size: u32,
+        evaluation_mode: EvaluationMode,
+    ) -> Self {
+        let max_log_size = max_log_size as usize;
+        Self {
+            random_coeff_powers,
+            sub_accumulations: (0..(max_log_size + 1)).map(|_| None).collect(),
+            evaluation_mode,
+        }
+    }
+
+    /// The accumulated columns by log size, once every random coefficient power has been used.
+    pub fn into_sub_accumulations(self) -> Vec<Option<SecureColumnByCoords<B>>> {
+        assert_eq!(self.random_coeff_powers.len(), 0, "not all random coefficients were used");
+        self.sub_accumulations
+    }
+
+    /// An accumulator holding already accumulated columns by log size, ready to be finalized.
+    pub fn from_sub_accumulations(
+        sub_accumulations: Vec<Option<SecureColumnByCoords<B>>>,
+        evaluation_mode: EvaluationMode,
+    ) -> Self {
+        Self { random_coeff_powers: vec![], sub_accumulations, evaluation_mode }
+    }
+
     pub fn columns<const N: usize>(
         &mut self,
         n_cols_per_size: [(u32, usize); N],
@@ -168,10 +199,17 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
             };
             let twiddles_ref = owned_twiddles.as_ref().unwrap_or(twiddles);
 
-            SecureCirclePoly(eval.columns.map(|c| {
+            // The four coordinate columns are interpolated concurrently: each IFFT is parallel on
+            // its own, but one column at a time leaves most threads idle.
+            let interpolate = |c: Col<B, BaseField>| {
                 CircleEvaluation::<B, BaseField, BitReversedOrder>::new(domain, c)
                     .interpolate_with_twiddles(twiddles_ref)
-            }))
+            };
+            #[cfg(not(feature = "parallel"))]
+            let polys: Vec<_> = eval.columns.into_iter().map(interpolate).collect();
+            #[cfg(feature = "parallel")]
+            let polys: Vec<_> = eval.columns.into_par_iter().map(interpolate).collect();
+            SecureCirclePoly(polys.try_into().unwrap_or_else(|_| unreachable!("four coordinates")))
         } else {
             SecureCirclePoly(std::array::from_fn(|_| {
                 CircleCoefficients::new(Col::<B, BaseField>::zeros(1 << log_size))

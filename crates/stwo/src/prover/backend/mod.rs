@@ -63,4 +63,20 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     fn set(&mut self, index: usize, value: T);
     /// Splits the column into two halves.
     fn split_at_mid(self) -> (Self, Self);
+    /// Shortens the column to `len` elements while keeping its allocation, and returns whether
+    /// it did; a backend that does not support it leaves the column as it was.
+    fn truncate(&mut self, _len: usize) -> bool {
+        false
+    }
+    /// Lengthens the column to `len` elements within its existing allocation, the new elements
+    /// being uninitialized as after [`Self::uninitialized`] (the caller writes them before reading
+    /// them), and returns whether it did; a backend that does not support it leaves the column as
+    /// it was.
+    fn grow(&mut self, _len: usize) -> bool {
+        false
+    }
+    /// Lets the pages behind the column's spare capacity (past its length) stop being resident
+    /// while keeping the allocation, so that a shortened column can still grow back into it; a
+    /// backend that does not support it does nothing.
+    fn release_spare(&mut self) {}
 }

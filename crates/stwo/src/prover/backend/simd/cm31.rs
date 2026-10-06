@@ -20,16 +20,19 @@ unsafe impl Sync for PackedCM31 {}
 
 impl PackedCM31 {
     /// Constructs a new instance with all vector elements set to `value`.
+    #[inline(always)]
     pub const fn broadcast(value: CM31) -> Self {
         Self([PackedM31::broadcast(value.0), PackedM31::broadcast(value.1)])
     }
 
     /// Returns all `a` values such that each vector element is represented as `a + bi`.
+    #[inline(always)]
     pub const fn a(&self) -> PackedM31 {
         self.0[0]
     }
 
     /// Returns all `b` values such that each vector element is represented as `a + bi`.
+    #[inline(always)]
     pub const fn b(&self) -> PackedM31 {
         self.0[1]
     }
@@ -66,6 +69,7 @@ impl PackedCM31 {
     }
 
     /// Doubles each element in the vector.
+    #[inline(always)]
     pub fn double(self) -> Self {
         let Self([a, b]) = self;
         Self([a.double(), b.double()])
@@ -75,6 +79,7 @@ impl PackedCM31 {
 impl Add for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: Self) -> Self::Output {
         Self([self.a() + rhs.a(), self.b() + rhs.b()])
     }
@@ -83,26 +88,56 @@ impl Add for PackedCM31 {
 impl Sub for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: Self) -> Self::Output {
         Self([self.a() - rhs.a(), self.b() - rhs.b()])
+    }
+}
+
+impl PackedCM31 {
+    /// Returns `self * rhs` with the base field multiplication kernels expanded at the call site.
+    #[inline(always)]
+    pub(crate) fn mul_inline(self, rhs: Self) -> Self {
+        // Compute using Karatsuba.
+        let ac = self.a().mul_inline(rhs.a());
+        let bd = self.b().mul_inline(rhs.b());
+        // Computes (a + b) * (c + d).
+        let ab_t_cd = (self.a() + self.b()).mul_inline(rhs.a() + rhs.b());
+        // (ac - bd) + (ad + bc)i.
+        Self([ac - bd, ab_t_cd - ac - bd])
+    }
+
+    /// Returns `self * rhs` with the base field multiplication kernels expanded at the call site.
+    #[inline(always)]
+    pub(crate) fn mul_m31_inline(self, rhs: PackedM31) -> Self {
+        let Self([a, b]) = self;
+        Self([a.mul_inline(rhs), b.mul_inline(rhs)])
     }
 }
 
 impl Mul for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: Self) -> Self::Output {
-        // Compute using Karatsuba.
-        let ac = self.a() * rhs.a();
-        let bd = self.b() * rhs.b();
-        // Computes (a + b) * (c + d).
-        let ab_t_cd = (self.a() + self.b()) * (rhs.a() + rhs.b());
-        // (ac - bd) + (ad + bc)i.
-        Self([ac - bd, ab_t_cd - ac - bd])
+        mul_cm31(self, rhs)
     }
 }
 
+/// Returns `a * b`. Like `m31::mul_avx2`, it is not inlinable from other crates: the code that
+/// multiplies `PackedCM31`s directly (witness generation) calls it, while the `Vectorized`
+/// operators of the constraint evaluators expand [`PackedCM31::mul_inline`].
+pub(crate) fn mul_cm31(a: PackedCM31, b: PackedCM31) -> PackedCM31 {
+    a.mul_inline(b)
+}
+
+/// Returns `a * b`; see [`mul_cm31`].
+pub(crate) fn mul_cm31_m31(a: PackedCM31, b: PackedM31) -> PackedCM31 {
+    a.mul_m31_inline(b)
+}
+
 impl Zero for PackedCM31 {
+    #[inline(always)]
     fn zero() -> Self {
         Self([PackedM31::zero(), PackedM31::zero()])
     }
@@ -121,18 +156,21 @@ unsafe impl Zeroable for PackedCM31 {
 }
 
 impl One for PackedCM31 {
+    #[inline(always)]
     fn one() -> Self {
         Self([PackedM31::one(), PackedM31::zero()])
     }
 }
 
 impl MulAssign for PackedCM31 {
+    #[inline(always)]
     fn mul_assign(&mut self, rhs: Self) {
         *self = *self * rhs;
     }
 }
 
 impl FieldExpOps for PackedCM31 {
+    #[inline(always)]
     fn square(&self) -> Self {
         // (a + bi)^2 = (a + b)(a - b) + 2ab*i. Two base field multiplications instead of the
         // three that the Karatsuba `Mul` takes.
@@ -198,6 +236,7 @@ fn batch_inverse_chunk(
 impl Add<PackedM31> for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: PackedM31) -> Self::Output {
         Self([self.a() + rhs, self.b()])
     }
@@ -206,6 +245,7 @@ impl Add<PackedM31> for PackedCM31 {
 impl Sub<PackedM31> for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: PackedM31) -> Self::Output {
         let Self([a, b]) = self;
         Self([a - rhs, b])
@@ -215,15 +255,16 @@ impl Sub<PackedM31> for PackedCM31 {
 impl Mul<PackedM31> for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: PackedM31) -> Self::Output {
-        let Self([a, b]) = self;
-        Self([a * rhs, b * rhs])
+        mul_cm31_m31(self, rhs)
     }
 }
 
 impl Neg for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn neg(self) -> Self::Output {
         let Self([a, b]) = self;
         Self([-a, -b])

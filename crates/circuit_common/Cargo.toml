@@ -7,6 +7,7 @@ edition.workspace = true
 prover = ["stwo/parallel", "stwo/prover", "stwo-constraint-framework/parallel", "stwo-constraint-framework/prover"]
 
 [dependencies]
+rayon.workspace = true
 itertools.workspace = true
 rand_chacha.workspace = true
 

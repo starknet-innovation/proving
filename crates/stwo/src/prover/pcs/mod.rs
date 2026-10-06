@@ -60,6 +60,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         twiddles: &'a TwiddleTree<B>,
         base_column_pool: &'a BaseColumnPool<B>,
     ) -> Self {
+        base_column_pool.release_small_idle();
         CommitmentSchemeProver {
             trees: TreeVec::default(),
             config,
@@ -233,6 +234,15 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Evaluate polynomials on open points.
         let samples = self.compute_samples(&sampled_points, lifting_log_size);
 
+        // Point samples are complete; subsequent quotient and opening paths use evaluations.
+        for tree in &mut self.trees.0 {
+            if let MaybeOwned::Owned(tree) = tree {
+                for poly in &mut tree.polynomials {
+                    drop(poly.coeffs.take());
+                }
+            }
+        }
+
         let sampled_values =
             samples.as_cols_ref().map_cols(|x| x.iter().map(|o| o.value).collect());
         channel.mix_felts(&sampled_values.clone().flatten_cols());
@@ -292,6 +302,12 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .map(|(v, x)| (v, x.decommitment, x.aux))
             .multiunzip();
 
+        // The FRI input column is no longer needed: its four coordinate buffers go back to the
+        // pool, where the next proof's evaluations of the same size reuse them.
+        for column in quotients.values.columns {
+            self.base_column_pool.give_back(lifting_log_size, column);
+        }
+
         // Return evaluation buffers to the memory pool for reuse (owned trees only).
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
@@ -334,7 +350,11 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
         columns: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
     ) -> TreeSubspan {
         let span = span!(Level::INFO, "Interpolation for commitment").entered();
-        let polys = B::interpolate_columns(columns, self.commitment_scheme.twiddles);
+        let polys = B::interpolate_columns_pooled(
+            columns,
+            self.commitment_scheme.twiddles,
+            &self.commitment_scheme.base_column_pool,
+        );
         span.exit();
 
         self.extend_polys(polys)

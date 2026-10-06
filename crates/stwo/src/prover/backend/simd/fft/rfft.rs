@@ -1,6 +1,7 @@
 //! Regular (forward) fft.
 
 use std::array;
+use std::cell::RefCell;
 use std::simd::{simd_swizzle, u32x2, u32x4, u32x8, u32x16};
 
 use itertools::Itertools;
@@ -98,13 +99,13 @@ pub unsafe fn fft_lower_with_vecwise(
         for layer in (VECWISE_FFT_BITS..fft_layers).step_by(3).rev() {
             match fft_layers - layer {
                 1 => {
-                    fft1_loop(src, dst, &twiddle_dbl[(layer - 1)..], layer, index_h);
+                    fft1_loop::<false>(src, dst, &twiddle_dbl[(layer - 1)..], layer, index_h);
                 }
                 2 => {
-                    fft2_loop(src, dst, &twiddle_dbl[(layer - 1)..], layer, index_h);
+                    fft2_loop::<false>(src, dst, &twiddle_dbl[(layer - 1)..], layer, index_h);
                 }
                 _ => {
-                    fft3_loop(
+                    fft3_loop::<false>(
                         src,
                         dst,
                         &twiddle_dbl[(layer - 1)..],
@@ -116,7 +117,23 @@ pub unsafe fn fft_lower_with_vecwise(
             }
             src = dst;
         }
-        fft_vecwise_loop(src, dst, twiddle_dbl, fft_layers - VECWISE_FFT_BITS, index_h);
+        let loop_bits = fft_layers - VECWISE_FFT_BITS;
+        for index_l in 0..1 << loop_bits {
+            let index = (index_h << loop_bits) + index_l;
+            let mut val0 = PackedBaseField::load(src.add(index * 32));
+            let mut val1 = PackedBaseField::load(src.add(index * 32 + 16));
+            (val0, val1) =
+                simd_butterfly(val0, val1, u32x16::splat(*twiddle_dbl[3].get_unchecked(index)));
+            (val0, val1) = vecwise_butterflies(
+                val0,
+                val1,
+                array::from_fn(|i| *twiddle_dbl[0].get_unchecked(index * 8 + i)),
+                array::from_fn(|i| *twiddle_dbl[1].get_unchecked(index * 4 + i)),
+                array::from_fn(|i| *twiddle_dbl[2].get_unchecked(index * 2 + i)),
+            );
+            val0.store(dst.add(index * 32));
+            val1.store(dst.add(index * 32 + 16));
+        }
     });
 }
 
@@ -157,13 +174,13 @@ pub unsafe fn fft_lower_without_vecwise(
             let fixed_layer = layer + LOG_N_LANES as usize;
             match fft_layers - layer {
                 1 => {
-                    fft1_loop(src, dst, &twiddle_dbl[layer..], fixed_layer, index_h);
+                    fft1_loop::<false>(src, dst, &twiddle_dbl[layer..], fixed_layer, index_h);
                 }
                 2 => {
-                    fft2_loop(src, dst, &twiddle_dbl[layer..], fixed_layer, index_h);
+                    fft2_loop::<false>(src, dst, &twiddle_dbl[layer..], fixed_layer, index_h);
                 }
                 _ => {
-                    fft3_loop(
+                    fft3_loop::<false>(
                         src,
                         dst,
                         &twiddle_dbl[layer..],
@@ -178,41 +195,155 @@ pub unsafe fn fft_lower_without_vecwise(
     });
 }
 
-/// Runs the last 5 fft layers across the entire array.
+/// The log of the size in bytes of the thread local buffer in which [`fft_subdomains`] computes a
+/// group of neighbouring blocks.
+const SCATTER_SCRATCH_LOG_BYTES: usize = 16;
+/// The log of the number of elements in a 4 KiB page.
+const LOG_PAGE_ELEMENTS: usize = 10;
+/// The log of the number of pages touched by one task of [`fft_subdomains`] before the fft.
+const LOG_PREFAULT_PAGES: usize = 5;
+
+thread_local! {
+    static PHASE1_SCRATCH: RefCell<Vec<u32x16>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Performs [`fft`] of the same coefficients for several consecutive subdomains: the evaluation on
+/// subdomain `i` is written to `dst + (i << log_n_elements)`, using the twiddles
+/// `subdomain_twiddles[i]`.
+///
+/// The result is the one of calling [`fft`] for every subdomain. For large inputs the first phase
+/// of the fft and the transposition after it are fused and shared by the subdomains: a group of
+/// neighbouring blocks is read once, and for each subdomain it is computed in a thread local
+/// buffer and then stored to its transposed place in the destination in contiguous runs.
 ///
 /// # Arguments
 ///
-/// - `src`: A pointer to the values to transform, aligned to 64 bytes.
-/// - `dst`: A pointer to the destination array, aligned to 64 bytes.
-/// - `twiddle_dbl`: The doubles of the twiddle factors for each of the 5 fft layers.
-/// - `high_bits`: The number of bits this loops needs to run on.
-/// - `index_h`: The higher part of the index, iterated by the caller.
+/// * `src`: A pointer to the values to transform, aligned to 64 bytes.
+/// * `dst`: A pointer to the destination arrays, aligned to 64 bytes. Must not alias `src`.
+/// * `subdomain_twiddles`: For each subdomain, the doubles of the twiddle factors.
+/// * `log_n_elements`: The log of the number of elements of the transformed values.
+///
+/// # Panics
+///
+/// This function will panic if `log_n_elements` is less than `MIN_FFT_LOG_SIZE`.
 ///
 /// # Safety
 ///
-/// Behavior is undefined if `src` and `dst` do not have the same alignment as [`PackedBaseField`].
-unsafe fn fft_vecwise_loop(
+/// Behavior is undefined if `src` and `dst` do not have the same alignment as [`PackedBaseField`],
+/// or if `dst` does not have room for `subdomain_twiddles.len() << log_n_elements` elements.
+pub unsafe fn fft_subdomains(
     src: *const u32,
     dst: *mut u32,
-    twiddle_dbl: &[&[u32]],
-    loop_bits: usize,
-    index_h: usize,
+    subdomain_twiddles: &[Vec<&[u32]>],
+    log_n_elements: usize,
 ) {
-    for index_l in 0..1 << loop_bits {
-        let index = (index_h << loop_bits) + index_l;
-        let mut val0 = PackedBaseField::load(src.add(index * 32));
-        let mut val1 = PackedBaseField::load(src.add(index * 32 + 16));
-        (val0, val1) =
-            simd_butterfly(val0, val1, u32x16::splat(*twiddle_dbl[3].get_unchecked(index)));
-        (val0, val1) = vecwise_butterflies(
-            val0,
-            val1,
-            array::from_fn(|i| *twiddle_dbl[0].get_unchecked(index * 8 + i)),
-            array::from_fn(|i| *twiddle_dbl[1].get_unchecked(index * 4 + i)),
-            array::from_fn(|i| *twiddle_dbl[2].get_unchecked(index * 2 + i)),
+    if log_n_elements <= CACHED_FFT_LOG_SIZE as usize {
+        for (i, twiddle_dbl) in subdomain_twiddles.iter().enumerate() {
+            fft(src, dst.add(i << log_n_elements), twiddle_dbl, log_n_elements);
+        }
+        return;
+    }
+
+    let log_n_vecs = log_n_elements - LOG_N_LANES as usize;
+    // As in `transpose_vecs`: a vector index is (a, b, c) with |a| = |c| = post and |b| = 0 or 1.
+    // The first phase applies the layers that act on `c`, and the transposition moves the vector
+    // (a, b, c) to the place (c, b, a).
+    let post = log_n_vecs / 2;
+    let pre = log_n_vecs - post;
+    let log_n_b = log_n_vecs & 1;
+    let block_vecs = 1usize << post;
+    let block_elems = block_vecs << LOG_N_LANES;
+    let group_log = SCATTER_SCRATCH_LOG_BYTES.saturating_sub(post + 6).clamp(1, 4).min(post);
+    let group_size = 1usize << group_log;
+    let n_tasks = 1usize << (post - group_log + log_n_b);
+
+    let src = UnsafeConst(src);
+    let dsts: Vec<UnsafeMut<u32>> =
+        (0..subdomain_twiddles.len()).map(|i| UnsafeMut(dst.add(i << log_n_elements))).collect();
+    let dsts = &dsts;
+
+    // The stores of the first phase reach each page of a destination from several tasks at about
+    // the same time. If the page is not mapped yet, each of these tasks takes a page fault for it.
+    // Touching every page first, from a single task, avoids the repeated faults.
+    let log_chunk = LOG_PAGE_ELEMENTS + LOG_PREFAULT_PAGES;
+    let chunks = 1usize << (log_n_elements - log_chunk);
+    parallel_iter!(0..dsts.len() * chunks).for_each(|task| {
+        let dst = dsts[task / chunks].get();
+        let first = (task % chunks) << log_chunk;
+        for page in 0..1usize << LOG_PREFAULT_PAGES {
+            dst.add(first + (page << LOG_PAGE_ELEMENTS)).write(0);
+        }
+    });
+
+    parallel_iter!(0..n_tasks).for_each(|task| {
+        let src = src.get();
+        let b = task & ((1 << log_n_b) - 1);
+        let a0 = (task >> log_n_b) << group_log;
+        PHASE1_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            if scratch.len() < group_size * block_vecs {
+                scratch.resize(group_size * block_vecs, u32x16::splat(0));
+            }
+            let scr = scratch.as_mut_ptr() as *mut u32;
+            for (dst, twiddle_dbl) in dsts.iter().zip(subdomain_twiddles) {
+                let dst = dst.get();
+                let twiddle_dbl = &twiddle_dbl[(3 + pre)..];
+                for i in 0..group_size {
+                    // The block (a, b) of the first phase: the layers of
+                    // `fft_lower_without_vecwise`.
+                    let index_h = ((a0 + i) << log_n_b) | b;
+                    let mut from = src.add(index_h * block_elems);
+                    let to = scr.add(i * block_elems);
+                    for layer in (0..post).step_by(3).rev() {
+                        let fixed_layer = layer + LOG_N_LANES as usize;
+                        match post - layer {
+                            1 => fft1_loop::<true>(
+                                from,
+                                to,
+                                &twiddle_dbl[layer..],
+                                fixed_layer,
+                                index_h,
+                            ),
+                            2 => fft2_loop::<true>(
+                                from,
+                                to,
+                                &twiddle_dbl[layer..],
+                                fixed_layer,
+                                index_h,
+                            ),
+                            _ => fft3_loop::<true>(
+                                from,
+                                to,
+                                &twiddle_dbl[layer..],
+                                post - layer - 3,
+                                fixed_layer,
+                                index_h,
+                            ),
+                        }
+                        from = to;
+                    }
+                }
+                // Vector c of the block (a, b) goes to the place (c, b, a) of the destination.
+                for c in 0..block_vecs {
+                    let out = dst.add(((c << pre) | (b << post) | a0) << LOG_N_LANES);
+                    for i in 0..group_size {
+                        PackedBaseField::load(scr.add(i * block_elems + (c << LOG_N_LANES)))
+                            .store(out.add(i << LOG_N_LANES));
+                    }
+                }
+            }
+        });
+    });
+
+    for (dst, twiddle_dbl) in dsts.iter().zip(subdomain_twiddles) {
+        let dst = dst.get();
+        fft_lower_with_vecwise(
+            dst,
+            dst,
+            &twiddle_dbl[..3 + pre],
+            log_n_elements,
+            pre + LOG_N_LANES as usize,
         );
-        val0.store(dst.add(index * 32));
-        val1.store(dst.add(index * 32 + 16));
     }
 }
 
@@ -231,7 +362,7 @@ unsafe fn fft_vecwise_loop(
 /// # Safety
 ///
 /// Behavior is undefined if `src` and `dst` do not have the same alignment as [`PackedBaseField`].
-unsafe fn fft3_loop(
+unsafe fn fft3_loop<const LOCAL: bool>(
     src: *const u32,
     dst: *mut u32,
     twiddle_dbl: &[&[u32]],
@@ -241,7 +372,7 @@ unsafe fn fft3_loop(
 ) {
     for index_l in 0..1 << loop_bits {
         let index = (index_h << loop_bits) + index_l;
-        let offset = index << (layer + 3);
+        let offset = if LOCAL { index_l << (layer + 3) } else { index << (layer + 3) };
         let twiddles0: [u32x16; 4] = array::from_fn(|i| {
             u32x16::splat(
                 *twiddle_dbl[0].get_unchecked((index * 4 + i) & (twiddle_dbl[0].len() - 1)),
@@ -276,14 +407,14 @@ unsafe fn fft3_loop(
 /// # Safety
 ///
 /// Behavior is undefined if `src` and `dst` do not have the same alignment as [`PackedBaseField`].
-unsafe fn fft2_loop(
+unsafe fn fft2_loop<const LOCAL: bool>(
     src: *const u32,
     dst: *mut u32,
     twiddle_dbl: &[&[u32]],
     layer: usize,
     index: usize,
 ) {
-    let offset = index << (layer + 2);
+    let offset = if LOCAL { 0 } else { index << (layer + 2) };
     let twiddles0: [u32x16; 2] = array::from_fn(|i| {
         u32x16::splat(*twiddle_dbl[0].get_unchecked((index * 2 + i) & (twiddle_dbl[0].len() - 1)))
     });
@@ -308,14 +439,14 @@ unsafe fn fft2_loop(
 /// # Safety
 ///
 /// Behavior is undefined if `src` and `dst` do not have the same alignment as [`PackedBaseField`].
-unsafe fn fft1_loop(
+unsafe fn fft1_loop<const LOCAL: bool>(
     src: *const u32,
     dst: *mut u32,
     twiddle_dbl: &[&[u32]],
     layer: usize,
     index: usize,
 ) {
-    let offset = index << (layer + 1);
+    let offset = if LOCAL { 0 } else { index << (layer + 1) };
     let twiddles0: [u32x16; 1] = array::from_fn(|i| {
         u32x16::splat(*twiddle_dbl[0].get_unchecked((index + i) & (twiddle_dbl[0].len() - 1)))
     });

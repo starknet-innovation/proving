@@ -23,12 +23,13 @@ use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::core::poly::utils::{domain_line_twiddles_from_tree, fold, get_folding_alphas};
 use crate::core::utils::{SliceExt, bit_reverse_index};
 use crate::prover::backend::cpu::circle::slow_precompute_twiddles;
-use crate::prover::backend::simd::column::BaseColumn;
+use crate::prover::backend::simd::column::{BaseColumn, advise_pages};
 use crate::prover::backend::simd::fft::transpose_vecs;
 use crate::prover::backend::simd::fri::fold_circle_evaluation_into_line;
 use crate::prover::backend::simd::m31::PackedM31;
 use crate::prover::backend::{Col, Column, CpuBackend};
 use crate::prover::fri::FriOps;
+use crate::prover::mempool::BaseColumnPool;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use crate::prover::poly::twiddles::TwiddleTree;
@@ -126,6 +127,87 @@ impl SimdBackend {
 
 // TODO(shahars): Everything is returned in redundant representation, where values can also be P.
 // Decide if and when it's ok and what to do if it's not.
+/// [`PolyOps::interpolate`] for the SIMD backend, with the coefficients of large columns written to
+/// a buffer taken from `pool` when there is one.
+fn interpolate_ex(
+    eval: CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>,
+    twiddles: &TwiddleTree<SimdBackend>,
+    pool: Option<&BaseColumnPool<SimdBackend>>,
+) -> CircleCoefficients<SimdBackend> {
+    let _span = span!(Level::TRACE, "", class = "iFFT").entered();
+    let log_size = eval.values.length.ilog2();
+    if log_size < MIN_FFT_LOG_SIZE {
+        let cpu_poly = eval.to_cpu().interpolate();
+        return CircleCoefficients::new(cpu_poly.coeffs.into_iter().collect());
+    }
+
+    let mut values = eval.values;
+    let twiddles = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
+
+    // TODO(alont): Cache this inversion.
+    let inv = PackedBaseField::broadcast(BaseField::from(eval.domain.size()).inverse());
+    let log_n_elements = log_size as usize;
+    let log_n_vecs = log_n_elements - LOG_N_LANES as usize;
+
+    // With a pool, the coefficients of a large column are written to a buffer of the pool (or a
+    // fresh one), through the fused first pass and transposition of `ifft_out_of_place`, and
+    // the evaluation buffer goes back to the pool.
+    let pooled = match pool {
+        Some(pool) if log_n_elements > CACHED_FFT_LOG_SIZE as usize => Some((
+            pool,
+            pool.try_take(log_size).unwrap_or_else(|| BaseColumn::zeros(1 << log_size)),
+        )),
+        _ => None,
+    };
+
+    // Safe because [PackedBaseField] is aligned on 64 bytes.
+    unsafe {
+        let ptr = transmute::<*mut PackedBaseField, *mut u32>(values.data.as_mut_ptr());
+        if let Some((pool, mut coeffs)) = pooled {
+            ifft::ifft_out_of_place(
+                ptr.cast_const(),
+                transmute::<*mut PackedBaseField, *mut u32>(coeffs.data.as_mut_ptr()),
+                &twiddles,
+                log_n_elements,
+                inv,
+            );
+            pool.give_back(log_size, values);
+            return CircleCoefficients::new(coeffs);
+        }
+        if log_n_elements <= CACHED_FFT_LOG_SIZE as usize {
+            ifft::ifft(ptr, &twiddles, log_n_elements);
+            #[cfg(not(feature = "parallel"))]
+            values.data.iter_mut().for_each(|x| *x *= inv);
+            #[cfg(feature = "parallel")]
+            values
+                .data
+                .par_chunks_mut(1 << 10)
+                .for_each(|chunk| chunk.iter_mut().for_each(|x| *x *= inv));
+        } else {
+            // The passes of `ifft::ifft`, with the scaling by `inv` done by the last pass while
+            // each chunk is still in cache instead of by a pass of its own over the array.
+            let fft_layers_pre_transpose = log_n_vecs.div_ceil(2);
+            let fft_layers_post_transpose = log_n_vecs / 2;
+            ifft::ifft_lower_with_vecwise(
+                ptr,
+                &twiddles[..3 + fft_layers_pre_transpose],
+                log_n_elements,
+                fft_layers_pre_transpose + LOG_N_LANES as usize,
+            );
+            transpose_vecs(ptr, log_n_vecs);
+            ifft::ifft_lower_without_vecwise(
+                ptr,
+                &twiddles[3 + fft_layers_pre_transpose..],
+                log_n_elements,
+                fft_layers_post_transpose,
+                Some(inv),
+            );
+        }
+    }
+
+    CircleCoefficients::new(values)
+}
+
 impl PolyOps for SimdBackend {
     // The twiddles type is i32, and not BaseField. This is because the fast AVX mul implementation
     //  requires one of the numbers to be shifted left by 1 bit. This is not a reduced
@@ -136,30 +218,15 @@ impl PolyOps for SimdBackend {
         eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,
         twiddles: &TwiddleTree<Self>,
     ) -> CircleCoefficients<Self> {
-        let _span = span!(Level::TRACE, "", class = "iFFT").entered();
-        let log_size = eval.values.length.ilog2();
-        if log_size < MIN_FFT_LOG_SIZE {
-            let cpu_poly = eval.to_cpu().interpolate();
-            return CircleCoefficients::new(cpu_poly.coeffs.into_iter().collect());
-        }
+        interpolate_ex(eval, twiddles, None)
+    }
 
-        let mut values = eval.values;
-        let twiddles = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
-
-        // Safe because [PackedBaseField] is aligned on 64 bytes.
-        unsafe {
-            ifft::ifft(
-                transmute::<*mut PackedBaseField, *mut u32>(values.data.as_mut_ptr()),
-                &twiddles,
-                log_size as usize,
-            );
-        }
-
-        // TODO(alont): Cache this inversion.
-        let inv = PackedBaseField::broadcast(BaseField::from(eval.domain.size()).inverse());
-        values.data.iter_mut().for_each(|x| *x *= inv);
-
-        CircleCoefficients::new(values)
+    fn interpolate_pooled(
+        eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,
+        twiddles: &TwiddleTree<Self>,
+        pool: &BaseColumnPool<Self>,
+    ) -> CircleCoefficients<Self> {
+        interpolate_ex(eval, twiddles, Some(pool))
     }
 
     fn eval_at_point(
@@ -413,28 +480,30 @@ impl PolyOps for SimdBackend {
         // Evaluate on big domains by evaluating on several subdomains.
         let log_subdomains = log_size - fft_log_size;
 
-        for i in 0..(1 << log_subdomains) {
-            // The subdomain twiddles are a slice of the large domain twiddles.
-            let subdomain_twiddles = (0..(fft_log_size - 1))
-                .map(|layer_i| {
-                    &twiddles[layer_i as usize]
-                        [i << (fft_log_size - 2 - layer_i)..(i + 1) << (fft_log_size - 2 - layer_i)]
-                })
-                .collect::<Vec<_>>();
+        // The twiddles of each subdomain are a slice of the large domain twiddles.
+        let subdomain_twiddles = (0..(1usize << log_subdomains))
+            .map(|i| {
+                (0..(fft_log_size - 1))
+                    .map(|layer_i| {
+                        &twiddles[layer_i as usize][i << (fft_log_size - 2 - layer_i)
+                            ..(i + 1) << (fft_log_size - 2 - layer_i)]
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
-            // FFT from the coefficients buffer directly into the provided buffer.
-            unsafe {
-                rfft::fft(
-                    transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
-                    transmute::<*mut PackedBaseField, *mut u32>(
-                        buffer.data[i << (fft_log_size - LOG_N_LANES)
-                            ..(i + 1) << (fft_log_size - LOG_N_LANES)]
-                            .as_mut_ptr(),
-                    ),
-                    &subdomain_twiddles,
-                    fft_log_size as usize,
-                );
-            }
+        // Map the pages of the destination in one call before the FFT's stores fault them in one
+        // by one (a hint: no-op where the kernel does not support it).
+        advise_pages(&buffer.data, true);
+
+        // FFT from the coefficients buffer directly into the provided buffer.
+        unsafe {
+            rfft::fft_subdomains(
+                transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
+                transmute::<*mut PackedBaseField, *mut u32>(buffer.data.as_mut_ptr()),
+                &subdomain_twiddles,
+                fft_log_size as usize,
+            );
         }
 
         CircleEvaluation::new(domain, buffer)

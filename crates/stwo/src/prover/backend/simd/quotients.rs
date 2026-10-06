@@ -1,18 +1,21 @@
 use std::iter::zip;
+use std::simd::u64x8;
 
 use itertools::{Itertools, zip_eq};
 use num_traits::Zero;
 #[cfg(feature = "parallel")]
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 
 use super::SimdBackend;
-use super::column::CM31Column;
+use super::column::{BaseColumn, CM31Column};
 use super::domain::CircleDomainBitRevIterator;
 use super::m31::{LOG_N_LANES, PackedBaseField};
 use super::qm31::PackedSecureField;
 use crate::core::circle::CirclePoint;
 use crate::core::fields::batch_inverse;
-use crate::core::fields::m31::BaseField;
+use crate::core::fields::m31::{BaseField, P};
 use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::quotients::{ColumnSampleBatch, quotient_constants};
 use crate::core::poly::circle::{CanonicCoset, CircleDomain};
@@ -185,15 +188,22 @@ impl QuotientOps for SimdBackend {
                 .itwiddles
                 .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
         };
+        // The four coordinate columns are interpolated and evaluated concurrently: each FFT is
+        // parallel on its own, but one column at a time leaves most threads idle.
+        let extend = |eval: BaseColumn| {
+            let poly = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                eval_subdomain,
+                eval,
+            )
+            .interpolate_with_twiddles(&subdomain_twiddles);
+            poly.evaluate_with_twiddles(eval_domain, twiddles).values
+        };
+        #[cfg(not(feature = "parallel"))]
+        let columns: Vec<BaseColumn> = quotients.columns.into_iter().map(extend).collect();
+        #[cfg(feature = "parallel")]
+        let columns: Vec<BaseColumn> = quotients.columns.into_par_iter().map(extend).collect();
         let evals = SecureColumnByCoords {
-            columns: quotients.columns.map(|eval| {
-                let poly = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
-                    eval_subdomain,
-                    eval,
-                )
-                .interpolate_with_twiddles(&subdomain_twiddles);
-                poly.evaluate_with_twiddles(eval_domain, twiddles).values
-            }),
+            columns: columns.try_into().unwrap_or_else(|_| unreachable!("four coordinates")),
         };
 
         SecureEvaluation::new(eval_domain, evals)
@@ -205,6 +215,14 @@ impl QuotientOps for SimdBackend {
 /// Note that `columns` are assumed to be evaluations over a possibly larger domain containing
 /// `subdomain`. It must hold that the points of `subdomain` in bit-reversed order form a prefix of
 /// the points of the larger domain in bit-reversed order.
+///
+/// Every term `c * val - b` of a coordinate is accumulated with deferred reduction: the exact
+/// 64-bit products (each below 2^62) of up to four terms are summed in `u64` lanes, folded once
+/// (`x = hi * 2^31 + lo == hi + lo` modulo `P`) and added to a wide accumulator, and the `b`
+/// coefficients, which do not depend on the row, are summed once per batch. The result equals
+/// the per-term reduced computation modulo `P` (here it is fully reduced into `[0, P)`).
+///
+/// Deferred-reduction mechanism: workshop thread bt1_4527483bd364509b01f72c85.
 fn accumulate_numerators_on_subdomain(
     subdomain: CircleDomain,
     sample_batch: &ColumnSampleBatch,
@@ -213,9 +231,58 @@ fn accumulate_numerators_on_subdomain(
 ) -> SecureColumnByCoords<SimdBackend> {
     // This constant is chosen empirically by benchmarking.
     const NUMERATORS_CHUNK_SIZE: usize = 1 << 6;
+    // Number of packed rows accumulated together in a pass over all the terms.
+    const ROW_BLOCK: usize = 16;
+
+    type RowAcc = [[u64x8; 2]; 4];
+
+    #[inline(always)]
+    fn accumulate_group<const G: usize>(
+        acc: &mut [RowAcc],
+        cols: [&[PackedBaseField]; G],
+        coeffs: &[[u32; 4]; G],
+    ) {
+        for (r, row_acc) in acc.iter_mut().enumerate() {
+            let mut even = [u64x8::splat(0); G];
+            let mut odd = [u64x8::splat(0); G];
+            for g in 0..G {
+                let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(cols[g][r]));
+                even[g] = w & u64x8::splat(0xFFFF_FFFF);
+                odd[g] = w >> 32;
+            }
+            for k in 0..4 {
+                let mut pe = even[0] * u64x8::splat(coeffs[0][k] as u64);
+                let mut po = odd[0] * u64x8::splat(coeffs[0][k] as u64);
+                for g in 1..G {
+                    pe += even[g] * u64x8::splat(coeffs[g][k] as u64);
+                    po += odd[g] * u64x8::splat(coeffs[g][k] as u64);
+                }
+                row_acc[k][0] += (pe & u64x8::splat(P as u64)) + (pe >> 31);
+                row_acc[k][1] += (po & u64x8::splat(P as u64)) + (po >> 31);
+            }
+        }
+    }
 
     let mut values =
         unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(subdomain.size()) };
+
+    // Per-term data, shared by all chunks.
+    let terms: Vec<(&[PackedBaseField], [u32; 4])> =
+        zip_eq(&sample_batch.cols_vals_randpows, quotient_coeffs)
+            .map(|(numerator_data, (_, _, c))| {
+                let col_data = &columns[numerator_data.column_index].data;
+                (&col_data[..], [c.0.0.0, c.0.1.0, c.1.0.0, c.1.1.0])
+            })
+            .collect();
+    // The sum of the row independent `b` terms, negated.
+    let b_sum: SecureField = quotient_coeffs.iter().map(|(_, b, _)| b).sum();
+    let neg_b_sum = -b_sum;
+    let neg_b = [
+        PackedBaseField::broadcast(neg_b_sum.0.0),
+        PackedBaseField::broadcast(neg_b_sum.0.1),
+        PackedBaseField::broadcast(neg_b_sum.1.0),
+        PackedBaseField::broadcast(neg_b_sum.1.1),
+    ];
 
     #[cfg(not(feature = "parallel"))]
     let iter = values.chunks_mut(NUMERATORS_CHUNK_SIZE);
@@ -225,27 +292,59 @@ fn accumulate_numerators_on_subdomain(
 
     iter.enumerate().for_each(|(chunk_idx, mut values_dst)| {
         let chunk_start = chunk_idx * NUMERATORS_CHUNK_SIZE;
-        // Initialize accumulators for the chunk.
-        let mut accumulators = [PackedSecureField::zero(); NUMERATORS_CHUNK_SIZE];
         // This is needed because the last chunk may be smaller than
         // `NUMERATORS_CHUNK_SIZE`.
         let packed_chunk_len = values_dst.0[0].0.len();
-        let accumulators = &mut accumulators[..packed_chunk_len];
 
-        for (numerator_data, (_, b, c)) in zip_eq(&sample_batch.cols_vals_randpows, quotient_coeffs)
-        {
-            let col_data = &columns[numerator_data.column_index].data;
-            let b_broadcast = PackedSecureField::broadcast(*b);
-            let c_broadcast = PackedSecureField::broadcast(*c);
-            for (i, acc) in accumulators.iter_mut().enumerate() {
-                let val = col_data[chunk_start + i];
-                *acc += c_broadcast * val - b_broadcast;
+        for block_start in (0..packed_chunk_len).step_by(ROW_BLOCK) {
+            let n_rows = ROW_BLOCK.min(packed_chunk_len - block_start);
+            let first = chunk_start + block_start;
+            let mut acc = [[[u64x8::splat(0); 2]; 4]; ROW_BLOCK];
+            let acc_rows = &mut acc[..n_rows];
+
+            let mut quads = terms.chunks_exact(4);
+            for q in &mut quads {
+                accumulate_group::<4>(
+                    acc_rows,
+                    [
+                        &q[0].0[first..first + n_rows],
+                        &q[1].0[first..first + n_rows],
+                        &q[2].0[first..first + n_rows],
+                        &q[3].0[first..first + n_rows],
+                    ],
+                    &[q[0].1, q[1].1, q[2].1, q[3].1],
+                );
             }
-        }
+            match quads.remainder() {
+                [a, b, c] => accumulate_group::<3>(
+                    acc_rows,
+                    [
+                        &a.0[first..first + n_rows],
+                        &b.0[first..first + n_rows],
+                        &c.0[first..first + n_rows],
+                    ],
+                    &[a.1, b.1, c.1],
+                ),
+                [a, b] => accumulate_group::<2>(
+                    acc_rows,
+                    [&a.0[first..first + n_rows], &b.0[first..first + n_rows]],
+                    &[a.1, b.1],
+                ),
+                [a] => accumulate_group::<1>(acc_rows, [&a.0[first..first + n_rows]], &[a.1]),
+                _ => {}
+            }
 
-        for (i, acc) in accumulators.iter().enumerate() {
-            unsafe {
-                values_dst.set_packed(i, *acc);
+            for (r, row_acc) in acc_rows.iter().enumerate() {
+                let coords: [PackedBaseField; 4] = std::array::from_fn(|k| {
+                    let fold = |x: u64x8| (x & u64x8::splat(P as u64)) + (x >> 31);
+                    let packed = fold(row_acc[k][0]) | (fold(row_acc[k][1]) << 32);
+                    let lanes = bytemuck::cast::<[u64; 8], PackedBaseField>(packed.to_array());
+                    PackedBaseField::reduce_simd(lanes.into_simd()) + neg_b[k]
+                });
+                unsafe {
+                    values_dst
+                        .set_packed(block_start + r, PackedSecureField::from_packed_m31s(coords));
+                }
             }
         }
     });

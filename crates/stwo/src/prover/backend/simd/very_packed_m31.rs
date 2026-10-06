@@ -19,6 +19,7 @@ pub const N_VERY_PACKED_ELEMS: usize = 1 << LOG_N_VERY_PACKED_ELEMS;
 pub struct Vectorized<A: Copy, const N: usize>(pub [A; N]);
 
 impl<A: Copy, const N: usize> Vectorized<A, N> {
+    #[inline(always)]
     pub fn from_fn<F>(cb: F) -> Self
     where
         F: FnMut(usize) -> A,
@@ -48,6 +49,7 @@ pub type VeryPackedBaseField = VeryPackedM31;
 pub type VeryPackedSecureField = VeryPackedQM31;
 
 impl VeryPackedM31 {
+    #[inline(always)]
     pub fn broadcast(value: M31) -> Self {
         Self::from_fn(|_| PackedM31::broadcast(value))
     }
@@ -73,31 +75,37 @@ impl VeryPackedM31 {
 }
 
 impl VeryPackedCM31 {
+    #[inline(always)]
     pub fn broadcast(value: CM31) -> Self {
         Self::from_fn(|_| PackedCM31::broadcast(value))
     }
 }
 
 impl VeryPackedQM31 {
+    #[inline(always)]
     pub fn broadcast(value: QM31) -> Self {
         Self::from_fn(|_| PackedQM31::broadcast(value))
     }
 
+    #[inline(always)]
     pub fn from_very_packed_m31s([a, b, c, d]: [VeryPackedM31; 4]) -> Self {
         Self::from_fn(|i| PackedQM31::from_packed_m31s([a.0[i], b.0[i], c.0[i], d.0[i]]))
     }
 
+    #[inline(always)]
     pub fn into_very_packed_m31s(self) -> [VeryPackedM31; 4] {
         std::array::from_fn(|i| VeryPackedM31::from(self.0.map(|v| v.into_packed_m31s()[i])))
     }
 }
 impl From<M31> for VeryPackedM31 {
+    #[inline(always)]
     fn from(v: M31) -> Self {
         Self::broadcast(v)
     }
 }
 
 impl From<VeryPackedM31> for VeryPackedQM31 {
+    #[inline(always)]
     fn from(value: VeryPackedM31) -> Self {
         VeryPackedQM31::from_very_packed_m31s([
             value,
@@ -109,6 +117,7 @@ impl From<VeryPackedM31> for VeryPackedQM31 {
 }
 
 impl From<QM31> for VeryPackedQM31 {
+    #[inline(always)]
     fn from(value: QM31) -> Self {
         VeryPackedQM31::broadcast(value)
     }
@@ -122,12 +131,79 @@ impl Scalar for PackedM31 {}
 impl Scalar for PackedCM31 {}
 impl Scalar for PackedQM31 {}
 
+/// Multiplication used by the [`Vectorized`] operators, which the constraint evaluators are
+/// written against. It defaults to `Mul`; the lane-wise base field product overrides it with the
+/// multiplication kernel expanded at the call site ([`PackedM31::mul_inline`]).
+trait MulInl<Rhs = Self>: Mul<Rhs> + Sized {
+    #[inline(always)]
+    fn mul_inl(self, rhs: Rhs) -> <Self as Mul<Rhs>>::Output {
+        self * rhs
+    }
+}
+
+impl MulInl for PackedM31 {
+    #[inline(always)]
+    fn mul_inl(self, rhs: PackedM31) -> PackedM31 {
+        self.mul_inline(rhs)
+    }
+}
+impl MulInl<M31> for PackedM31 {
+    #[inline(always)]
+    fn mul_inl(self, rhs: M31) -> PackedM31 {
+        self.mul_inline(PackedM31::broadcast(rhs))
+    }
+}
+impl MulInl<QM31> for PackedM31 {
+    #[inline(always)]
+    fn mul_inl(self, rhs: QM31) -> PackedQM31 {
+        PackedQM31::broadcast(rhs).mul_m31_inline(self)
+    }
+}
+impl MulInl for PackedCM31 {
+    #[inline(always)]
+    fn mul_inl(self, rhs: PackedCM31) -> PackedCM31 {
+        self.mul_inline(rhs)
+    }
+}
+impl MulInl<PackedM31> for PackedCM31 {
+    #[inline(always)]
+    fn mul_inl(self, rhs: PackedM31) -> PackedCM31 {
+        self.mul_m31_inline(rhs)
+    }
+}
+impl MulInl for PackedQM31 {
+    #[inline(always)]
+    fn mul_inl(self, rhs: PackedQM31) -> PackedQM31 {
+        self.mul_inline(rhs)
+    }
+}
+impl MulInl<PackedM31> for PackedQM31 {
+    #[inline(always)]
+    fn mul_inl(self, rhs: PackedM31) -> PackedQM31 {
+        self.mul_m31_inline(rhs)
+    }
+}
+impl MulInl<PackedCM31> for PackedQM31 {}
+impl MulInl<QM31> for PackedQM31 {
+    #[inline(always)]
+    fn mul_inl(self, rhs: QM31) -> PackedQM31 {
+        self.mul_inline(PackedQM31::broadcast(rhs))
+    }
+}
+impl MulInl<M31> for PackedQM31 {
+    #[inline(always)]
+    fn mul_inl(self, rhs: M31) -> PackedQM31 {
+        self.mul_m31_inline(PackedM31::broadcast(rhs))
+    }
+}
+
 impl<A: Add<B> + Copy, B: Copy, const N: usize> Add<Vectorized<B, N>> for Vectorized<A, N>
 where
     <A as Add<B>>::Output: Copy,
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn add(self, other: Vectorized<B, N>) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] + other.0[i])
     }
@@ -139,6 +215,7 @@ where
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn add(self, other: B) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] + other)
     }
@@ -150,6 +227,7 @@ where
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn sub(self, other: Vectorized<B, N>) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] - other.0[i])
     }
@@ -161,36 +239,40 @@ where
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn sub(self, other: B) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] - other)
     }
 }
 
-impl<A: Mul<B> + Copy, B: Copy, const N: usize> Mul<Vectorized<B, N>> for Vectorized<A, N>
+impl<A: MulInl<B> + Copy, B: Copy, const N: usize> Mul<Vectorized<B, N>> for Vectorized<A, N>
 where
     <A as Mul<B>>::Output: Copy,
 {
-    type Output = Vectorized<A::Output, N>;
+    type Output = Vectorized<<A as Mul<B>>::Output, N>;
 
+    #[inline(always)]
     fn mul(self, other: Vectorized<B, N>) -> Self::Output {
-        Vectorized::from_fn(|i| self.0[i] * other.0[i])
+        Vectorized::from_fn(|i| self.0[i].mul_inl(other.0[i]))
     }
 }
 
-impl<A: Mul<B> + Copy, B: Scalar + Copy, const N: usize> Mul<B> for Vectorized<A, N>
+impl<A: MulInl<B> + Copy, B: Scalar + Copy, const N: usize> Mul<B> for Vectorized<A, N>
 where
     <A as Mul<B>>::Output: Copy,
 {
-    type Output = Vectorized<A::Output, N>;
+    type Output = Vectorized<<A as Mul<B>>::Output, N>;
 
+    #[inline(always)]
     fn mul(self, other: B) -> Self::Output {
-        Vectorized::from_fn(|i| self.0[i] * other)
+        Vectorized::from_fn(|i| self.0[i].mul_inl(other))
     }
 }
 
 impl<A: AddAssign<B> + Copy, B: Copy, const N: usize> AddAssign<Vectorized<B, N>>
     for Vectorized<A, N>
 {
+    #[inline(always)]
     fn add_assign(&mut self, other: Vectorized<B, N>) {
         for i in 0..N {
             self.0[i] += other.0[i];
@@ -199,6 +281,7 @@ impl<A: AddAssign<B> + Copy, B: Copy, const N: usize> AddAssign<Vectorized<B, N>
 }
 
 impl<A: AddAssign<B> + Copy, B: Scalar + Copy, const N: usize> AddAssign<B> for Vectorized<A, N> {
+    #[inline(always)]
     fn add_assign(&mut self, other: B) {
         for i in 0..N {
             self.0[i] += other;
@@ -209,6 +292,7 @@ impl<A: AddAssign<B> + Copy, B: Scalar + Copy, const N: usize> AddAssign<B> for 
 impl<A: MulAssign<B> + Copy, B: Copy, const N: usize> MulAssign<Vectorized<B, N>>
     for Vectorized<A, N>
 {
+    #[inline(always)]
     fn mul_assign(&mut self, other: Vectorized<B, N>) {
         for i in 0..N {
             self.0[i] *= other.0[i];
@@ -229,6 +313,7 @@ where
 }
 
 impl<A: Zero + Copy, const N: usize> Zero for Vectorized<A, N> {
+    #[inline(always)]
     fn zero() -> Self {
         Vectorized::from_fn(|_| A::zero())
     }
@@ -238,13 +323,14 @@ impl<A: Zero + Copy, const N: usize> Zero for Vectorized<A, N> {
     }
 }
 
-impl<A: One + Copy, const N: usize> One for Vectorized<A, N> {
+impl<A: One + MulInl + Copy, const N: usize> One for Vectorized<A, N> {
+    #[inline(always)]
     fn one() -> Self {
         Vectorized::from_fn(|_| A::one())
     }
 }
 
-impl<A: FieldExpOps + Zero + Copy, const N: usize> FieldExpOps for Vectorized<A, N> {
+impl<A: FieldExpOps + Zero + MulInl + Copy, const N: usize> FieldExpOps for Vectorized<A, N> {
     fn inverse(&self) -> Self {
         let mut dst = [A::zero(); N];
         batch_inverse_interleaved(&self.0, &mut dst);

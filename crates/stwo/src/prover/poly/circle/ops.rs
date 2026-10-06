@@ -39,6 +39,30 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         iter.map(|eval| eval.interpolate_with_twiddles(twiddles)).collect()
     }
 
+    /// [`Self::interpolate`] with the buffers of `pool` where the backend supports it: the
+    /// coefficients may be written to a buffer of the pool, and the evaluation buffer given back.
+    fn interpolate_pooled(
+        eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,
+        itwiddles: &TwiddleTree<Self>,
+        _pool: &BaseColumnPool<Self>,
+    ) -> CircleCoefficients<Self> {
+        Self::interpolate(eval, itwiddles)
+    }
+
+    /// [`Self::interpolate_columns`] through [`Self::interpolate_pooled`].
+    fn interpolate_columns_pooled(
+        columns: Vec<CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        twiddles: &TwiddleTree<Self>,
+        pool: &BaseColumnPool<Self>,
+    ) -> Vec<CircleCoefficients<Self>> {
+        #[cfg(feature = "parallel")]
+        let iter = columns.into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = columns.into_iter();
+
+        iter.map(|eval| Self::interpolate_pooled(eval, twiddles, pool)).collect()
+    }
+
     /// Evaluates the polynomial at a single point.
     /// Used by the [`CircleCoefficients::eval_at_point()`] function.
     fn eval_at_point(
@@ -116,14 +140,19 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
     where
         Self: crate::prover::backend::Backend,
     {
-        // Pre-take all buffers from the pool before the parallel section.
-        let buffers: Vec<_> = polynomials
+        // Pre-take all buffers from the pool before the parallel section: first the buffers of
+        // the exact size, so that a column does not take, and shorten, a larger idle buffer that
+        // a later column of that size could have used as it is.
+        let mut buffers: Vec<_> = polynomials
             .iter()
-            .map(|poly_coeffs| {
-                let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
-                pool.take_or_alloc(log_eval_size)
-            })
+            .map(|poly_coeffs| pool.try_take(poly_coeffs.log_size() + log_blowup_factor))
             .collect();
+        for (poly_coeffs, buffer) in polynomials.iter().zip(buffers.iter_mut()) {
+            if buffer.is_none() {
+                *buffer = Some(pool.take_or_alloc(poly_coeffs.log_size() + log_blowup_factor));
+            }
+        }
+        let buffers: Vec<_> = buffers.into_iter().map(Option::unwrap).collect();
 
         #[cfg(feature = "parallel")]
         let iter = polynomials.into_par_iter().zip(buffers.into_par_iter());

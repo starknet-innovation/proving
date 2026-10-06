@@ -50,6 +50,8 @@ use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::prover::CommitmentTreeProver;
 use stwo::prover::backend::simd::SimdBackend;
+#[cfg(unix)]
+use stwo::prover::backend::simd::column::LargeBlockCache;
 use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
@@ -67,17 +69,62 @@ use crate::consts::{
     CAIRO_PROVER_PARAMS, CAIRO_RUN_CONFIG, CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
 };
 
+/// The precomputes of a prover process.
+///
+/// The large members (the pool with its buffers, the twiddles, the preprocessed trees and the
+/// circuit) live as long as the process and are not freed when the precomputes are dropped: a
+/// prover drops them only on its way out, where unmapping several gigabytes buffer by buffer
+/// costs tens of milliseconds for nothing, while the operating system reclaims the whole address
+/// space at once at exit.
 pub struct RecursiveProverPrecomputes {
-    pub base_column_pool: BaseColumnPool<SimdBackend>,
-    pub twiddles: TwiddleTree<SimdBackend>,
+    pub base_column_pool: std::mem::ManuallyDrop<Arc<BaseColumnPool<SimdBackend>>>,
+    pub twiddles: std::mem::ManuallyDrop<Arc<TwiddleTree<SimdBackend>>>,
     pub cairo_preprocessed_trace: Arc<PreProcessedTrace>,
-    pub cairo_preprocessed_tree: CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>,
+    pub cairo_preprocessed_tree:
+        std::mem::ManuallyDrop<CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>>,
     pub cairo_verifier_config: CairoVerifierConfig,
-    pub circuit_preprocessed_tree: CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>,
-    pub preprocessed_circuit: PreprocessedCircuit,
+    /// Built on first use, which is after the Cairo proof: its committed evaluations are not
+    /// resident while that proof runs, its columns reuse that proof's idle buffers, and the
+    /// circuit proof needs them only when it starts.
+    pub circuit_preprocessed_tree: std::mem::ManuallyDrop<LazyCommitmentTree>,
+    pub preprocessed_circuit: std::mem::ManuallyDrop<PreprocessedCircuit>,
     pub circuit_config: CircuitConfig,
     pub proof_config: ProofConfig,
 }
+
+type PrecomputedTree = CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>;
+
+/// A committed preprocessed tree that is built the first time it is dereferenced.
+pub struct LazyCommitmentTree {
+    tree: std::sync::OnceLock<PrecomputedTree>,
+    build: std::sync::Mutex<Option<Box<dyn FnOnce() -> PrecomputedTree + Send>>>,
+}
+
+impl LazyCommitmentTree {
+    pub fn new(build: impl FnOnce() -> PrecomputedTree + Send + 'static) -> Self {
+        Self {
+            tree: std::sync::OnceLock::new(),
+            build: std::sync::Mutex::new(Some(Box::new(build))),
+        }
+    }
+}
+
+impl std::ops::Deref for LazyCommitmentTree {
+    type Target = PrecomputedTree;
+
+    fn deref(&self) -> &PrecomputedTree {
+        self.tree.get_or_init(|| {
+            let build = self.build.lock().unwrap().take().expect("the tree is built once");
+            build()
+        })
+    }
+}
+
+/// Large blocks come from a cache every thread shares instead of each thread's malloc arena, so
+/// the temporaries one worker frees are reused by the others; see [`LargeBlockCache`].
+#[cfg(unix)]
+#[global_allocator]
+static ALLOCATOR: LargeBlockCache = LargeBlockCache;
 
 fn compress_proof(proof_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(zstd::encode_all(proof_bytes, 3)?)
@@ -135,12 +182,10 @@ pub fn prepare_recursive_prover_precomputes()
     let _span = span!(Level::INFO, "prepare_privacy_recursiveprover_precomputes").entered();
 
     let cairo_verifier_config = get_cairo_verifier_config()?;
-    let preprocessed_circuit = get_cairo_preprocessed_circuit(&cairo_verifier_config);
     let circuit_config =
         get_recursive_circuit_config(&PRIVACY_RECURSION_CIRCUIT_PREPROCESSED_ROOT)?;
     let proof_config = get_proof_config(&PRIVACY_RECURSION_CIRCUIT_PREPROCESSED_ROOT)?;
 
-    info!("Prepare the twiddles");
     let base_column_pool = BaseColumnPool::<SimdBackend>::new();
     let LiftingSizePolicy::Fixed(cairo_lifting_log_size) = CAIRO_PROVER_PARAMS.lifting_size_policy
     else {
@@ -148,51 +193,81 @@ pub fn prepare_recursive_prover_precomputes()
     };
     let circuit_lifting_log_size = CIRCUIT_PCS_CONFIG.trace_lifting_log_size;
 
-    // Precompute twiddles.
     let max_domain_size = max(cairo_lifting_log_size, circuit_lifting_log_size);
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(max_domain_size).circle_domain().half_coset,
-    );
 
-    info!("Prepare the cairo prover preprocessed trace and tree");
-    let cairo_preprocessed_trace =
-        Arc::new(CAIRO_PROVER_PARAMS.preprocessed_trace.to_preprocessed_trace());
-    // Warm the Pedersen points table before gen_trace reads it.
-    warm_pedersen_pp_trace(CAIRO_PROVER_PARAMS.preprocessed_trace);
-    let cairo_preprocessed_trace_polys =
-        SimdBackend::interpolate_columns(gen_trace(cairo_preprocessed_trace.clone()), &twiddles);
-    let cairo_preprocessed_tree = CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
-        cairo_preprocessed_trace_polys,
-        CAIRO_PCS_CONFIG.fri_config.log_blowup_factor,
-        &twiddles,
-        CAIRO_PROVER_PARAMS.store_polynomials_coefficients,
-        cairo_lifting_log_size,
-        &base_column_pool,
-    );
-
-    info!("Prepare the circuit prover preprocessed trace and tree");
-    let circuit_preprocessed_trace =
-        preprocessed_circuit.preprocessed_trace.get_trace::<SimdBackend>();
-    let circuit_preprocessed_trace_polys =
-        SimdBackend::interpolate_columns(circuit_preprocessed_trace, &twiddles);
-    let circuit_preprocessed_tree =
-        CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
-            circuit_preprocessed_trace_polys,
-            CIRCUIT_FRI_CONFIG.log_blowup_factor,
-            &twiddles,
-            CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
-            circuit_config.config.preprocessed_lifting_log_size,
-            &base_column_pool,
+    // The circuit-side preprocessing is sequential and independent of the Cairo-side twiddles,
+    // preprocessed trace and tree, so the two run concurrently.
+    let (preprocessed_circuit, (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)) =
+        rayon::join(
+            || get_cairo_preprocessed_circuit(&cairo_verifier_config),
+            || {
+                // The twiddles and the Cairo preprocessed trace are independent as well.
+                let (twiddles, (cairo_preprocessed_trace, cairo_preprocessed_evals)) = rayon::join(
+                    || {
+                        info!("Prepare the twiddles");
+                        SimdBackend::precompute_twiddles(
+                            CanonicCoset::new(max_domain_size).circle_domain().half_coset,
+                        )
+                    },
+                    || {
+                        info!("Prepare the cairo prover preprocessed trace");
+                        let cairo_preprocessed_trace = Arc::new(
+                            CAIRO_PROVER_PARAMS.preprocessed_trace.to_preprocessed_trace(),
+                        );
+                        // Warm the Pedersen points table before gen_trace reads it.
+                        warm_pedersen_pp_trace(CAIRO_PROVER_PARAMS.preprocessed_trace);
+                        let evals = gen_trace(cairo_preprocessed_trace.clone());
+                        (cairo_preprocessed_trace, evals)
+                    },
+                );
+                info!("Prepare the cairo prover preprocessed tree");
+                let cairo_preprocessed_trace_polys =
+                    SimdBackend::interpolate_columns(cairo_preprocessed_evals, &twiddles);
+                let cairo_preprocessed_tree =
+                    CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
+                        cairo_preprocessed_trace_polys,
+                        CAIRO_PCS_CONFIG.fri_config.log_blowup_factor,
+                        &twiddles,
+                        CAIRO_PROVER_PARAMS.store_polynomials_coefficients,
+                        cairo_lifting_log_size,
+                        &base_column_pool,
+                    );
+                (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)
+            },
         );
 
+    info!("Prepare the circuit prover preprocessed trace and tree (built on first use)");
+    let base_column_pool = Arc::new(base_column_pool);
+    let twiddles = Arc::new(twiddles);
+    let circuit_preprocessed_tree = {
+        let preprocessed_trace = preprocessed_circuit.preprocessed_trace.clone();
+        let twiddles = twiddles.clone();
+        let base_column_pool = base_column_pool.clone();
+        let preprocessed_lifting_log_size = circuit_config.config.preprocessed_lifting_log_size;
+        LazyCommitmentTree::new(move || {
+            let _span = span!(Level::INFO, "prepare_circuit_preprocessed_tree").entered();
+            let circuit_preprocessed_trace = preprocessed_trace.get_trace::<SimdBackend>();
+            let circuit_preprocessed_trace_polys =
+                SimdBackend::interpolate_columns(circuit_preprocessed_trace, &twiddles);
+            CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
+                circuit_preprocessed_trace_polys,
+                CIRCUIT_FRI_CONFIG.log_blowup_factor,
+                &twiddles,
+                CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
+                preprocessed_lifting_log_size,
+                &base_column_pool,
+            )
+        })
+    };
+
     Ok(Arc::new(RecursiveProverPrecomputes {
-        base_column_pool,
-        twiddles,
+        base_column_pool: std::mem::ManuallyDrop::new(base_column_pool),
+        twiddles: std::mem::ManuallyDrop::new(twiddles),
         cairo_preprocessed_trace,
-        cairo_preprocessed_tree,
+        cairo_preprocessed_tree: std::mem::ManuallyDrop::new(cairo_preprocessed_tree),
         cairo_verifier_config,
-        circuit_preprocessed_tree,
-        preprocessed_circuit,
+        circuit_preprocessed_tree: std::mem::ManuallyDrop::new(circuit_preprocessed_tree),
+        preprocessed_circuit: std::mem::ManuallyDrop::new(preprocessed_circuit),
         circuit_config,
         proof_config,
     }))
