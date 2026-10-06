@@ -1012,6 +1012,11 @@ unsafe impl GlobalAlloc for LargeBlockCache {
         if start + len > block + size {
             munmap((block + size) as *mut core::ffi::c_void, start + len - block - size);
         }
+        // In `madvise` THP mode huge pages must be asked for: one fault per 2 MiB, not 512.
+        #[cfg(target_os = "linux")]
+        if align == HUGE_PAGE {
+            madvise(block as *mut core::ffi::c_void, size, 14);
+        }
         block as *mut u8
     }
 

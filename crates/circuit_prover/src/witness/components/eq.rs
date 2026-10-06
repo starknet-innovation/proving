@@ -8,8 +8,8 @@ pub type PackedInputType = [PackedM31; 4];
 /// preprocessed trace.
 #[allow(clippy::uninit_vec)]
 pub fn extract_component_inputs(
-    in0_address: &[usize],
-    in1_address: &[usize],
+    in0_address: &[u32],
+    in1_address: &[u32],
     context_values: &[QM31],
 ) -> Vec<InputType> {
     let n_rows = in0_address.len();
@@ -25,7 +25,7 @@ pub fn extract_component_inputs(
     (in0_address.par_iter(), in1_address.par_iter()).into_par_iter().for_each(
         |(in0_address, in1_address)| {
             assert_eq!(
-                context_values[*in0_address], context_values[*in1_address],
+                context_values[*in0_address as usize], context_values[*in1_address as usize],
                 "Eq gate: in0 and in1 must have equal values"
             );
         },
@@ -33,7 +33,7 @@ pub fn extract_component_inputs(
 
     (inputs.par_iter_mut(), in0_address.par_iter()).into_par_iter().for_each(
         |(input, in0_address)| {
-            *input = context_values[*in0_address].to_m31_array();
+            *input = context_values[*in0_address as usize].to_m31_array();
         },
     );
 

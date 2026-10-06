@@ -423,11 +423,12 @@ fn blake_g_gate_preprocessed_columns(
 /// the proof.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PreProcessedTrace {
-    columns: OrderedHashMap<PreProcessedColumnId, Vec<usize>>,
+    columns: OrderedHashMap<PreProcessedColumnId, Vec<u32>>,
 }
 
 impl PreProcessedTrace {
     fn push_column(&mut self, id: PreProcessedColumnId, column: Vec<usize>) {
+        let column: Vec<u32> = column.into_iter().map(|x| u32::try_from(x).unwrap()).collect();
         assert!(
             self.columns.insert(id.clone(), column).is_none(),
             "Duplicate preprocessed column id: {id:?}"
@@ -471,17 +472,17 @@ impl PreProcessedTrace {
     pub fn get_trace<B: Backend>(&self) -> Vec<CircleEvaluation<B, BaseField, BitReversedOrder>> {
         use rayon::prelude::*;
 
-        let to_evaluation = |vec: &Vec<usize>| {
+        let to_evaluation = |vec: &Vec<u32>| {
             let col = Col::<B, BaseField>::from_iter(vec.iter().cloned().map(BaseField::from));
             CircleEvaluation::new(CanonicCoset::new(col.len().ilog2()).circle_domain(), col)
         };
 
         // The columns are converted independently; the order of the result is that of the map.
-        let columns: Vec<&Vec<usize>> = self.columns.values().collect();
+        let columns: Vec<&Vec<u32>> = self.columns.values().collect();
         columns.into_par_iter().map(to_evaluation).collect()
     }
 
-    pub fn get_column(&self, id: &PreProcessedColumnId) -> &Vec<usize> {
+    pub fn get_column(&self, id: &PreProcessedColumnId) -> &Vec<u32> {
         self.columns.get(id).unwrap_or_else(|| panic!("Missing preprocessed column {id:?}"))
     }
 

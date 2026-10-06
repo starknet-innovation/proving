@@ -15,16 +15,16 @@ pub type PackedInputType = [PackedUInt32; 10];
 #[allow(clippy::uninit_vec)]
 #[allow(clippy::too_many_arguments)]
 pub fn extract_component_inputs(
-    input_addr_a: &[usize],
-    input_addr_b: &[usize],
-    input_addr_c: &[usize],
-    input_addr_d: &[usize],
-    input_addr_f0: &[usize],
-    input_addr_f1: &[usize],
-    output_addr_a: &[usize],
-    output_addr_b: &[usize],
-    output_addr_c: &[usize],
-    output_addr_d: &[usize],
+    input_addr_a: &[u32],
+    input_addr_b: &[u32],
+    input_addr_c: &[u32],
+    input_addr_d: &[u32],
+    input_addr_f0: &[u32],
+    input_addr_f1: &[u32],
+    output_addr_a: &[u32],
+    output_addr_b: &[u32],
+    output_addr_c: &[u32],
+    output_addr_d: &[u32],
     context_values: &[QM31],
 ) -> Vec<InputType> {
     let n_rows = input_addr_a.len();
@@ -71,16 +71,16 @@ pub fn extract_component_inputs(
                 &out_addr_c,
                 &out_addr_d,
             )| {
-                let qm31_in_addr_a = context_values[addr_a].to_m31_array();
-                let qm31_in_addr_b = context_values[addr_b].to_m31_array();
-                let qm31_in_addr_c = context_values[addr_c].to_m31_array();
-                let qm31_in_addr_d = context_values[addr_d].to_m31_array();
-                let qm31_in_addr_f0 = context_values[addr_f0].to_m31_array();
-                let qm31_in_addr_f1 = context_values[addr_f1].to_m31_array();
-                let qm31_out_addr_a = context_values[out_addr_a].to_m31_array();
-                let qm31_out_addr_b = context_values[out_addr_b].to_m31_array();
-                let qm31_out_addr_c = context_values[out_addr_c].to_m31_array();
-                let qm31_out_addr_d = context_values[out_addr_d].to_m31_array();
+                let qm31_in_addr_a = context_values[addr_a as usize].to_m31_array();
+                let qm31_in_addr_b = context_values[addr_b as usize].to_m31_array();
+                let qm31_in_addr_c = context_values[addr_c as usize].to_m31_array();
+                let qm31_in_addr_d = context_values[addr_d as usize].to_m31_array();
+                let qm31_in_addr_f0 = context_values[addr_f0 as usize].to_m31_array();
+                let qm31_in_addr_f1 = context_values[addr_f1 as usize].to_m31_array();
+                let qm31_out_addr_a = context_values[out_addr_a as usize].to_m31_array();
+                let qm31_out_addr_b = context_values[out_addr_b as usize].to_m31_array();
+                let qm31_out_addr_c = context_values[out_addr_c as usize].to_m31_array();
+                let qm31_out_addr_d = context_values[out_addr_d as usize].to_m31_array();
                 *input = [
                     UInt32::from(qm31_in_addr_a[0].0 | (qm31_in_addr_a[1].0 << 16)),
                     UInt32::from(qm31_in_addr_b[0].0 | (qm31_in_addr_b[1].0 << 16)),
@@ -151,6 +151,7 @@ pub fn write_trace(
     let log_size = size.ilog2();
 
     let packed_inputs = pack_values(&inputs);
+    drop(inputs);
 
     let preprocessed_columns = [
         input_addr_a,

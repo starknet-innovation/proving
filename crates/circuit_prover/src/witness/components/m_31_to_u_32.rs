@@ -14,7 +14,7 @@ pub type PackedInputType = (PackedM31, PackedUInt32);
 /// preprocessed trace.
 #[allow(clippy::uninit_vec)]
 pub fn extract_component_inputs(
-    input_addr_col: &[usize],
+    input_addr_col: &[u32],
     context_values: &[QM31],
 ) -> Vec<InputType> {
     let n_rows = input_addr_col.len();
@@ -24,7 +24,7 @@ pub fn extract_component_inputs(
     }
 
     (inputs.par_iter_mut(), input_addr_col).into_par_iter().for_each(|(input, &input_addr)| {
-        let m31_input = context_values[input_addr].to_m31_array()[0];
+        let m31_input = context_values[input_addr as usize].to_m31_array()[0];
         *input = (m31_input, UInt32::from(m31_input.0));
     });
 

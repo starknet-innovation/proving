@@ -11,9 +11,9 @@ pub type PackedInputType = [[PackedM31; 4]; 3];
 /// preprocessed trace.
 #[allow(clippy::uninit_vec)]
 pub fn extract_component_inputs(
-    in0_address: &[usize],
-    in1_address: &[usize],
-    out_address: &[usize],
+    in0_address: &[u32],
+    in1_address: &[u32],
+    out_address: &[u32],
     context_values: &[QM31],
     trace_generator: &Qm31OpsTraceGenerator,
 ) -> Vec<InputType> {
@@ -40,7 +40,7 @@ pub fn extract_component_inputs(
             (non_perm_inputs, non_perm_in0, non_perm_in1, non_perm_out).into_par_iter().for_each(
                 |(input, in0_address, in1_address, out_address)| {
                     *input = [in0_address, in1_address, out_address]
-                        .map(|address| context_values[*address].to_m31_array());
+                        .map(|address| context_values[*address as usize].to_m31_array());
                 },
             );
         },
@@ -50,10 +50,10 @@ pub fn extract_component_inputs(
             (perm_inputs.par_chunks_mut(2), perm_in1.par_chunks(2), perm_out.par_chunks(2))
                 .into_par_iter()
                 .for_each(|(input_chunk, in1_chunk, out_chunk)| {
-                    let input_value = context_values[in1_chunk[0]].to_m31_array();
+                    let input_value = context_values[in1_chunk[0] as usize].to_m31_array();
                     input_chunk[0] = [zero, input_value, input_value];
 
-                    let output_value = context_values[out_chunk[1]].to_m31_array();
+                    let output_value = context_values[out_chunk[1] as usize].to_m31_array();
                     input_chunk[1] = [zero, output_value, output_value];
                 });
         },
@@ -99,6 +99,7 @@ pub fn write_trace(
     let log_size = n_rows.ilog2();
 
     let packed_inputs = pack_values(&inputs);
+    drop(inputs);
 
     let preprocessed_columns = [
         add_flag,
