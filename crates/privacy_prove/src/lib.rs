@@ -41,6 +41,8 @@ use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::prover::CommitmentTreeProver;
 use stwo::prover::backend::simd::SimdBackend;
+#[cfg(unix)]
+use stwo::prover::backend::simd::column::LargeBlockCache;
 use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
@@ -108,6 +110,12 @@ impl std::ops::Deref for LazyCommitmentTree {
         })
     }
 }
+
+/// Large blocks come from a cache every thread shares instead of each thread's malloc arena, so
+/// the temporaries one worker frees are reused by the others; see [`LargeBlockCache`].
+#[cfg(unix)]
+#[global_allocator]
+static ALLOCATOR: LargeBlockCache = LargeBlockCache;
 
 fn compress_proof(proof_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(zstd::encode_all(proof_bytes, 3)?)

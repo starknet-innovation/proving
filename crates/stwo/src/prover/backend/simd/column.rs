@@ -1,4 +1,6 @@
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::iter::zip;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{array, mem};
 
 use bytemuck::allocation::cast_vec;
@@ -21,13 +23,23 @@ use crate::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use crate::prover::backend::{Column, CpuBackend};
 use crate::prover::secure_column::SecureColumnByCoords;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 unsafe extern "C" {
+    #[cfg(target_os = "linux")]
     fn madvise(
         addr: *mut core::ffi::c_void,
         length: usize,
         advice: core::ffi::c_int,
     ) -> core::ffi::c_int;
+    fn mmap(
+        addr: *mut core::ffi::c_void,
+        length: usize,
+        prot: core::ffi::c_int,
+        flags: core::ffi::c_int,
+        fd: core::ffi::c_int,
+        offset: i64,
+    ) -> *mut core::ffi::c_void;
+    fn munmap(addr: *mut core::ffi::c_void, length: usize) -> core::ffi::c_int;
 }
 
 /// Advises the kernel about a large buffer: `MADV_HUGEPAGE` on the whole pages it covers, so that
@@ -835,6 +847,181 @@ impl VeryPackedSecureColumnByCoords {
                     VeryPackedBaseColumnMutSlice(d),
                 ])
             })
+    }
+}
+
+/// A global allocator that keeps large blocks in a cache every thread shares.
+///
+/// glibc serves each thread from its own arena. A large temporary that one rayon worker frees (an
+/// interaction writer's denominators, a FRI layer, a quotient accumulator, a Merkle layer) stays in
+/// that worker's arena, where the other workers cannot reuse it, so across 16 workers the freed
+/// blocks pile up as holes: about 1.4 GB at the privacy proof's peak. Handing them back to the
+/// kernel instead (a lower mmap threshold, one arena, `malloc_trim`) frees that memory but costs
+/// 3.5% to 16% of the run in system calls and page faults.
+///
+/// Blocks of 1 MiB and up are mapped here instead, rounded up to a quarter of a power of two, which
+/// is exact for the power-of-two sizes of most columns and layers. A freed block waits in its class
+/// for the next request of that class, from any thread, which takes it without a system call. Idle
+/// blocks stay bounded: past [`LARGE_IDLE_CAP`] a freed block is unmapped, and a request that finds
+/// its class empty first unmaps idle blocks of other classes, down to [`LARGE_LOW_WATER`], so that
+/// a new phase's blocks replace the idle ones instead of adding to them. Smaller blocks, and blocks
+/// aligned past a page, go to the system allocator as before. Proof bytes do not depend on where
+/// buffers come from.
+#[cfg(unix)]
+pub struct LargeBlockCache;
+
+const LARGE_MIN_LOG: u32 = 20;
+const LARGE_MAX_LOG: u32 = 40;
+const LARGE_CLASSES: usize = ((LARGE_MAX_LOG - LARGE_MIN_LOG) * 4) as usize + 1;
+/// Idle blocks a class can hold.
+const LARGE_SLOTS: usize = 128;
+/// The most idle memory the cache holds.
+const LARGE_IDLE_CAP: usize = 1 << 30;
+/// Idle memory a request with an empty class leaves alone: enough to absorb the churn between
+/// classes within a phase without a system call.
+const LARGE_LOW_WATER: usize = 256 << 20;
+/// Blocks of 2 MiB and up start on a 2 MiB boundary, so transparent huge pages can back all of
+/// them.
+const HUGE_PAGE: usize = 1 << 21;
+const PROT_READ: core::ffi::c_int = 1;
+const PROT_WRITE: core::ffi::c_int = 2;
+const MAP_PRIVATE: core::ffi::c_int = 2;
+#[cfg(target_os = "linux")]
+const MAP_ANONYMOUS: core::ffi::c_int = 0x20;
+#[cfg(not(target_os = "linux"))]
+const MAP_ANONYMOUS: core::ffi::c_int = 0x1000;
+
+/// The idle blocks, as addresses in per-class slots, and their total size.
+struct LargeBlocks {
+    idle: AtomicUsize,
+    counts: [AtomicUsize; LARGE_CLASSES],
+    slots: [[AtomicUsize; LARGE_SLOTS]; LARGE_CLASSES],
+}
+
+static LARGE_BLOCKS: LargeBlocks = LargeBlocks {
+    idle: AtomicUsize::new(0),
+    counts: [const { AtomicUsize::new(0) }; LARGE_CLASSES],
+    slots: [const { [const { AtomicUsize::new(0) }; LARGE_SLOTS] }; LARGE_CLASSES],
+};
+
+impl LargeBlocks {
+    /// An idle block of the class, if there is one.
+    fn take(&self, class: usize) -> Option<usize> {
+        if self.counts[class].load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        for slot in &self.slots[class] {
+            if slot.load(Ordering::Relaxed) != 0 {
+                let block = slot.swap(0, Ordering::Acquire);
+                if block != 0 {
+                    self.counts[class].fetch_sub(1, Ordering::Relaxed);
+                    self.idle.fetch_sub(large_class_size(class), Ordering::Relaxed);
+                    return Some(block);
+                }
+            }
+        }
+        None
+    }
+
+    /// Keeps a freed block of the class, unless the cache is full; the counters go up before the
+    /// block is visible, so they never fall below what the slots hold.
+    fn keep(&self, class: usize, block: usize) -> bool {
+        let size = large_class_size(class);
+        if self.idle.fetch_add(size, Ordering::Relaxed) + size > LARGE_IDLE_CAP {
+            self.idle.fetch_sub(size, Ordering::Relaxed);
+            return false;
+        }
+        self.counts[class].fetch_add(1, Ordering::Relaxed);
+        for slot in &self.slots[class] {
+            if slot.compare_exchange(0, block, Ordering::Release, Ordering::Relaxed).is_ok() {
+                return true;
+            }
+        }
+        self.counts[class].fetch_sub(1, Ordering::Relaxed);
+        self.idle.fetch_sub(size, Ordering::Relaxed);
+        false
+    }
+
+    /// An idle block of the largest class that has one, with its size, while the idle memory is
+    /// above the low-water mark.
+    fn evict(&self) -> Option<(usize, usize)> {
+        if self.idle.load(Ordering::Relaxed) <= LARGE_LOW_WATER {
+            return None;
+        }
+        (0..LARGE_CLASSES).rev().find_map(|class| Some((self.take(class)?, large_class_size(class))))
+    }
+}
+
+/// The class of a block the cache serves, or `None` for one the system allocator serves.
+fn large_class(layout: Layout) -> Option<usize> {
+    let size = layout.size();
+    if size < 1 << LARGE_MIN_LOG || size > 1 << LARGE_MAX_LOG || layout.align() > 4096 {
+        return None;
+    }
+    if size == 1 << LARGE_MIN_LOG {
+        return Some(0);
+    }
+    // 2^k < size <= 2^(k + 1), rounded up to a quarter of 2^k.
+    let k = usize::BITS - 1 - (size - 1).leading_zeros();
+    Some(((k - LARGE_MIN_LOG) * 4) as usize + size.div_ceil(1 << (k - 2)) - 4)
+}
+
+fn large_class_size(class: usize) -> usize {
+    if class == 0 {
+        return 1 << LARGE_MIN_LOG;
+    }
+    ((class - 1) % 4 + 5) << (LARGE_MIN_LOG + ((class - 1) / 4) as u32 - 2)
+}
+
+#[cfg(unix)]
+unsafe impl GlobalAlloc for LargeBlockCache {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let Some(class) = large_class(layout) else {
+            return System.alloc(layout);
+        };
+        if let Some(block) = LARGE_BLOCKS.take(class) {
+            return block as *mut u8;
+        }
+        let size = large_class_size(class);
+        let mut freed = 0;
+        while freed < size
+            && let Some((block, block_size)) = LARGE_BLOCKS.evict()
+        {
+            munmap(block as *mut core::ffi::c_void, block_size);
+            freed += block_size;
+        }
+        let align = if size >= HUGE_PAGE { HUGE_PAGE } else { 1 };
+        let len = size + align - 1;
+        let mapped = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if mapped as isize == -1 {
+            return std::ptr::null_mut();
+        }
+        // Trim the mapping to the aligned block; the trimmed ends were never touched.
+        let start = mapped as usize;
+        let block = (start + align - 1) & !(align - 1);
+        if block > start {
+            munmap(mapped, block - start);
+        }
+        if start + len > block + size {
+            munmap((block + size) as *mut core::ffi::c_void, start + len - block - size);
+        }
+        block as *mut u8
+    }
+
+    unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
+        let Some(class) = large_class(layout) else {
+            return System.dealloc(block, layout);
+        };
+        if !LARGE_BLOCKS.keep(class, block as usize) {
+            munmap(block.cast(), large_class_size(class));
+        }
     }
 }
 
