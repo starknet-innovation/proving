@@ -104,7 +104,7 @@ pub fn make_input_to_row<const N: usize>(
     InputToRow::new(1 << log_size, |i, row| columns[i][row] as u64)
 }
 
-pub fn pack_preprocessed_column(column: &[u32]) -> Vec<PackedM31> {
+pub fn pack_preprocessed_column(column: &[usize]) -> Vec<PackedM31> {
     let values: Vec<M31> = column.par_iter().map(|&v| M31::from(v)).collect();
     pack_values(&values)
 }

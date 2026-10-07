@@ -70,6 +70,11 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         point: CirclePoint<SecureField>,
     ) -> SecureField;
 
+    /// Log size of the barycentric weights for a domain of `log_size` with `log_blowup`.
+    fn barycentric_log_size(log_size: u32, _log_blowup: u32) -> u32 {
+        log_size
+    }
+
     /// Computes the weights for Barycentric Lagrange interpolation for point `p` on `coset`,
     /// writing them into the provided buffer instead of allocating a new one. The buffer's columns
     /// must have size `coset.size()`, and are fully overwritten.
@@ -100,6 +105,25 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         weights: &SecureColumnByCoords<Self>,
     ) -> SecureField;
+
+    /// Evaluates columns on the same canonic domain at `p`, sharing interpolation work.
+    /// Each polynomial has coefficient log size at most `coset.log_size() - log_blowup`.
+    /// Backends may interpolate from a sufficient bit-reversed prefix of the domain; the
+    /// default implementation retains the backend's existing weight-size contract.
+    fn subdomain_eval_group(
+        coset: CanonicCoset,
+        log_blowup: u32,
+        p: CirclePoint<SecureField>,
+        evals: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+    ) -> Vec<SecureField> {
+        if evals.is_empty() {
+            return Vec::new();
+        }
+        let log_size = Self::barycentric_log_size(coset.log_size(), log_blowup);
+        let buffer = SecureColumnByCoords::<Self>::zeros(1 << log_size);
+        let weights = Self::barycentric_weights_into(coset, p, buffer);
+        evals.iter().map(|eval| Self::barycentric_eval_at_point(eval, &weights)).collect()
+    }
 
     /// Evaluates a polynomial, represented by it's evaluations, at a point using folding.
     /// Used by the [`CircleEvaluation::eval_at_point_by_folding()`] function.

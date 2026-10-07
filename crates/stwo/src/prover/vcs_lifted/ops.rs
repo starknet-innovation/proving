@@ -44,6 +44,47 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
         Self::build_layers(columns, lifting_log_size)
     }
 
+    /// Builds packed-leaf layers directly from four coordinate columns where supported.
+    fn build_packed_layers(
+        columns: &[&Col<Self, BaseField>; SECURE_EXTENSION_DEGREE],
+        lifting_log_size: u32,
+    ) -> Vec<Col<Self, H::Hash>> {
+        let packed = Self::pack_leaves_input(columns);
+        Self::build_layers_sparse(&packed.iter().collect::<Vec<_>>(), lifting_log_size)
+    }
+
+    /// Rebuilds selected packed leaves from the four retained coordinate columns.
+    fn packed_leaf_hashes_at(
+        columns: &[&Col<Self, BaseField>],
+        lifting_log_size: u32,
+        positions: &[usize],
+    ) -> Vec<H::Hash> {
+        if positions.is_empty() {
+            return Vec::new();
+        }
+        assert_eq!(columns.len(), SECURE_EXTENSION_DEGREE);
+        let input_len = columns[0].len();
+        assert!(columns.iter().all(|c| c.len() == input_len));
+        let log_ratio = lifting_log_size - (input_len / PACKED_LEAF_SIZE).ilog2();
+        // Gather lifted positions first, then hash equal-size compact columns. The CPU
+        // backend requires at least two rows; repeated padding hashes are discarded.
+        let len = positions.len().next_power_of_two().max(2);
+        let packed: [Col<Self, BaseField>; SECURE_EXTENSION_DEGREE * PACKED_LEAF_SIZE] =
+            core::array::from_fn(|i| {
+                let coord = i % SECURE_EXTENSION_DEGREE;
+                let offset = i / SECURE_EXTENSION_DEGREE;
+                (0..len)
+                    .map(|j| {
+                        let position = positions[j.min(positions.len() - 1)];
+                        let row = (position >> (log_ratio + 1) << 1) + (position & 1);
+                        columns[coord].at(row * PACKED_LEAF_SIZE + offset)
+                    })
+                    .collect()
+            });
+        let leaves = Self::build_leaves(&packed.iter().collect::<Vec<_>>(), len.ilog2());
+        (0..positions.len()).map(|i| leaves.at(i)).collect()
+    }
+
     /// The leaves at `positions` of the tree that [`Self::build_leaves`] builds for `columns`
     /// (sorted increasingly by length, as for [`Self::build_leaves`]) and `lifting_log_size`.
     fn leaf_hashes_at(

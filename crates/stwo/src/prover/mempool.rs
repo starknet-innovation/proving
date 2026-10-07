@@ -119,6 +119,14 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
         }
     }
 
+    /// Drops every idle buffer: nothing of the finished proof stays resident while the next one
+    /// builds its context; its columns are allocated afresh, on huge pages.
+    pub fn release_all_idle(&self) {
+        for mut entry in self.pools.iter_mut() {
+            entry.value_mut().clear();
+        }
+    }
+
     /// Returns a buffer to the pool. The caller is responsible for ensuring the buffer's log_size
     /// matches.
     pub fn give_back(&self, log_size: u32, buf: Col<B, BaseField>) {

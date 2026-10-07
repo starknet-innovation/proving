@@ -79,4 +79,7 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     /// while keeping the allocation, so that a shortened column can still grow back into it; a
     /// backend that does not support it does nothing.
     fn release_spare(&mut self) {}
+    /// May discard physical pages containing only initialized literal-zero storage, preserving
+    /// every logical value. Backends without proven private anonymous backing do nothing.
+    fn release_zeroed_pages(&mut self) {}
 }

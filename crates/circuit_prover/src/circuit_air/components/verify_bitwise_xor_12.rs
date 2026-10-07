@@ -57,6 +57,41 @@ impl FrameworkEval for Eval {
         let c_low = eval
             .get_preprocessed_column(PreProcessedColumnId { id: "bitwise_xor_10_2".to_owned() });
 
+        // Keep symbolic evaluators' expression structure stable. The concrete SIMD
+        // evaluator can factor this affine relation over its field values.
+        // Ignore diagnostic lifetime spelling; an unrecognized type uses the
+        // unchanged generic path below.
+        if core::any::type_name::<E>().split('<').next()
+            == Some("stwo_constraint_framework::prover::simd_domain::SimdDomainEvaluator")
+        {
+            use stwo_constraint_framework::Relation;
+            let base: E::EF = self.common_lookup_elements.combine(&[
+                relation_id.clone(),
+                a_low.clone(),
+                b_low.clone(),
+                c_low.clone(),
+            ]);
+            let zero: SecureField = self.common_lookup_elements.combine(&[M31(0); 4]);
+            let stride: [SecureField; 3] = core::array::from_fn(|limb| {
+                let mut values = [M31(0); 4];
+                values[limb + 1] = M31(1 << LIMB_BITS);
+                let shifted: SecureField = self.common_lookup_elements.combine(&values);
+                shifted - zero
+            });
+            for i in 0..1 << EXPAND_BITS {
+                for j in 0..1 << EXPAND_BITS {
+                    let multiplicity = eval.next_trace_mask();
+                    let offset = stride[0] * M31(i) + stride[1] * M31(j) + stride[2] * M31(i ^ j);
+                    eval.write_logup_frac(stwo::core::Fraction {
+                        numerator: -E::EF::from(multiplicity),
+                        denominator: base.clone() + offset,
+                    });
+                }
+            }
+            eval.finalize_logup_in_pairs();
+            return eval;
+        }
+
         for i in 0..1 << EXPAND_BITS {
             for j in 0..1 << EXPAND_BITS {
                 let multiplicity = eval.next_trace_mask();

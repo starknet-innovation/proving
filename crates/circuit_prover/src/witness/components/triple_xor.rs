@@ -11,10 +11,10 @@ pub type PackedInputType = [PackedUInt32; 4];
 /// preprocessed trace.
 #[allow(clippy::uninit_vec)]
 pub fn extract_component_inputs(
-    input_addr_col_0: &[u32],
-    input_addr_col_1: &[u32],
-    input_addr_col_2: &[u32],
-    output_addr_col: &[u32],
+    input_addr_col_0: &[usize],
+    input_addr_col_1: &[usize],
+    input_addr_col_2: &[usize],
+    output_addr_col: &[usize],
     context_values: &[QM31],
 ) -> Vec<InputType> {
     let n_rows = input_addr_col_0.len();
@@ -36,10 +36,10 @@ pub fn extract_component_inputs(
     )
         .into_par_iter()
         .for_each(|(input, &addr_0, &addr_1, &addr_2, &out_addr)| {
-            let qm31_in_addr_0 = context_values[addr_0 as usize].to_m31_array();
-            let qm31_in_addr_1 = context_values[addr_1 as usize].to_m31_array();
-            let qm31_in_addr_2 = context_values[addr_2 as usize].to_m31_array();
-            let qm31_out_addr = context_values[out_addr as usize].to_m31_array();
+            let qm31_in_addr_0 = context_values[addr_0].to_m31_array();
+            let qm31_in_addr_1 = context_values[addr_1].to_m31_array();
+            let qm31_in_addr_2 = context_values[addr_2].to_m31_array();
+            let qm31_out_addr = context_values[out_addr].to_m31_array();
             *input = [
                 UInt32::from(qm31_in_addr_0[0].0 | (qm31_in_addr_0[1].0 << 16)),
                 UInt32::from(qm31_in_addr_1[0].0 | (qm31_in_addr_1[1].0 << 16)),
@@ -73,10 +73,10 @@ pub fn write_trace(
         .get_column(&PreProcessedColumnId { id: "triple_xor_multiplicity".to_owned() });
 
     let inputs = extract_component_inputs(
-        input_addr_col_0,
-        input_addr_col_1,
-        input_addr_col_2,
-        output_addr_col,
+        &input_addr_col_0,
+        &input_addr_col_1,
+        &input_addr_col_2,
+        &output_addr_col,
         context_values,
     );
 

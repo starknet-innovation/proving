@@ -61,10 +61,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             );
             let columns: [&Col<B, BaseField>; SECURE_EXTENSION_DEGREE] =
                 columns.try_into().unwrap();
-            let packed_columns = B::pack_leaves_input(&columns);
-            let max_log_size = packed_columns[0].len().ilog2();
-            assert!(lifting_log_size >= max_log_size);
-            B::build_layers(&packed_columns.iter().collect_vec(), lifting_log_size)
+            B::build_packed_layers(&columns, lifting_log_size)
         } else {
             let sorted_columns = columns.into_iter().sorted_by_key(|c| c.len()).collect_vec();
             let max_log_size = sorted_columns.last().unwrap().len().ilog2();
@@ -98,6 +95,24 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         query_positions: &[usize],
         columns: Vec<&Col<B, BaseField>>,
     ) -> (ColumnVec<Vec<BaseField>>, ExtendedMerkleDecommitmentLifted<H>) {
+        self.decommit_impl(query_positions, columns, false)
+    }
+
+    /// Opens a packed-leaf tree using the original four coordinate columns.
+    pub fn decommit_packed(
+        &self,
+        query_positions: &[usize],
+        columns: Vec<&Col<B, BaseField>>,
+    ) -> (ColumnVec<Vec<BaseField>>, ExtendedMerkleDecommitmentLifted<H>) {
+        self.decommit_impl(query_positions, columns, true)
+    }
+
+    fn decommit_impl(
+        &self,
+        query_positions: &[usize],
+        columns: Vec<&Col<B, BaseField>>,
+        packed: bool,
+    ) -> (ColumnVec<Vec<BaseField>>, ExtendedMerkleDecommitmentLifted<H>) {
         // Prepare output buffers.
         let mut decommitment = MerkleDecommitmentLifted::<H>::default();
         let mut all_node_values: Vec<HashMap<usize, <H as MerkleHasherLifted>::Hash>> = vec![];
@@ -105,16 +120,20 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         // Compute the queried values: a few random reads per column, done column by column in
         // parallel.
         let max_log_size = self.layers.len() - 1;
-        let queried_values: ColumnVec<Vec<BaseField>> = parallel_iter!(&columns)
-            .map(|col| {
-                let log_size = col.len().ilog2() as usize;
-                let shift = max_log_size - log_size;
-                query_positions
-                    .iter()
-                    .map(|pos| col.at((pos >> (shift + 1) << 1) + (pos & 1)))
-                    .collect()
-            })
-            .collect();
+        let queried_values: ColumnVec<Vec<BaseField>> = if packed {
+            vec![]
+        } else {
+            parallel_iter!(&columns)
+                .map(|col| {
+                    let log_size = col.len().ilog2() as usize;
+                    let shift = max_log_size - log_size;
+                    query_positions
+                        .iter()
+                        .map(|pos| col.at((pos >> (shift + 1) << 1) + (pos & 1)))
+                        .collect()
+                })
+                .collect()
+        };
 
         let mut prev_layer_queries: Vec<usize> =
             query_positions.iter().copied().sorted().dedup().collect();
@@ -123,7 +142,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         // decommitment reads are recomputed here, from the columns.
         let n_omitted_layers =
             self.layers.iter().rev().take_while(|layer| layer.is_empty()).count();
-        let omitted_layers = self.recompute_omitted_layers(&prev_layer_queries, &columns);
+        let omitted_layers = self.recompute_omitted_layers(&prev_layer_queries, &columns, packed);
         // The largest log size of a layer is equal to `self.layers.len() - 1`. We start iterating
         // from the layer of log size `self.layers.len() - 2` so that we always have a previous
         // layer available for the computation.
@@ -185,6 +204,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         &self,
         query_positions: &[usize],
         columns: &[&Col<B, BaseField>],
+        packed: bool,
     ) -> Vec<HashMap<usize, H::Hash>> {
         let n_omitted = self.layers.iter().rev().take_while(|layer| layer.is_empty()).count();
         if n_omitted == 0 || query_positions.is_empty() {
@@ -201,8 +221,12 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             .flat_map(|block| (block << n_omitted)..((block + 1) << n_omitted))
             .collect();
         // The leaves are hashed from the columns in the order the commitment hashed them.
-        let sorted_columns = columns.iter().copied().sorted_by_key(|c| c.len()).collect_vec();
-        let leaves = B::leaf_hashes_at(&sorted_columns, lifting_log_size, &leaf_positions);
+        let leaves = if packed {
+            B::packed_leaf_hashes_at(columns, lifting_log_size, &leaf_positions)
+        } else {
+            let sorted_columns = columns.iter().copied().sorted_by_key(|c| c.len()).collect_vec();
+            B::leaf_hashes_at(&sorted_columns, lifting_log_size, &leaf_positions)
+        };
         let mut layers: Vec<HashMap<usize, H::Hash>> =
             vec![HashMap::from_iter(leaf_positions.iter().copied().zip(leaves))];
         for level in 1..n_omitted {

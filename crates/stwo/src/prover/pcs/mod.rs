@@ -21,7 +21,7 @@ use crate::core::utils::MaybeOwned;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::ExtendedMerkleDecommitmentLifted;
 use crate::prover::air::component_prover::{Poly, Trace, WeightsHashMap};
-use crate::prover::backend::BackendForChannel;
+use crate::prover::backend::{BackendForChannel, Column};
 use crate::prover::fri::{FriDecommitResult, FriProver};
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::pcs::quotient_ops::compute_fri_quotients;
@@ -84,7 +84,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     fn commit(&mut self, polynomials: ColumnVec<CircleCoefficients<B>>, channel: &mut MC::C) {
         let _span = span!(Level::INFO, "Commitment").entered();
         let lifting_log_size = self.config.lifting_log_size(self.trees.len());
-        let tree = CommitmentTreeProver::new(
+        let mut tree = CommitmentTreeProver::new(
             polynomials,
             self.config.fri_config.log_blowup_factor,
             self.twiddles,
@@ -93,6 +93,11 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             &self.base_column_pool,
         );
         MC::mix_root(channel, tree.commitment.root());
+        // Only newly owned ordinary commitments are considered. Externally supplied or borrowed
+        // preprocessed trees use commit_tree and retain their existing storage behavior.
+        for poly in &mut tree.polynomials {
+            poly.evals.values.release_zeroed_pages();
+        }
         self.trees.push(MaybeOwned::Owned(tree));
     }
 
@@ -143,8 +148,14 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         self.polynomials().zip_cols(sampled_points).map_cols(|(poly, points)| {
             let compute_weights = |(log_size, point): (u32, CirclePoint<SecureField>)| {
                 weights_dashmap.entry((log_size, point)).or_insert_with(|| {
+                    let weights_log_size = B::barycentric_log_size(
+                        log_size,
+                        self.config.fri_config.log_blowup_factor,
+                    );
                     let buffer = SecureColumnByCoords {
-                        columns: array::from_fn(|_| self.base_column_pool.take_or_alloc(log_size)),
+                        columns: array::from_fn(|_| {
+                            self.base_column_pool.take_or_alloc(weights_log_size)
+                        }),
                     };
                     CircleEvaluation::<B, BaseField, BitReversedOrder>::barycentric_weights_into(
                         CanonicCoset::new(log_size),
@@ -174,6 +185,64 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         weights_dashmap
     }
 
+    /// Groups coefficient-free columns by domain size and projected sample point, so a backend
+    /// can generate a small weight block once and reuse it across every column in the group.
+    fn compute_grouped_samples(
+        &self,
+        sampled_points: &TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        lifting_log_size: u32,
+    ) -> TreeVec<Vec<Vec<PointSample>>> {
+        let polynomials = self.polynomials();
+        let mut samples = sampled_points.as_cols_ref().map_cols(|points| {
+            points
+                .iter()
+                .map(|&point| PointSample { point, value: SecureField::default() })
+                .collect_vec()
+        });
+        let mut groups: HashMap<(u32, CirclePoint<SecureField>), Vec<(usize, usize, usize)>> =
+            HashMap::new();
+        assert_eq!(polynomials.len(), sampled_points.len());
+        for (tree_index, columns) in polynomials.iter().enumerate() {
+            assert_eq!(columns.len(), sampled_points[tree_index].len());
+            for (column_index, poly) in columns.iter().enumerate() {
+                let log_size = poly.evals.domain.log_size();
+                for (sample_index, &point) in
+                    sampled_points[tree_index][column_index].iter().enumerate()
+                {
+                    let projected_point = point.repeated_double(lifting_log_size - log_size);
+                    if let Some(coefficients) = &poly.coeffs {
+                        samples[tree_index][column_index][sample_index].value =
+                            coefficients.eval_at_point(projected_point);
+                    } else {
+                        groups.entry((log_size, projected_point)).or_default().push((
+                            tree_index,
+                            column_index,
+                            sample_index,
+                        ));
+                    }
+                }
+            }
+        }
+        let log_blowup = self.config.fri_config.log_blowup_factor;
+        for ((log_size, point), members) in groups {
+            let evaluations = members
+                .iter()
+                .map(|&(tree, column, _)| &polynomials[tree][column].evals)
+                .collect_vec();
+            let values = B::subdomain_eval_group(
+                CanonicCoset::new(log_size),
+                log_blowup,
+                point,
+                &evaluations,
+            );
+            assert_eq!(members.len(), values.len());
+            for ((tree, column, sample), value) in members.into_iter().zip(values) {
+                samples[tree][column][sample].value = value;
+            }
+        }
+        samples
+    }
+
     /// Evaluates the committed polynomials on the sampled points.
     fn compute_samples(
         &self,
@@ -183,6 +252,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         let _span =
             span!(Level::INFO, "Evaluate columns out of domain", class = "EvaluateOutOfDomain")
                 .entered();
+
+        if !self.store_polynomials_coefficients {
+            return self.compute_grouped_samples(sampled_points, lifting_log_size);
+        }
 
         let weights_hash_map = if self.store_polynomials_coefficients {
             None
@@ -213,8 +286,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Return the weights buffers to the memory pool for reuse.
         if let Some(weights_hash_map) = weights_hash_map {
             for ((log_size, _), weights) in weights_hash_map {
+                let weights_log_size =
+                    B::barycentric_log_size(log_size, self.config.fri_config.log_blowup_factor);
                 for column in weights.columns {
-                    self.base_column_pool.give_back(log_size, column);
+                    self.base_column_pool.give_back(weights_log_size, column);
                 }
             }
         }
@@ -231,6 +306,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
 
         // Evaluate polynomials on open points.
         let samples = self.compute_samples(&sampled_points, lifting_log_size);
+
+        // Interpolation weights are complete; quotient and opening paths own their buffers.
+        self.base_column_pool.release_all_idle();
 
         // Point samples are complete; subsequent quotient and opening paths use evaluations.
         for tree in &mut self.trees.0 {
@@ -315,6 +393,8 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 }
             }
         }
+
+        self.base_column_pool.release_all_idle();
 
         ExtendedCommitmentSchemeProof {
             proof: CommitmentSchemeProof {

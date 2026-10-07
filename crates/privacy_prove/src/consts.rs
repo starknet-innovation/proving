@@ -23,10 +23,10 @@ pub const CAIRO_PROVER_PARAMS: ProverParameters = ProverParameters {
     fri_config: CAIRO_PCS_CONFIG.fri_config,
     preprocessed_trace: PreProcessedTraceVariant::CanonicalSmall,
     channel_salt: 0,
-    store_polynomials_coefficients: true,
+    store_polynomials_coefficients: false,
     include_all_preprocessed_columns: true,
     opt_n_id_to_big_components: Some(1),
     lifting_size_policy: LiftingSizePolicy::Fixed(CAIRO_PCS_CONFIG.trace_lifting_log_size),
 };
 
-pub const CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS: bool = true;
+pub const CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS: bool = false;

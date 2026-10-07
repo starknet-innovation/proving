@@ -71,14 +71,11 @@ fn write_trace_simd(
     let relation_id = PackedM31::broadcast(M31::from(112558620));
     let relation_id_b = PackedM31::broadcast(M31::from(521092554));
     let bitwise_xor_8_0 =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "bitwise_xor_8_0".to_owned() });
+        preprocessed_trace.get_packed_column(&PreProcessedColumnId { id: "bitwise_xor_8_0".to_owned() });
     let bitwise_xor_8_1 =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "bitwise_xor_8_1".to_owned() });
+        preprocessed_trace.get_packed_column(&PreProcessedColumnId { id: "bitwise_xor_8_1".to_owned() });
     let bitwise_xor_8_2 =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "bitwise_xor_8_2".to_owned() });
-    let bitwise_xor_8_0 = pack_preprocessed_column(bitwise_xor_8_0);
-    let bitwise_xor_8_1 = pack_preprocessed_column(bitwise_xor_8_1);
-    let bitwise_xor_8_2 = pack_preprocessed_column(bitwise_xor_8_2);
+        preprocessed_trace.get_packed_column(&PreProcessedColumnId { id: "bitwise_xor_8_2".to_owned() });
 
     (trace.par_iter_mut(), lookup_data.par_iter_mut()).into_par_iter().enumerate().for_each(
         |(row_index, (row, lookup_data))| {

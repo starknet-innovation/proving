@@ -310,13 +310,15 @@ impl<'a, B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriFirstLayerPro
         } else {
             decommitment_positions
         };
-        // The returned opened values are not used. The columns are needed only when the leaves
-        // are not packed: a tree committed on them directly may have left its lowest layers to
-        // be recomputed from them at decommitment (see `MerkleOpsLifted::build_layers_sparse`).
+        // The returned opened values are not used. Retained coordinate columns let both
+        // packed and unpacked trees recompute omitted lower layers at decommitment.
         // TODO(Leo): consider adding a method to merkle prover to decommit only the auth paths.
-        let columns: Vec<&Col<B, BaseField>> =
-            if self.pack_leaves { vec![] } else { self.column.values.columns.iter().collect() };
-        let (_, decommitment) = self.merkle_tree.decommit(&decommitment_positions, columns);
+        let columns: Vec<&Col<B, BaseField>> = self.column.values.columns.iter().collect();
+        let (_, decommitment) = if self.pack_leaves {
+            self.merkle_tree.decommit_packed(&decommitment_positions, columns)
+        } else {
+            self.merkle_tree.decommit(&decommitment_positions, columns)
+        };
         let commitment = self.merkle_tree.root();
 
         ExtendedFriLayerProof {
@@ -375,11 +377,13 @@ impl<B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriInnerLayerProver<
         } else {
             decommitment_positions
         };
-        // The returned opened values are not used; see `FriFirstLayerProver::decommit` for why
-        // the columns are passed when the leaves are not packed.
-        let columns: Vec<&Col<B, BaseField>> =
-            if self.pack_leaves { vec![] } else { self.evaluation.values.columns.iter().collect() };
-        let (_, decommitment) = self.merkle_tree.decommit(&decommitment_positions, columns);
+        // Retained coordinate columns supply omitted hashes for either leaf layout.
+        let columns: Vec<&Col<B, BaseField>> = self.evaluation.values.columns.iter().collect();
+        let (_, decommitment) = if self.pack_leaves {
+            self.merkle_tree.decommit_packed(&decommitment_positions, columns)
+        } else {
+            self.merkle_tree.decommit(&decommitment_positions, columns)
+        };
         let commitment = self.merkle_tree.root();
 
         ExtendedFriLayerProof {

@@ -218,6 +218,34 @@ impl Column<BaseField> for BaseColumn {
     fn release_spare(&mut self) {
         release_pages(self.data.spare_capacity_mut());
     }
+
+    fn release_zeroed_pages(&mut self) {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            // Membership proves the exact allocation base is a live private anonymous mapping
+            // from LargeBlockCache. A size or alignment test alone cannot establish that fact.
+            let allocation_base = self.data.as_mut_ptr() as usize;
+            if self.length < (1 << 21) / mem::size_of::<BaseField>()
+                || !LIVE_ANONYMOUS_BLOCKS.contains(allocation_base)
+            {
+                return;
+            }
+            // Inspect only initialized logical words, not spare capacity or packed padding.
+            // P is another field encoding of zero but is not the literal bytes restored by
+            // MADV_DONTNEED, so it must not satisfy this check.
+            let initialized_bytes = {
+                let initialized = self.as_slice();
+                if !initialized.iter().all(|value| value.0 == 0) {
+                    return;
+                }
+                mem::size_of_val(initialized)
+            };
+            let (start, len) = whole_pages(allocation_base, initialized_bytes);
+            // Exclusive ownership keeps the allocation live throughout membership, scanning,
+            // and advice. Inward rounding excludes every byte outside the initialized slice.
+            advise_range(start, len, 4);
+        }
+    }
 }
 
 impl FromIterator<BaseField> for BaseColumn {
@@ -876,10 +904,10 @@ const LARGE_CLASSES: usize = ((LARGE_MAX_LOG - LARGE_MIN_LOG) * 4) as usize + 1;
 /// Idle blocks a class can hold.
 const LARGE_SLOTS: usize = 128;
 /// The most idle memory the cache holds.
-const LARGE_IDLE_CAP: usize = 1 << 30;
+const LARGE_IDLE_CAP: usize = 0;
 /// Idle memory a request with an empty class leaves alone: enough to absorb the churn between
 /// classes within a phase without a system call.
-const LARGE_LOW_WATER: usize = 256 << 20;
+const LARGE_LOW_WATER: usize = 0;
 /// Blocks of 2 MiB and up start on a 2 MiB boundary, so transparent huge pages can back all of
 /// them.
 const HUGE_PAGE: usize = 1 << 21;
@@ -903,6 +931,51 @@ static LARGE_BLOCKS: LargeBlocks = LargeBlocks {
     counts: [const { AtomicUsize::new(0) }; LARGE_CLASSES],
     slots: [const { [const { AtomicUsize::new(0) }; LARGE_SLOTS] }; LARGE_CLASSES],
 };
+
+/// A conservative, allocation-free record of currently live private anonymous allocation bases.
+/// Collisions lose optimization opportunities; they never replace a different live address.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct LiveAnonymousBlocks {
+    slots: [AtomicUsize; 1 << 14],
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+static LIVE_ANONYMOUS_BLOCKS: LiveAnonymousBlocks = LiveAnonymousBlocks {
+    slots: [const { AtomicUsize::new(0) }; 1 << 14],
+};
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl LiveAnonymousBlocks {
+    fn slot(&self, address: usize) -> &AtomicUsize {
+        &self.slots[((address >> 21) ^ (address >> 35)) & (self.slots.len() - 1)]
+    }
+
+    fn register(&self, address: usize) {
+        if address != 0 {
+            let _ = self.slot(address).compare_exchange(
+                0, address, Ordering::SeqCst, Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn unregister(&self, address: usize) {
+        if address != 0 {
+            let _ = self.slot(address).compare_exchange(
+                address, 0, Ordering::SeqCst, Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn contains(&self, address: usize) -> bool {
+        // Use a locked read-modify-write, not a potentially stale load. It observes the latest
+        // slot modification, so an address removed before unmap cannot authorize a later,
+        // unrelated allocation reusing that address. Exclusive Vec ownership prevents the
+        // currently matching allocation from being deallocated before the caller's advice.
+        address != 0 && self.slot(address).compare_exchange(
+            address, address, Ordering::SeqCst, Ordering::SeqCst,
+        ).is_ok()
+    }
+}
 
 impl LargeBlocks {
     /// An idle block of the class, if there is one.
@@ -980,6 +1053,8 @@ unsafe impl GlobalAlloc for LargeBlockCache {
             return System.alloc(layout);
         };
         if let Some(block) = LARGE_BLOCKS.take(class) {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            LIVE_ANONYMOUS_BLOCKS.register(block);
             return block as *mut u8;
         }
         let size = large_class_size(class);
@@ -1012,11 +1087,14 @@ unsafe impl GlobalAlloc for LargeBlockCache {
         if start + len > block + size {
             munmap((block + size) as *mut core::ffi::c_void, start + len - block - size);
         }
-        // In `madvise` THP mode huge pages must be asked for: one fault per 2 MiB, not 512.
+        // In `madvise` THP mode the alignment alone buys nothing: ask for huge pages, so the
+        // block takes one fault per 2 MiB instead of 512. A hint; the block is correct either way.
         #[cfg(target_os = "linux")]
         if align == HUGE_PAGE {
             madvise(block as *mut core::ffi::c_void, size, 14);
         }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        LIVE_ANONYMOUS_BLOCKS.register(block);
         block as *mut u8
     }
 
@@ -1024,6 +1102,8 @@ unsafe impl GlobalAlloc for LargeBlockCache {
         let Some(class) = large_class(layout) else {
             return System.dealloc(block, layout);
         };
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        LIVE_ANONYMOUS_BLOCKS.unregister(block as usize);
         if !LARGE_BLOCKS.keep(class, block as usize) {
             munmap(block.cast(), large_class_size(class));
         }

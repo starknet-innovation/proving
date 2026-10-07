@@ -228,6 +228,59 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
         layers
     }
 
+    fn build_packed_layers(
+        columns: &[&Col<Self, BaseField>; SECURE_EXTENSION_DEGREE],
+        lifting_log_size: u32,
+    ) -> Vec<Col<Self, Blake2sHash>> {
+        let input_len = columns[0].len();
+        assert!(columns.iter().all(|c| c.len() == input_len));
+        assert!(input_len.is_multiple_of(PACKED_LEAF_SIZE));
+        let packed_log_size = (input_len / PACKED_LEAF_SIZE).ilog2();
+        assert!(lifting_log_size >= packed_log_size);
+        if lifting_log_size < LOG_N_LANES + FUSED_LEVELS || lifting_log_size != packed_log_size {
+            let packed = Self::pack_leaves_input(columns);
+            return <Self as MerkleOpsLifted<Blake2sMerkleHasher>>::build_layers_sparse(
+                &packed.iter().collect_vec(),
+                lifting_log_size,
+            );
+        }
+        // Fuse the packed-leaf transpose into leaf hashing. Only the tile of hash states and
+        // the retained upper layer are materialized; no full-size sixteen-column copy.
+        let mut top = vec![Blake2sHash::default(); 1 << (lifting_log_size - FUSED_LEVELS)];
+        chunks_mut_iter(&mut top, N_HASHES_PER_SIMD_STATE).enumerate().for_each(
+            |(tile_index, dst)| {
+                let mut states = [INITIAL_STATE; TILE];
+                for (k, state) in states.iter_mut().enumerate() {
+                    let row = (tile_index * TILE + k) * PACKED_LEAF_SIZE;
+                    let inputs = array::from_fn(|offset| {
+                        array::from_fn(|coord| columns[coord].data[row + offset])
+                    });
+                    let packed = transpose_packed_leaf(inputs);
+                    let msgs = array::from_fn(|i| {
+                        packed[i / SECURE_EXTENSION_DEGREE][i % SECURE_EXTENSION_DEGREE].into_simd()
+                    });
+                    *state = compress_finalize(INITIAL_STATE, msgs, N_BYTES_IN_BLAKE_MESSAGE);
+                }
+                let mut n_states = TILE;
+                while n_states > 1 {
+                    n_states /= 2;
+                    for k in 0..n_states {
+                        states[k] = hash_state_pair(&states[2 * k], &states[2 * k + 1]);
+                    }
+                }
+                store_states(untranspose_states(states[0]), dst);
+            },
+        );
+        let mut layers: Vec<Vec<Blake2sHash>> = (0..FUSED_LEVELS).map(|_| Vec::new()).collect();
+        layers.push(top);
+        for _ in FUSED_LEVELS..lifting_log_size {
+            layers.push(<Self as MerkleOpsLifted<Blake2sMerkleHasher>>::build_next_layer(
+                layers.last().unwrap(),
+            ));
+        }
+        layers
+    }
+
     /// See [`MerkleOpsLifted::leaf_hashes_at`]: the leaves are recomputed one packed row at a
     /// time, through every pass, without the full-size state buffers of [`Self::build_leaves`].
     fn leaf_hashes_at(

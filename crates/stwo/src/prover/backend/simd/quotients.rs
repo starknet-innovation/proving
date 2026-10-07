@@ -180,6 +180,14 @@ impl QuotientOps for SimdBackend {
                 }
             }
         });
+        // Numerator and denominator scratch is dead before the larger-domain extension.
+        drop(accumulations);
+        drop(denominators_inverses);
+        drop(subdomain_points);
+        drop(sample_points);
+        drop(log_ratios);
+        drop(first_linear_terms);
+
         let subdomain_twiddles = TwiddleTree {
             root_coset: eval_subdomain.half_coset,
             // Only itwiddles are needed for interpolation.
