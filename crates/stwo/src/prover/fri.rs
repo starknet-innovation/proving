@@ -310,11 +310,15 @@ impl<'a, B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriFirstLayerPro
         } else {
             decommitment_positions
         };
-        // We can pass an empty vector to the merkle decommit because we don't use its returned
-        // opened values.
+        // The returned opened values are not used. Retained coordinate columns let both
+        // packed and unpacked trees recompute omitted lower layers at decommitment.
         // TODO(Leo): consider adding a method to merkle prover to decommit only the auth paths.
-        let (_, decommitment) =
-            self.merkle_tree.decommit(&decommitment_positions, Vec::<&Col<B, BaseField>>::new());
+        let columns: Vec<&Col<B, BaseField>> = self.column.values.columns.iter().collect();
+        let (_, decommitment) = if self.pack_leaves {
+            self.merkle_tree.decommit_packed(&decommitment_positions, columns)
+        } else {
+            self.merkle_tree.decommit(&decommitment_positions, columns)
+        };
         let commitment = self.merkle_tree.root();
 
         ExtendedFriLayerProof {
@@ -373,10 +377,13 @@ impl<B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriInnerLayerProver<
         } else {
             decommitment_positions
         };
-        // We can pass an empty vector to the merkle decommit because we don't use its returned
-        // opened values.
-        let (_, decommitment) =
-            self.merkle_tree.decommit(&decommitment_positions, Vec::<&Col<B, BaseField>>::new());
+        // Retained coordinate columns supply omitted hashes for either leaf layout.
+        let columns: Vec<&Col<B, BaseField>> = self.evaluation.values.columns.iter().collect();
+        let (_, decommitment) = if self.pack_leaves {
+            self.merkle_tree.decommit_packed(&decommitment_positions, columns)
+        } else {
+            self.merkle_tree.decommit(&decommitment_positions, columns)
+        };
         let commitment = self.merkle_tree.root();
 
         ExtendedFriLayerProof {

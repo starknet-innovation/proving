@@ -85,10 +85,19 @@ impl<const N: usize> LookupElements<N> {
             self.alpha_powers.len() >= values.len(),
             "Not enough alpha powers to combine values"
         );
-        values
+        // Drawn lookup elements start with alpha^0 = 1. Keep the generic path for
+        // manually constructed element sets whose first coefficient is different.
+        let (start, initial) = if !values.is_empty()
+            && self.alpha_powers.first() == Some(&SecureField::one())
+        {
+            (1, EF::from(values[0].clone()))
+        } else {
+            (0, EF::zero())
+        };
+        values[start..]
             .iter()
-            .zip(self.alpha_powers)
-            .fold(EF::zero(), |acc, (value, power)| acc + EF::from(power) * value.clone())
+            .zip(&self.alpha_powers[start..])
+            .fold(initial, |acc, (value, power)| acc + EF::from(*power) * value.clone())
             - EF::from(self.z)
     }
 

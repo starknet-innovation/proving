@@ -43,7 +43,7 @@ pub fn write_trace(
     let multiplicity_col = preprocessed_trace
         .get_column(&PreProcessedColumnId { id: "m31_to_u32_multiplicity".to_owned() });
 
-    let inputs = extract_component_inputs(input_addr_col, context_values);
+    let inputs = extract_component_inputs(&input_addr_col, context_values);
 
     let n_rows = inputs.len();
     assert_ne!(n_rows, 0);

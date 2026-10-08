@@ -447,28 +447,128 @@ impl Circuit {
 
     /// Checks if the circuit is satisfied by the given values.
     pub fn check(&self, values: &[QM31]) -> Result<(), String> {
-        for gate in self.all_gates() {
-            gate.check(values)?;
-        }
+        use rayon::prelude::*;
+
+        // The gates are checked independently; a valid circuit passes either way, and for an
+        // invalid one some failing gate's error is returned.
+        let Circuit {
+            n_vars: _,
+            add,
+            sub,
+            mul,
+            pointwise_mul,
+            eq,
+            triple_xor,
+            m31_to_u32,
+            blake_g_gate,
+            permutation,
+            output,
+        } = self;
+        add.par_iter().try_for_each(|gate| gate.check(values))?;
+        sub.par_iter().try_for_each(|gate| gate.check(values))?;
+        mul.par_iter().try_for_each(|gate| gate.check(values))?;
+        pointwise_mul.par_iter().try_for_each(|gate| gate.check(values))?;
+        eq.par_iter().try_for_each(|gate| gate.check(values))?;
+        triple_xor.par_iter().try_for_each(|gate| gate.check(values))?;
+        m31_to_u32.par_iter().try_for_each(|gate| gate.check(values))?;
+        blake_g_gate.par_iter().try_for_each(|gate| gate.check(values))?;
+        permutation.par_iter().try_for_each(|gate| gate.check(values))?;
+        output.par_iter().try_for_each(|gate| gate.check(values))?;
         Ok(())
     }
 
     /// Returns the number of uses and number of yields for each variable (in the context of lookup
     /// terms).
     pub fn compute_multiplicities(&self) -> (Vec<usize>, Vec<usize>) {
-        let mut n_uses = vec![0; self.n_vars];
-        let mut n_yields = vec![0; self.n_vars];
+        // The two histograms are independent; each pass reads the gate fields directly (the same
+        // variables as `Gate::uses` and `Gate::yields` return), which avoids two `Vec`
+        // allocations per gate.
+        rayon::join(|| self.count_uses(), || self.count_yields())
+    }
 
-        for gate in self.all_gates() {
+    fn count_uses(&self) -> Vec<usize> {
+        let mut n_uses = vec![0; self.n_vars];
+        for Add { in0, in1, out: _ } in &self.add {
+            n_uses[*in0] += 1;
+            n_uses[*in1] += 1;
+        }
+        for Sub { in0, in1, out: _ } in &self.sub {
+            n_uses[*in0] += 1;
+            n_uses[*in1] += 1;
+        }
+        for Mul { in0, in1, out: _ } in &self.mul {
+            n_uses[*in0] += 1;
+            n_uses[*in1] += 1;
+        }
+        for PointwiseMul { in0, in1, out: _ } in &self.pointwise_mul {
+            n_uses[*in0] += 1;
+            n_uses[*in1] += 1;
+        }
+        for Eq { in0, in1 } in &self.eq {
+            n_uses[*in0] += 1;
+            n_uses[*in1] += 1;
+        }
+        for BlakeGGate { input_a, input_b, input_c, input_d, input_f0, input_f1, .. } in
+            &self.blake_g_gate
+        {
+            n_uses[*input_a] += 1;
+            n_uses[*input_b] += 1;
+            n_uses[*input_c] += 1;
+            n_uses[*input_d] += 1;
+            n_uses[*input_f0] += 1;
+            n_uses[*input_f1] += 1;
+        }
+        for TripleXor { input_a, input_b, input_c, out: _ } in &self.triple_xor {
+            n_uses[*input_a] += 1;
+            n_uses[*input_b] += 1;
+            n_uses[*input_c] += 1;
+        }
+        for M31ToU32 { input, out: _ } in &self.m31_to_u32 {
+            n_uses[*input] += 1;
+        }
+        for gate in &self.permutation {
             for use_var in gate.uses() {
                 n_uses[use_var] += 1;
             }
+        }
+        for Output { in0 } in &self.output {
+            n_uses[*in0] += 1;
+        }
+        n_uses
+    }
+
+    fn count_yields(&self) -> Vec<usize> {
+        let mut n_yields = vec![0; self.n_vars];
+        for Add { out, .. } in &self.add {
+            n_yields[*out] += 1;
+        }
+        for Sub { out, .. } in &self.sub {
+            n_yields[*out] += 1;
+        }
+        for Mul { out, .. } in &self.mul {
+            n_yields[*out] += 1;
+        }
+        for PointwiseMul { out, .. } in &self.pointwise_mul {
+            n_yields[*out] += 1;
+        }
+        for BlakeGGate { out_a, out_b, out_c, out_d, .. } in &self.blake_g_gate {
+            n_yields[*out_a] += 1;
+            n_yields[*out_b] += 1;
+            n_yields[*out_c] += 1;
+            n_yields[*out_d] += 1;
+        }
+        for TripleXor { out, .. } in &self.triple_xor {
+            n_yields[*out] += 1;
+        }
+        for M31ToU32 { out, .. } in &self.m31_to_u32 {
+            n_yields[*out] += 1;
+        }
+        for gate in &self.permutation {
             for yield_var in gate.yields() {
                 n_yields[yield_var] += 1;
             }
         }
-
-        (n_uses, n_yields)
+        n_yields
     }
 
     /// Verifies that each variable appears exactly once as a yield.

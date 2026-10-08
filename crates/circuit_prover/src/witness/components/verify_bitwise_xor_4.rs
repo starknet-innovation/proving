@@ -9,7 +9,7 @@ pub type PackedInputType = [PackedM31; 3];
 
 pub struct ClaimGenerator {
     pub mults: [AtomicMultiplicityColumn; 1],
-    input_to_row: HashMap<[M31; 3], usize>,
+    input_to_row: InputToRow<3>,
     preprocessed_trace: Arc<PreProcessedTrace>,
 }
 
@@ -41,7 +41,7 @@ impl ClaimGenerator {
 
     pub fn add_input(&self, input: &InputType, relation_index: usize) {
         self.mults[relation_index]
-            .increase_at((*self.input_to_row.get(input).unwrap()).try_into().unwrap());
+            .increase_at(self.input_to_row.row(input).try_into().unwrap());
     }
 
     pub fn add_packed_inputs(&self, packed_inputs: &[PackedInputType], relation_index: usize) {
@@ -71,14 +71,11 @@ fn write_trace_simd(
 
     let relation_id = PackedM31::broadcast(M31::from(45448144));
     let bitwise_xor_4_0 =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "bitwise_xor_4_0".to_owned() });
+        preprocessed_trace.get_packed_column(&PreProcessedColumnId { id: "bitwise_xor_4_0".to_owned() });
     let bitwise_xor_4_1 =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "bitwise_xor_4_1".to_owned() });
+        preprocessed_trace.get_packed_column(&PreProcessedColumnId { id: "bitwise_xor_4_1".to_owned() });
     let bitwise_xor_4_2 =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "bitwise_xor_4_2".to_owned() });
-    let bitwise_xor_4_0 = pack_preprocessed_column(bitwise_xor_4_0);
-    let bitwise_xor_4_1 = pack_preprocessed_column(bitwise_xor_4_1);
-    let bitwise_xor_4_2 = pack_preprocessed_column(bitwise_xor_4_2);
+        preprocessed_trace.get_packed_column(&PreProcessedColumnId { id: "bitwise_xor_4_2".to_owned() });
 
     (trace.par_iter_mut(), lookup_data.par_iter_mut()).into_par_iter().enumerate().for_each(
         |(row_index, (row, lookup_data))| {

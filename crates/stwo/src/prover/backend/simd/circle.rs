@@ -23,12 +23,13 @@ use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::core::poly::utils::{domain_line_twiddles_from_tree, fold, get_folding_alphas};
 use crate::core::utils::{SliceExt, bit_reverse_index};
 use crate::prover::backend::cpu::circle::slow_precompute_twiddles;
-use crate::prover::backend::simd::column::BaseColumn;
+use crate::prover::backend::simd::column::{BaseColumn, advise_pages};
 use crate::prover::backend::simd::fft::transpose_vecs;
 use crate::prover::backend::simd::fri::fold_circle_evaluation_into_line;
 use crate::prover::backend::simd::m31::PackedM31;
 use crate::prover::backend::{Col, Column, CpuBackend};
 use crate::prover::fri::FriOps;
+use crate::prover::mempool::BaseColumnPool;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use crate::prover::poly::twiddles::TwiddleTree;
@@ -126,6 +127,255 @@ impl SimdBackend {
 
 // TODO(shahars): Everything is returned in redundant representation, where values can also be P.
 // Decide if and when it's ok and what to do if it's not.
+/// [`PolyOps::interpolate`] for the SIMD backend, with the coefficients of large columns written to
+/// a buffer taken from `pool` when there is one.
+fn interpolate_ex(
+    eval: CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>,
+    twiddles: &TwiddleTree<SimdBackend>,
+    pool: Option<&BaseColumnPool<SimdBackend>>,
+) -> CircleCoefficients<SimdBackend> {
+    let _span = span!(Level::TRACE, "", class = "iFFT").entered();
+    let log_size = eval.values.length.ilog2();
+    if log_size < MIN_FFT_LOG_SIZE {
+        let cpu_poly = eval.to_cpu().interpolate();
+        return CircleCoefficients::new(cpu_poly.coeffs.into_iter().collect());
+    }
+
+    let mut values = eval.values;
+    let twiddles = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
+
+    // TODO(alont): Cache this inversion.
+    let inv = PackedBaseField::broadcast(BaseField::from(eval.domain.size()).inverse());
+    let log_n_elements = log_size as usize;
+    let log_n_vecs = log_n_elements - LOG_N_LANES as usize;
+
+    // With a pool, the coefficients of a large column are written to a buffer of the pool (or a
+    // fresh one), through the fused first pass and transposition of `ifft_out_of_place`, and
+    // the evaluation buffer goes back to the pool.
+    let pooled = match pool {
+        Some(pool) if log_n_elements > CACHED_FFT_LOG_SIZE as usize => Some((
+            pool,
+            pool.try_take(log_size).unwrap_or_else(|| BaseColumn::zeros(1 << log_size)),
+        )),
+        _ => None,
+    };
+
+    // Safe because [PackedBaseField] is aligned on 64 bytes.
+    unsafe {
+        let ptr = transmute::<*mut PackedBaseField, *mut u32>(values.data.as_mut_ptr());
+        if let Some((pool, mut coeffs)) = pooled {
+            ifft::ifft_out_of_place(
+                ptr.cast_const(),
+                transmute::<*mut PackedBaseField, *mut u32>(coeffs.data.as_mut_ptr()),
+                &twiddles,
+                log_n_elements,
+                inv,
+            );
+            pool.give_back(log_size, values);
+            return CircleCoefficients::new(coeffs);
+        }
+        if log_n_elements <= CACHED_FFT_LOG_SIZE as usize {
+            ifft::ifft(ptr, &twiddles, log_n_elements);
+            #[cfg(not(feature = "parallel"))]
+            values.data.iter_mut().for_each(|x| *x *= inv);
+            #[cfg(feature = "parallel")]
+            values
+                .data
+                .par_chunks_mut(1 << 10)
+                .for_each(|chunk| chunk.iter_mut().for_each(|x| *x *= inv));
+        } else {
+            // The passes of `ifft::ifft`, with the scaling by `inv` done by the last pass while
+            // each chunk is still in cache instead of by a pass of its own over the array.
+            let fft_layers_pre_transpose = log_n_vecs.div_ceil(2);
+            let fft_layers_post_transpose = log_n_vecs / 2;
+            ifft::ifft_lower_with_vecwise(
+                ptr,
+                &twiddles[..3 + fft_layers_pre_transpose],
+                log_n_elements,
+                fft_layers_pre_transpose + LOG_N_LANES as usize,
+            );
+            transpose_vecs(ptr, log_n_vecs);
+            ifft::ifft_lower_without_vecwise(
+                ptr,
+                &twiddles[3 + fft_layers_pre_transpose..],
+                log_n_elements,
+                fft_layers_post_transpose,
+                Some(inv),
+            );
+        }
+    }
+
+    CircleCoefficients::new(values)
+}
+
+/// Weights for the first `2^s` bit-reversed entries of an evaluation on `coset`'s domain: the twin
+/// coset `±(G_{n+1} + <G_{s-1}>)`, which interpolates the FFT space of size `2^s` exactly. Its
+/// vanishing polynomial is `pi^(s-1)(x) - pi^(s-1)(x_0)`, its derivative the canonic one.
+fn twin_coset_barycentric_weights_into(
+    coset: CanonicCoset,
+    p: CirclePoint<SecureField>,
+    mut buffer: SecureColumnByCoords<SimdBackend>,
+) -> SecureColumnByCoords<SimdBackend> {
+    let s = buffer.len().ilog2();
+    assert!(s >= LOG_N_LANES && s < coset.log_size() && buffer.len() == 1 << s);
+    let initial = CirclePointIndex::subgroup_gen(coset.log_size() + 1);
+    let domain = CircleDomain::new(Coset::new(initial, s - 1));
+    let weights_vec_len = domain.size() / N_LANES;
+
+    let p = p.into_ef::<SecureField>();
+    let p_0 = domain.at(0).into_ef::<SecureField>();
+    let si_0 = SecureField::one()
+        / ((p_0.y * SecureField::from(-2)) * coset_vanishing_derivative(Coset::new(initial, s), p_0));
+
+    #[cfg(not(feature = "parallel"))]
+    let vi_p = (0..weights_vec_len)
+        .map(|i| {
+            PackedSecureField::from_array(std::array::from_fn(|j| {
+                point_vanishing(
+                    domain.at(bit_reverse_index(i * N_LANES + j, s)).into_ef::<SecureField>(),
+                    p,
+                )
+            }))
+        })
+        .collect_vec();
+
+    #[cfg(feature = "parallel")]
+    let vi_p: Vec<PackedSecureField> = (0..weights_vec_len)
+        .into_par_iter()
+        .map(|i| {
+            PackedSecureField::from_array(std::array::from_fn(|j| {
+                point_vanishing(
+                    domain.at(bit_reverse_index(i * N_LANES + j, s)).into_ef::<SecureField>(),
+                    p,
+                )
+            }))
+        })
+        .collect();
+
+    let vi_p_inverse = batch_inverse(&vi_p);
+
+    let mut vn_p = p.x;
+    let mut vn_0 = SecureField::from(p_0.x);
+    for _ in 1..s {
+        vn_p = CirclePoint::double_x(vn_p);
+        vn_0 = CirclePoint::double_x(vn_0);
+    }
+    let vn_p = vn_p - vn_0;
+
+    // Even bit-reversed indices lie on the half coset, odd ones on its conjugate.
+    let si_i_vn_p = PackedSecureField::from_array(std::array::from_fn(|i| {
+        if i.is_multiple_of(2) { si_0 * vn_p } else { -si_0 * vn_p }
+    }));
+
+    #[cfg(not(feature = "parallel"))]
+    for (i, vi_p_inverse) in vi_p_inverse.iter().enumerate() {
+        for (column, value) in buffer.columns.iter_mut().zip((*vi_p_inverse * si_i_vn_p).into_packed_m31s()) {
+            column.data[i] = value;
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    {
+        const CHUNK_SIZE: usize = 1 << 10;
+        buffer.par_chunks_mut(CHUNK_SIZE).zip(vi_p_inverse.par_chunks(CHUNK_SIZE)).for_each(
+            |(mut chunk, vi_p_inverse_chunk)| {
+                for (i, vi_p_inverse) in vi_p_inverse_chunk.iter().enumerate() {
+                    for (column, value) in chunk.0.iter_mut().zip((*vi_p_inverse * si_i_vn_p).into_packed_m31s()) {
+                        column.0[i] = value;
+                    }
+                }
+            },
+        );
+    }
+
+    buffer
+}
+
+/// Constants shared by all 256-word chunks of a twin-coset interpolation.
+/// Adapted from Claude/Fable v12's grouped, blocked OODS evaluation.
+struct TwinCosetWeightSetup {
+    vanishing_scale: PackedSecureField,
+    point_x: PackedSecureField,
+    point_y: PackedSecureField,
+    lanes: [PackedM31; 5],
+    initial: CirclePointIndex,
+    low_points: Vec<CirclePoint<BaseField>>,
+}
+
+fn twin_coset_weight_setup(
+    coset: CanonicCoset,
+    p: CirclePoint<SecureField>,
+    len: usize,
+) -> TwinCosetWeightSetup {
+    let s = len.ilog2();
+    assert!(s >= LOG_N_LANES && s < coset.log_size() && len == 1 << s);
+    let initial = CirclePointIndex::subgroup_gen(coset.log_size() + 1);
+    let index = |value: usize, bits: u32, shift: u32| {
+        CirclePointIndex(value.reverse_bits() >> (usize::BITS - bits) << shift)
+    };
+    let (mut vanishing_at_point, mut vanishing_at_initial) = (p.x, initial.to_point().x);
+    for _ in 1..s {
+        vanishing_at_point = CirclePoint::double_x(vanishing_at_point);
+        vanishing_at_initial = CirclePoint::double_x(vanishing_at_initial);
+    }
+    let derivative = -BaseField::from_u32_unchecked(1 << s)
+        * CirclePointIndex::subgroup_gen(coset.log_size() - s + 2).to_point().y;
+    let vanishing_scale = PackedSecureField::broadcast(
+        (vanishing_at_point - SecureField::from(vanishing_at_initial)) * derivative.inverse(),
+    );
+
+    // A packed word uses three circle-index bits and the conjugation bit. The next eight
+    // bits select a word within a 256-word chunk; the remaining twenty select the chunk.
+    let low_points =
+        (0..(len / N_LANES).min(256)).map(|word| index(word, 8, 20).to_point()).collect();
+    let low: [_; 8] = std::array::from_fn(|lane| index(lane, 3, 28).to_point());
+    let sign = |lane: usize, value: BaseField| if lane & 1 == 0 { value } else { -value };
+    let pack = |f: &dyn Fn(usize) -> BaseField| PackedM31::from_array(std::array::from_fn(f));
+    let lanes = [
+        pack(&|lane| low[lane >> 1].x),
+        pack(&|lane| low[lane >> 1].y),
+        pack(&|lane| sign(lane, low[lane >> 1].x)),
+        pack(&|lane| sign(lane, low[lane >> 1].y)),
+        pack(&|lane| sign(lane, BaseField::one())),
+    ];
+    TwinCosetWeightSetup {
+        vanishing_scale,
+        point_x: PackedSecureField::broadcast(p.x),
+        point_y: PackedSecureField::broadcast(p.y),
+        lanes,
+        initial,
+        low_points,
+    }
+}
+
+/// Generates at most 256 packed weights, reused across every column before advancing.
+fn twin_coset_weight_chunk(
+    setup: &TwinCosetWeightSetup,
+    chunk_index: usize,
+    len: usize,
+) -> Vec<PackedSecureField> {
+    let [lane_x, lane_y, signed_x, signed_y, signs] = setup.lanes;
+    let one = PackedM31::broadcast(BaseField::one());
+    let high_index = CirclePointIndex(chunk_index.reverse_bits() >> (usize::BITS - 20));
+    let high_point = (setup.initial + high_index).to_point();
+    let mut numerators = Vec::with_capacity(len);
+    let mut denominators = Vec::with_capacity(len);
+    for low_point in &setup.low_points[..len] {
+        let point = high_point + *low_point;
+        let x = PackedM31::broadcast(point.x);
+        let y = PackedM31::broadcast(point.y);
+        let domain_x = x * lane_x - y * lane_y;
+        let domain_y = x * signed_y + y * signed_x;
+        numerators.push((setup.point_x * domain_x + setup.point_y * domain_y + one) * signs);
+        denominators.push(setup.point_y * domain_x - setup.point_x * domain_y);
+    }
+    let mut inverses = vec![PackedSecureField::zero(); len];
+    super::qm31::batch_inverse_packed_qm31(&denominators, &mut inverses);
+    zip(numerators, inverses)
+        .map(|(numerator, inverse)| numerator * inverse * setup.vanishing_scale)
+        .collect()
+}
+
 impl PolyOps for SimdBackend {
     // The twiddles type is i32, and not BaseField. This is because the fast AVX mul implementation
     //  requires one of the numbers to be shifted left by 1 bit. This is not a reduced
@@ -136,30 +386,15 @@ impl PolyOps for SimdBackend {
         eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,
         twiddles: &TwiddleTree<Self>,
     ) -> CircleCoefficients<Self> {
-        let _span = span!(Level::TRACE, "", class = "iFFT").entered();
-        let log_size = eval.values.length.ilog2();
-        if log_size < MIN_FFT_LOG_SIZE {
-            let cpu_poly = eval.to_cpu().interpolate();
-            return CircleCoefficients::new(cpu_poly.coeffs.into_iter().collect());
-        }
+        interpolate_ex(eval, twiddles, None)
+    }
 
-        let mut values = eval.values;
-        let twiddles = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
-
-        // Safe because [PackedBaseField] is aligned on 64 bytes.
-        unsafe {
-            ifft::ifft(
-                transmute::<*mut PackedBaseField, *mut u32>(values.data.as_mut_ptr()),
-                &twiddles,
-                log_size as usize,
-            );
-        }
-
-        // TODO(alont): Cache this inversion.
-        let inv = PackedBaseField::broadcast(BaseField::from(eval.domain.size()).inverse());
-        values.data.iter_mut().for_each(|x| *x *= inv);
-
-        CircleCoefficients::new(values)
+    fn interpolate_pooled(
+        eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,
+        twiddles: &TwiddleTree<Self>,
+        pool: &BaseColumnPool<Self>,
+    ) -> CircleCoefficients<Self> {
+        interpolate_ex(eval, twiddles, Some(pool))
     }
 
     fn eval_at_point(
@@ -229,6 +464,10 @@ impl PolyOps for SimdBackend {
         (sum * twiddle_lows).pointwise_sum()
     }
 
+    fn barycentric_log_size(log_size: u32, log_blowup: u32) -> u32 {
+        log_size.saturating_sub(log_blowup).max(LOG_N_LANES).min(log_size)
+    }
+
     fn barycentric_weights_into(
         coset: CanonicCoset,
         p: CirclePoint<SecureField>,
@@ -236,6 +475,9 @@ impl PolyOps for SimdBackend {
     ) -> SecureColumnByCoords<SimdBackend> {
         let domain = coset.circle_domain();
         let log_size = domain.log_size();
+        if buffer.len() < domain.size() {
+            return twin_coset_barycentric_weights_into(coset, p, buffer);
+        }
         assert_eq!(buffer.len(), domain.size());
         let weights_vec_len = domain.size().div_ceil(N_LANES);
         if weights_vec_len == 1 {
@@ -336,12 +578,12 @@ impl PolyOps for SimdBackend {
         };
 
         #[cfg(not(feature = "parallel"))]
-        return (0..evals.domain.size().div_ceil(N_LANES))
+        return (0..weights.len().div_ceil(N_LANES))
             .fold(PackedSecureField::zero(), |acc, i| acc + (weight_at(i) * evals.values.data[i]))
             .pointwise_sum();
 
         #[cfg(feature = "parallel")]
-        return (0..evals.domain.size().div_ceil(N_LANES))
+        return (0..weights.len().div_ceil(N_LANES))
             .into_par_iter()
             .fold(PackedSecureField::zero, |acc: PackedSecureField, i: usize| {
                 acc + (weight_at(i) * evals.values.data[i])
@@ -350,6 +592,51 @@ impl PolyOps for SimdBackend {
             .to_array()
             .into_par_iter()
             .sum::<SecureField>();
+    }
+
+    fn subdomain_eval_group(
+        coset: CanonicCoset,
+        log_blowup: u32,
+        p: CirclePoint<SecureField>,
+        evals: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+    ) -> Vec<SecureField> {
+        if evals.is_empty() {
+            return Vec::new();
+        }
+        let log_size = Self::barycentric_log_size(coset.log_size(), log_blowup);
+        let len = 1usize << log_size;
+        if len < N_LANES || log_size == coset.log_size() {
+            // Keep the existing full-domain path, including zeroed padding for tiny domains.
+            let buffer = SecureColumnByCoords::<Self>::zeros(len);
+            let weights = Self::barycentric_weights_into(coset, p, buffer);
+            return evals
+                .iter()
+                .map(|eval| Self::barycentric_eval_at_point(eval, &weights))
+                .collect();
+        }
+
+        let setup = twin_coset_weight_setup(coset, p, len);
+        let n_words = len / N_LANES;
+        let zero = || vec![PackedSecureField::zero(); evals.len()];
+        let fold = |mut accumulators: Vec<PackedSecureField>, chunk_index: usize| {
+            let start = chunk_index * 256;
+            let chunk_len = 256.min(n_words - start);
+            let weights = twin_coset_weight_chunk(&setup, chunk_index, chunk_len);
+            for (accumulator, eval) in accumulators.iter_mut().zip(evals) {
+                let values = &eval.values.data[start..start + chunk_len];
+                *accumulator += zip(&weights, values)
+                    .fold(PackedSecureField::zero(), |sum, (weight, value)| sum + *weight * *value);
+            }
+            accumulators
+        };
+        #[cfg(not(feature = "parallel"))]
+        let sums = (0..n_words.div_ceil(256)).fold(zero(), fold);
+        #[cfg(feature = "parallel")]
+        let sums = (0..n_words.div_ceil(256))
+            .into_par_iter()
+            .fold(zero, fold)
+            .reduce(zero, |a, b| zip(a, b).map(|(x, y)| x + y).collect());
+        sums.into_iter().map(|sum| sum.pointwise_sum()).collect()
     }
 
     fn eval_at_point_by_folding(
@@ -413,28 +700,30 @@ impl PolyOps for SimdBackend {
         // Evaluate on big domains by evaluating on several subdomains.
         let log_subdomains = log_size - fft_log_size;
 
-        for i in 0..(1 << log_subdomains) {
-            // The subdomain twiddles are a slice of the large domain twiddles.
-            let subdomain_twiddles = (0..(fft_log_size - 1))
-                .map(|layer_i| {
-                    &twiddles[layer_i as usize]
-                        [i << (fft_log_size - 2 - layer_i)..(i + 1) << (fft_log_size - 2 - layer_i)]
-                })
-                .collect::<Vec<_>>();
+        // The twiddles of each subdomain are a slice of the large domain twiddles.
+        let subdomain_twiddles = (0..(1usize << log_subdomains))
+            .map(|i| {
+                (0..(fft_log_size - 1))
+                    .map(|layer_i| {
+                        &twiddles[layer_i as usize][i << (fft_log_size - 2 - layer_i)
+                            ..(i + 1) << (fft_log_size - 2 - layer_i)]
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
-            // FFT from the coefficients buffer directly into the provided buffer.
-            unsafe {
-                rfft::fft(
-                    transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
-                    transmute::<*mut PackedBaseField, *mut u32>(
-                        buffer.data[i << (fft_log_size - LOG_N_LANES)
-                            ..(i + 1) << (fft_log_size - LOG_N_LANES)]
-                            .as_mut_ptr(),
-                    ),
-                    &subdomain_twiddles,
-                    fft_log_size as usize,
-                );
-            }
+        // Map the pages of the destination in one call before the FFT's stores fault them in one
+        // by one (a hint: no-op where the kernel does not support it).
+        advise_pages(&buffer.data, true);
+
+        // FFT from the coefficients buffer directly into the provided buffer.
+        unsafe {
+            rfft::fft_subdomains(
+                transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
+                transmute::<*mut PackedBaseField, *mut u32>(buffer.data.as_mut_ptr()),
+                &subdomain_twiddles,
+                fft_log_size as usize,
+            );
         }
 
         CircleEvaluation::new(domain, buffer)

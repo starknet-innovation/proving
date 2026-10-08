@@ -1,5 +1,4 @@
 pub use std::array::from_fn;
-pub use std::collections::HashMap;
 pub use std::simd::num::{SimdInt, SimdUint};
 pub use std::simd::{Simd, u32x16};
 pub use std::sync::Arc;
@@ -95,33 +94,127 @@ impl PackedBlakeG {
 pub fn make_input_to_row<const N: usize>(
     preprocessed_trace: &PreProcessedTrace,
     column_ids: [PreProcessedColumnId; N],
-) -> HashMap<[M31; N], usize> {
-    let mut result: HashMap<[M31; N], usize> = HashMap::new();
-
+) -> InputToRow<N> {
     let columns = column_ids.iter().map(|id| preprocessed_trace.get_column(id)).collect_vec();
     let log_size = columns[0].len().ilog2();
     assert!(
         columns.iter().all(|c| c.len().ilog2() == log_size),
         "input_to_row columns of different sizes"
     );
-
-    for packed_row in 0..(1 << (log_size - LOG_N_LANES)) {
-        let row_offset = packed_row * N_LANES;
-        for i in 0..N_LANES {
-            let key: [M31; N] = columns
-                .iter()
-                .map(|column| M31::from(column[row_offset + i]))
-                .collect_vec()
-                .try_into()
-                .expect("Unexpected number of column values");
-            result.insert(key, row_offset + i);
-        }
-    }
-
-    result
+    InputToRow::new(1 << log_size, |i, row| columns[i][row] as u64)
 }
 
 pub fn pack_preprocessed_column(column: &[usize]) -> Vec<PackedM31> {
     let values: Vec<M31> = column.par_iter().map(|&v| M31::from(v)).collect();
     pack_values(&values)
+}
+
+/// A fast, deterministic hasher for the witness' lookup maps: their keys are small arrays of
+/// field elements, and SipHash dominates both the construction of the maps and the lookups.
+/// Iteration order is never relied on (the default hasher is randomized), so the choice of
+/// hasher cannot change the trace.
+#[derive(Default, Clone, Copy)]
+pub struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
+
+pub type FastHasherBuilder = std::hash::BuildHasherDefault<FastHasher>;
+
+/// [`std::collections::HashMap`] with [`FastHasher`].
+pub type HashMap<K, V> = std::collections::HashMap<K, V, FastHasherBuilder>;
+
+/// The row of a const-size component's preprocessed table for an input tuple.
+///
+/// When the key columns are bit fields of the row index that cover all its bits (the range-check
+/// and bitwise-xor tables: column `i` holds the bits `shift_i..shift_i + width_i` of the row,
+/// which is checked over every row when the table is built), the row is the sum of the shifted
+/// key values; otherwise it is looked up in a map.
+pub struct InputToRow<const N: usize> {
+    /// `(key index, shift)` of the bit fields; empty when the map is used.
+    fields: Vec<(usize, u32)>,
+    map: HashMap<[M31; N], usize>,
+}
+
+impl<const N: usize> InputToRow<N> {
+    /// Builds the lookup for a table given as `n_rows` rows of `N` key values, `at(column, row)`.
+    pub fn new(n_rows: usize, at: impl Fn(usize, usize) -> u64) -> Self {
+        let log_size = n_rows.ilog2();
+        assert_eq!(1 << log_size, n_rows);
+        let mut fields: Vec<(usize, u32)> = Vec::new();
+        let mut covered: u64 = 0;
+        for i in 0..N {
+            // The values at the rows 1, 2, 4, ... say which bits a bit-field column would hold.
+            if at(i, 0) != 0 {
+                continue;
+            }
+            let powers: Vec<u64> = (0..log_size).map(|k| at(i, 1 << k)).collect();
+            let nonzero: Vec<usize> = (0..log_size as usize).filter(|&k| powers[k] != 0).collect();
+            let Some(&shift) = nonzero.first() else { continue };
+            let width = nonzero.len();
+            if nonzero != (shift..shift + width).collect::<Vec<_>>()
+                || !(0..width).all(|j| powers[shift + j] == 1 << j)
+            {
+                continue;
+            }
+            let field_mask = ((1u64 << width) - 1) << shift;
+            if covered & field_mask != 0 {
+                continue;
+            }
+            let low_mask = (1u64 << width) - 1;
+            if !(0..n_rows).all(|r| at(i, r) == ((r as u64) >> shift) & low_mask) {
+                continue;
+            }
+            covered |= field_mask;
+            fields.push((i, shift as u32));
+        }
+        if covered == (1u64 << log_size) - 1 {
+            return Self { fields, map: HashMap::default() };
+        }
+        let mut map: HashMap<[M31; N], usize> =
+            HashMap::with_capacity_and_hasher(n_rows, Default::default());
+        for r in 0..n_rows {
+            let key: [M31; N] = std::array::from_fn(|i| M31::from(at(i, r) as u32));
+            map.insert(key, r);
+        }
+        Self { fields: Vec::new(), map }
+    }
+
+    /// The row holding `input`.
+    #[inline]
+    pub fn row(&self, input: &[M31; N]) -> usize {
+        if self.fields.is_empty() {
+            *self.map.get(input).unwrap()
+        } else {
+            self.fields.iter().map(|&(i, shift)| (input[i].0 as usize) << shift).sum()
+        }
+    }
 }

@@ -10,6 +10,7 @@ description = "Run Cairo programs and generate STWO proofs that can be verified 
 slow-tests = []
 
 [dependencies]
+rayon.workspace = true
 anyhow.workspace = true
 itertools.workspace = true
 serde_json.workspace = true

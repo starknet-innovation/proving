@@ -49,7 +49,7 @@ pub fn write_trace(
     let in1_address =
         preprocessed_trace.get_column(&PreProcessedColumnId { id: "eq_in1_address".to_owned() });
 
-    let inputs = extract_component_inputs(in0_address, in1_address, context_values);
+    let inputs = extract_component_inputs(&in0_address, &in1_address, context_values);
 
     let n_rows = inputs.len();
     assert_ne!(n_rows, 0);

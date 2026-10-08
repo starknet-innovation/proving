@@ -134,8 +134,6 @@ where
         base_column_pool,
     );
 
-    commitment_scheme.set_store_polynomials_coefficients();
-
     // Grab the preprocessed root for the circuit hash before it is consumed by `commit_tree` below.
     let preprocessed_root: Blake2sHash = preprocessed_tree.commitment.root().into();
 

@@ -158,15 +158,16 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
         // `Sync` requirement on `Self`.
         let self_eval = &self.eval;
         let self_claimed_sum = self.claimed_sum;
+        // The column references are the same for every row; build them once.
+        let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
+        let trace_cols = &trace_cols;
 
         iter.for_each(|(chunk_idx, mut chunk)| {
-            let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
-
             for idx_in_chunk in 0..CHUNK_SIZE {
                 let vec_row = chunk_idx * CHUNK_SIZE + idx_in_chunk;
                 // Evaluate constrains at row.
                 let eval = SimdDomainEvaluator::new(
-                    &trace_cols,
+                    trace_cols,
                     vec_row,
                     &accum.random_coeff_powers,
                     trace_domain.log_size(),

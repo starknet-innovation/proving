@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use circuits::circuit::{
@@ -140,8 +141,6 @@ const XOR_TABLE_N_BITS: [u32; 5] = [4, 7, 8, 9, 10];
 const SEQ_LOG_SIZE: u32 = 16;
 
 /// A fixed column's per-row value, as a function of the column's log size.
-type ColumnFn = fn(u32, usize) -> usize;
-
 fn seq(_log_size: u32, row: usize) -> usize {
     row
 }
@@ -157,18 +156,47 @@ fn xor_result(log_size: u32, row: usize) -> usize {
     xor_lhs(log_size, row) ^ xor_rhs(log_size, row)
 }
 
+/// The value formula of a fixed lookup-table column (see [`fixed_columns`]), as an explicit kind
+/// so that a generated column ([`CompactColumn::Fixed`]) compares and prints by kind rather than
+/// by function pointer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum FixedColumnKind {
+    /// The sequence column (`0..2^n`, used by `range_check_16`).
+    Seq,
+    /// The `rhs = row >> n` column of a `bitwise_xor_{n}` table.
+    XorRhs,
+    /// The `lhs = row & (2^n - 1)` column of a `bitwise_xor_{n}` table.
+    XorLhs,
+    /// The `lhs ^ rhs` column of a `bitwise_xor_{n}` table.
+    XorResult,
+}
+
+impl FixedColumnKind {
+    /// The column's value at `row`, for a table of the given log size. Exactly the functions
+    /// above.
+    fn at(self, log_size: u32, row: usize) -> usize {
+        match self {
+            Self::Seq => seq(log_size, row),
+            Self::XorRhs => xor_rhs(log_size, row),
+            Self::XorLhs => xor_lhs(log_size, row),
+            Self::XorResult => xor_result(log_size, row),
+        }
+    }
+}
+
 /// The fixed lookup-table columns, in commitment order: the sequence column, then the three
 /// columns of the bitwise-XOR table of each bit width.
 ///
-/// Each entry pairs an id and log size with the per-row value function of the column it labels.
-fn fixed_columns() -> impl Iterator<Item = (String, u32, ColumnFn)> {
-    let xor_columns: [ColumnFn; 3] = [xor_rhs, xor_lhs, xor_result];
-    std::iter::once((format!("seq_{SEQ_LOG_SIZE}"), SEQ_LOG_SIZE, seq as ColumnFn)).chain(
+/// Each entry pairs an id and log size with the per-row value formula of the column it labels.
+fn fixed_columns() -> impl Iterator<Item = (String, u32, FixedColumnKind)> {
+    let xor_columns: [FixedColumnKind; 3] =
+        [FixedColumnKind::XorRhs, FixedColumnKind::XorLhs, FixedColumnKind::XorResult];
+    std::iter::once((format!("seq_{SEQ_LOG_SIZE}"), SEQ_LOG_SIZE, FixedColumnKind::Seq)).chain(
         XOR_TABLE_N_BITS.into_iter().flat_map(move |n_bits| {
             xor_columns
                 .into_iter()
                 .enumerate()
-                .map(move |(i, value)| (format!("bitwise_xor_{n_bits}_{i}"), 2 * n_bits, value))
+                .map(move |(i, kind)| (format!("bitwise_xor_{n_bits}_{i}"), 2 * n_bits, kind))
         }),
     )
 }
@@ -292,12 +320,11 @@ struct Qm31OpsGates<'a> {
 ///
 /// `n_vars` is the total number of circuit variables, used as the first unused wire address for the
 /// permutation columns.
-fn add_qm31_ops_to_preprocessed_trace(
+fn qm31_ops_preprocessed_columns(
     gates: Qm31OpsGates<'_>,
     n_vars: usize,
     multiplicities: &[usize],
-    pp_trace: &mut PreProcessedTrace,
-) -> Qm31OpsTraceGenerator {
+) -> (Qm31OpsColumns, Qm31OpsTraceGenerator) {
     let Qm31OpsGates { add, sub, mul, pointwise_mul, permutation } = gates;
     let mut qm31_ops_columns: [_; N_QM31_OPS_PP_COLUMNS] = std::array::from_fn(|_| vec![]);
     fill_binary_op_columns(add, OpCode::Add, multiplicities, &mut qm31_ops_columns);
@@ -314,30 +341,28 @@ fn add_qm31_ops_to_preprocessed_trace(
 
     fill_permutation_columns(permutation, multiplicities, &mut qm31_ops_columns, n_vars);
 
-    Qm31OpsColumns::from(qm31_ops_columns).push_to(pp_trace);
-    qm31_ops_trace_generator
+    (Qm31OpsColumns::from(qm31_ops_columns), qm31_ops_trace_generator)
 }
 
 /// Adds the preprocessed columns of eq component to the preprocessed trace. If the component
 /// is empty, no columns are added. Preprocessed columns are in the following format:
 /// | in0_address | in1_address |
-fn add_eq_to_preprocessed_trace(eq: &[Eq], pp_trace: &mut PreProcessedTrace) {
+fn eq_preprocessed_columns(eq: &[Eq]) -> EqColumns {
     let mut columns = EqColumns::default();
     for Eq { in0, in1 } in eq {
         columns.eq_in0_address.push(*in0);
         columns.eq_in1_address.push(*in1);
     }
 
-    columns.push_to(pp_trace);
+    columns
 }
 
 /// Adds TripleXor gates to the preprocessed trace. Preprocessed columns are in the format:
 /// | input_addr_0 | input_addr_1 | input_addr_2 | output_addr | multiplicity |
-fn add_triple_xor_to_preprocessed_trace(
+fn triple_xor_preprocessed_columns(
     triple_xor: &[TripleXor],
     multiplicities: &[usize],
-    pp_trace: &mut PreProcessedTrace,
-) {
+) -> TripleXorColumns {
     let mut columns = TripleXorColumns::default();
     for TripleXor { input_a, input_b, input_c, out } in triple_xor.iter() {
         columns.triple_xor_input_addr_0.push(*input_a);
@@ -347,7 +372,7 @@ fn add_triple_xor_to_preprocessed_trace(
         columns.triple_xor_multiplicity.push(multiplicities[*out]);
     }
 
-    columns.push_to(pp_trace);
+    columns
 }
 
 /// Adds M31ToU32 gates to preprocessed trace columns.
@@ -364,25 +389,23 @@ fn fill_m31_to_u32_columns(
     }
 }
 
-fn add_m31_to_u32_to_preprocessed_trace(
+fn m31_to_u32_preprocessed_columns(
     m31_to_u32: &[M31ToU32],
     multiplicities: &[usize],
-    pp_trace: &mut PreProcessedTrace,
-) {
+) -> M31ToU32Columns {
     let mut columns: [_; N_M31_TO_U32_PP_COLUMNS] = std::array::from_fn(|_| vec![]);
     fill_m31_to_u32_columns(m31_to_u32, multiplicities, &mut columns);
 
-    M31ToU32Columns::from(columns).push_to(pp_trace);
+    M31ToU32Columns::from(columns)
 }
 
 /// Adds BlakeGGate gates to the preprocessed trace. Preprocessed columns are in the format:
 /// | input_addr_a | input_addr_b | input_addr_c | input_addr_d | input_addr_f0 | input_addr_f1 |
 /// | output_addr_a | output_addr_b | output_addr_c | output_addr_d | multiplicity |
-fn add_blake_g_gate_to_preprocessed_trace(
+fn blake_g_gate_preprocessed_columns(
     blake_g_gate: &[BlakeGGate],
     multiplicities: &[usize],
-    pp_trace: &mut PreProcessedTrace,
-) {
+) -> BlakeGGateColumns {
     let mut columns = BlakeGGateColumns::default();
     for BlakeGGate {
         input_a,
@@ -421,18 +444,134 @@ fn add_blake_g_gate_to_preprocessed_trace(
         columns.blake_g_gate_multiplicity.push(mult);
     }
 
-    columns.push_to(pp_trace);
+    columns
+}
+
+/// A preprocessed column, stored in the narrowest representation that reproduces its exact
+/// `usize` values.
+///
+/// Narrowing is always checked: a value is stored at a smaller width only when it fits exactly,
+/// so the column's values, length and order are identical to the materialized `Vec<usize>` it
+/// replaces. A column containing any value above `u32::MAX` is kept `Wide`, unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompactColumn {
+    /// Every value fits in a `u32`.
+    Narrow(Vec<u32>),
+    /// General fallback: the column contains some value above `u32::MAX`.
+    Wide(Vec<usize>),
+    /// Every value is 0 or 1. `words` packs the rows LSB-first, 64 rows per word; `len` is the
+    /// row count (the last word's bits past `len` are zero).
+    Bits { len: usize, words: Vec<u64> },
+    /// A fixed lookup-table column, expanded from its value formula instead of being stored.
+    Fixed { log_size: u32, kind: FixedColumnKind },
+}
+
+impl CompactColumn {
+    /// Compacts a materialized column into the narrowest representation holding its exact values.
+    fn compact(column: Vec<usize>) -> Self {
+        if column.iter().all(|&value| value <= 1) {
+            // `value` is 0 or 1, so the `u64` conversion is lossless.
+            let mut words = vec![0_u64; column.len().div_ceil(64)];
+            for (row, &value) in column.iter().enumerate() {
+                words[row / 64] |= (value as u64) << (row % 64);
+            }
+            return Self::Bits { len: column.len(), words };
+        }
+        let narrow: Result<Vec<u32>, _> =
+            column.iter().map(|&value| u32::try_from(value)).collect();
+        match narrow {
+            Ok(narrow) => Self::Narrow(narrow),
+            Err(_) => Self::Wide(column),
+        }
+    }
+
+    /// The number of rows in the column.
+    fn len(&self) -> usize {
+        match self {
+            Self::Narrow(values) => values.len(),
+            Self::Wide(values) => values.len(),
+            Self::Bits { len, .. } => *len,
+            Self::Fixed { log_size, .. } => 1_usize << log_size,
+        }
+    }
+
+    /// The value at `row`, without any allocation.
+    fn at(&self, row: usize) -> usize {
+        match self {
+            Self::Narrow(values) => usize::try_from(values[row]).expect("value originally fit usize"),
+            Self::Wide(values) => values[row],
+            Self::Bits { words, .. } => ((words[row / 64] >> (row % 64)) & 1) as usize,
+            Self::Fixed { log_size, kind } => kind.at(*log_size, row),
+        }
+    }
+
+    /// Materializes the column's exact values.
+    fn to_vec(&self) -> Vec<usize> {
+        match self {
+            Self::Narrow(values) => values.iter().map(|&value| usize::try_from(value).expect("value originally fit usize")).collect(),
+            Self::Wide(values) => values.clone(),
+            _ => (0..self.len()).map(|row| self.at(row)).collect(),
+        }
+    }
+
+    /// Expands the column directly to a field column, with no intermediate `usize` array. Every
+    /// value goes through the same `BaseField::from(usize)` conversion as a materialized column.
+    #[cfg(feature = "prover")]
+    fn to_field_column<B: Backend>(&self) -> Col<B, BaseField> {
+        match self {
+            Self::Narrow(values) => Col::<B, BaseField>::from_iter(
+                values.iter().map(|&value| BaseField::from(usize::try_from(value).expect("value originally fit usize"))),
+            ),
+            Self::Wide(values) => {
+                Col::<B, BaseField>::from_iter(values.iter().cloned().map(BaseField::from))
+            }
+            _ => Col::<B, BaseField>::from_iter(
+                (0..self.len()).map(|row| BaseField::from(self.at(row))),
+            ),
+        }
+    }
+
+    /// Expands the column directly to packed field elements, with no intermediate `usize` array.
+    /// Like `chunks_exact(N_LANES)`, a partial trailing chunk is dropped.
+    #[cfg(feature = "prover")]
+    fn to_packed_column(&self) -> Vec<PackedM31> {
+        match self {
+            Self::Narrow(values) => values
+                .chunks_exact(N_LANES)
+                .map(|c| {
+                    PackedM31::from_array(std::array::from_fn(|i| {
+                        BaseField::from(usize::try_from(c[i]).expect("value originally fit usize"))
+                    }))
+                })
+                .collect(),
+            Self::Wide(values) => values
+                .chunks_exact(N_LANES)
+                .map(|c| PackedM31::from_array(std::array::from_fn(|i| BaseField::from(c[i]))))
+                .collect(),
+            _ => (0..self.len() / N_LANES)
+                .map(|chunk| {
+                    PackedM31::from_array(std::array::from_fn(|i| {
+                        BaseField::from(self.at(chunk * N_LANES + i))
+                    }))
+                })
+                .collect(),
+        }
+    }
 }
 
 /// A collection of preprocessed columns, whose values are publicly acknowledged, and independent of
 /// the proof.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PreProcessedTrace {
-    columns: OrderedHashMap<PreProcessedColumnId, Vec<usize>>,
+    columns: OrderedHashMap<PreProcessedColumnId, CompactColumn>,
 }
 
 impl PreProcessedTrace {
     fn push_column(&mut self, id: PreProcessedColumnId, column: Vec<usize>) {
+        self.push_compact_column(id, CompactColumn::compact(column));
+    }
+
+    fn push_compact_column(&mut self, id: PreProcessedColumnId, column: CompactColumn) {
         assert!(
             self.columns.insert(id.clone(), column).is_none(),
             "Duplicate preprocessed column id: {id:?}"
@@ -446,7 +585,7 @@ impl PreProcessedTrace {
     }
     /// Adds preprocessed columns that are fixed lookup tables, independent of the circuit's gates.
     ///
-    /// Unlike the per-component helpers (e.g. `add_eq_to_preprocessed_trace`), these columns do not
+    /// Unlike the per-component helpers (e.g. `eq_preprocessed_columns`), these columns do not
     /// depend on the circuit gates or their multiplicities. They provide constant lookup
     /// infrastructure referenced by certain components:
     /// - `seq_16`: the sequence `0..2^16`, used by `range_check_16`.
@@ -454,9 +593,10 @@ impl PreProcessedTrace {
     ///   every ordered pair of n-bit values (`rhs`, `lhs`) and `_2` holds their XOR, used by the
     ///   `VerifyBitwiseXor` components.
     fn add_fixed_preprocessed_columns(pp_trace: &mut PreProcessedTrace) {
-        for (id, log_size, value) in fixed_columns() {
-            let column = (0..1_usize << log_size).map(|row| value(log_size, row)).collect();
-            pp_trace.push_column(PreProcessedColumnId { id }, column);
+        // The fixed columns are generated from their value formulas, never materialized.
+        for (id, log_size, kind) in fixed_columns() {
+            let column = CompactColumn::Fixed { log_size, kind };
+            pp_trace.push_compact_column(PreProcessedColumnId { id }, column);
         }
     }
 
@@ -474,25 +614,35 @@ impl PreProcessedTrace {
 
     #[cfg(feature = "prover")]
     pub fn get_trace<B: Backend>(&self) -> Vec<CircleEvaluation<B, BaseField, BitReversedOrder>> {
-        let to_evaluation = |vec: &[usize]| {
-            let col = Col::<B, BaseField>::from_iter(vec.iter().cloned().map(BaseField::from));
+        use rayon::prelude::*;
+
+        let to_evaluation = |column: &CompactColumn| {
+            let col = column.to_field_column::<B>();
             CircleEvaluation::new(CanonicCoset::new(col.len().ilog2()).circle_domain(), col)
         };
 
-        self.columns.values().map(|c| to_evaluation(c)).collect()
+        // The columns are converted independently; the order of the result is that of the map.
+        let columns: Vec<&CompactColumn> = self.columns.values().collect();
+        columns.into_par_iter().map(to_evaluation).collect()
     }
 
-    pub fn get_column(&self, id: &PreProcessedColumnId) -> &Vec<usize> {
-        self.columns.get(id).unwrap_or_else(|| panic!("Missing preprocessed column {id:?}"))
+    /// The column's exact values. `Wide` columns are borrowed in place; compact and generated
+    /// columns are materialized on each call (no cache, so nothing extra is retained).
+    pub fn get_column(&self, id: &PreProcessedColumnId) -> Cow<'_, [usize]> {
+        let column =
+            self.columns.get(id).unwrap_or_else(|| panic!("Missing preprocessed column {id:?}"));
+        match column {
+            CompactColumn::Wide(values) => Cow::Borrowed(values.as_slice()),
+            _ => Cow::Owned(column.to_vec()),
+        }
     }
 
     #[cfg(feature = "prover")]
     pub fn get_packed_column(&self, id: &PreProcessedColumnId) -> Vec<PackedM31> {
-        let column = self.get_column(id);
-        column
-            .chunks_exact(N_LANES)
-            .map(|c| PackedM31::from_array(std::array::from_fn(|i| BaseField::from(c[i]))))
-            .collect::<Vec<_>>()
+        self.columns
+            .get(id)
+            .unwrap_or_else(|| panic!("Missing preprocessed column {id:?}"))
+            .to_packed_column()
     }
 }
 
@@ -571,20 +721,64 @@ impl PreprocessedCircuit {
         } = circuit;
 
         // Add Eq columns.
-        add_eq_to_preprocessed_trace(eq, &mut pp_trace);
-        // Add QM31 operations columns.
-        let qm31_ops_trace_generator = add_qm31_ops_to_preprocessed_trace(
-            Qm31OpsGates { add, sub, mul, pointwise_mul, permutation },
-            *n_vars,
-            &multiplicities,
-            &mut pp_trace,
+        // The components' columns are built independently and pushed in the fixed order.
+        let multiplicities = &multiplicities;
+        let (
+            (eq_columns, (qm31_ops_columns, qm31_ops_trace_generator)),
+            (triple_xor_columns, (m31_to_u32_columns, blake_g_gate_columns)),
+        ) = rayon::join(
+            || {
+                rayon::join(
+                    || {
+                        let mut trace = PreProcessedTrace::default();
+                        eq_preprocessed_columns(eq).push_to(&mut trace);
+                        trace
+                    },
+                    || {
+                        let (columns, generator) = qm31_ops_preprocessed_columns(
+                            Qm31OpsGates { add, sub, mul, pointwise_mul, permutation },
+                            *n_vars,
+                            multiplicities,
+                        );
+                        let mut trace = PreProcessedTrace::default();
+                        columns.push_to(&mut trace);
+                        (trace, generator)
+                    },
+                )
+            },
+            || {
+                rayon::join(
+                    || {
+                                let mut trace = PreProcessedTrace::default();
+                                triple_xor_preprocessed_columns(triple_xor, multiplicities).push_to(&mut trace);
+                                trace
+                            },
+                    || {
+                        rayon::join(
+                            || {
+                                let mut trace = PreProcessedTrace::default();
+                                m31_to_u32_preprocessed_columns(m31_to_u32, multiplicities).push_to(&mut trace);
+                                trace
+                            },
+                            || {
+                                let mut trace = PreProcessedTrace::default();
+                                blake_g_gate_preprocessed_columns(blake_g_gate, multiplicities).push_to(&mut trace);
+                                trace
+                            },
+                        )
+                    },
+                )
+            },
         );
-        // Add TripleXor columns.
-        add_triple_xor_to_preprocessed_trace(triple_xor, &multiplicities, &mut pp_trace);
-        // Add M31ToU32 columns.
-        add_m31_to_u32_to_preprocessed_trace(m31_to_u32, &multiplicities, &mut pp_trace);
-        // Add BlakeGGate columns.
-        add_blake_g_gate_to_preprocessed_trace(blake_g_gate, &multiplicities, &mut pp_trace);
+        // Compact within each joined task, then merge by the original component order.
+        // A completed component no longer retains its full-width staging columns while
+        // another component is still being built.
+        for component in [eq_columns, qm31_ops_columns, triple_xor_columns,
+            m31_to_u32_columns, blake_g_gate_columns] {
+            for (id, column) in component.columns {
+                pp_trace.push_compact_column(id, column);
+            }
+        }
 
         PreProcessedTrace::add_fixed_preprocessed_columns(&mut pp_trace);
         pp_trace.sort_by_size();

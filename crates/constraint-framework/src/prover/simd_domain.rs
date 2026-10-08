@@ -58,6 +58,27 @@ impl<'a> SimdDomainEvaluator<'a> {
             logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size),
         }
     }
+
+    /// Emit a pair's relation in Horner form, avoiding one secure-field product.
+    #[inline(always)]
+    fn add_logup_batch_constraint(
+        &mut self,
+        diff: VeryPackedSecureField,
+        fractions: &[Fraction<VeryPackedSecureField, VeryPackedSecureField>],
+    ) {
+        let constraint = match fractions {
+            [a, b] => {
+                (diff * a.denominator - a.numerator) * b.denominator
+                    - b.numerator * a.denominator
+            }
+            _ => {
+                let frac: Fraction<VeryPackedSecureField, VeryPackedSecureField> =
+                    fractions.iter().copied().sum();
+                diff * frac.denominator - frac.numerator
+            }
+        };
+        self.add_constraint(constraint);
+    }
 }
 impl EvalAtRow for SimdDomainEvaluator<'_> {
     type F = VeryPackedBaseField;
@@ -109,5 +130,47 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
         VeryPackedSecureField::from_very_packed_m31s(values)
     }
 
-    crate::logup_proxy!();
+    fn write_logup_frac(&mut self, fraction: Fraction<Self::EF, Self::EF>) {
+        if self.logup.fracs.is_empty() {
+            self.logup.is_finalized = false;
+        }
+        self.logup.fracs.push(fraction);
+    }
+
+    fn finalize_logup_batched(&mut self, batch_size: usize) {
+        assert!(!self.logup.is_finalized, "LogupAtRow was already finalized");
+        assert!(batch_size > 0, "Batch size must be positive");
+        assert!(!self.logup.fracs.is_empty(), "No fractions to finalize");
+
+        // Borrow the fractions independently of the evaluator while reading interaction masks.
+        // Emit one batch at a time instead of allocating and copying a second fraction vector.
+        let fracs = std::mem::take(&mut self.logup.fracs);
+        let last_batch = (fracs.len() - 1) / batch_size;
+        let mut prev_col_cumsum = Self::EF::zero();
+        for (i, chunk) in fracs.chunks(batch_size).enumerate() {
+            if i == last_batch {
+                let [prev_row_cumsum, cur_cumsum] =
+                    self.next_extension_interaction_mask(self.logup.interaction, [-1, 0]);
+                let diff = cur_cumsum - prev_row_cumsum - prev_col_cumsum;
+                let shifted_diff = diff + self.logup.cumsum_shift;
+                self.add_logup_batch_constraint(shifted_diff, chunk);
+            } else {
+                let [cur_cumsum] =
+                    self.next_extension_interaction_mask(self.logup.interaction, [0]);
+                let diff = cur_cumsum - prev_col_cumsum;
+                prev_col_cumsum = cur_cumsum;
+                self.add_logup_batch_constraint(diff, chunk);
+            }
+        }
+        self.logup.fracs = fracs;
+        self.logup.is_finalized = true;
+    }
+
+    fn finalize_logup(&mut self) {
+        self.finalize_logup_batched(1)
+    }
+
+    fn finalize_logup_in_pairs(&mut self) {
+        self.finalize_logup_batched(2)
+    }
 }

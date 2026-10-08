@@ -73,10 +73,10 @@ pub fn write_trace(
         .get_column(&PreProcessedColumnId { id: "triple_xor_multiplicity".to_owned() });
 
     let inputs = extract_component_inputs(
-        input_addr_col_0,
-        input_addr_col_1,
-        input_addr_col_2,
-        output_addr_col,
+        &input_addr_col_0,
+        &input_addr_col_1,
+        &input_addr_col_2,
+        &output_addr_col,
         context_values,
     );
 

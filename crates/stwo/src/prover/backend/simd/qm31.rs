@@ -27,16 +27,19 @@ unsafe impl Sync for PackedQM31 {}
 
 impl PackedQM31 {
     /// Constructs a new instance with all vector elements set to `value`.
+    #[inline(always)]
     pub const fn broadcast(value: QM31) -> Self {
         Self([PackedCM31::broadcast(value.0), PackedCM31::broadcast(value.1)])
     }
 
     /// Returns all `a` values such that each vector element is represented as `a + bu`.
+    #[inline(always)]
     pub const fn a(&self) -> PackedCM31 {
         self.0[0]
     }
 
     /// Returns all `b` values such that each vector element is represented as `a + bu`.
+    #[inline(always)]
     pub const fn b(&self) -> PackedCM31 {
         self.0[1]
     }
@@ -77,6 +80,7 @@ impl PackedQM31 {
     }
 
     /// Doubles each element in the vector.
+    #[inline(always)]
     pub fn double(self) -> Self {
         let Self([a, b]) = self;
         Self([a.double(), b.double()])
@@ -84,6 +88,7 @@ impl PackedQM31 {
 
     /// Returns vectors `a, b, c, d` such that element `i` is represented as
     /// `QM31(a_i, b_i, c_i, d_i)`.
+    #[inline(always)]
     pub const fn into_packed_m31s(self) -> [PackedM31; 4] {
         let Self([PackedCM31([a, b]), PackedCM31([c, d])]) = self;
         [a, b, c, d]
@@ -91,6 +96,7 @@ impl PackedQM31 {
 
     /// Creates an instance from vectors `a, b, c, d` such that element `i`
     /// is represented as `QM31(a_i, b_i, c_i, d_i)`.
+    #[inline(always)]
     pub const fn from_packed_m31s([a, b, c, d]: [PackedM31; 4]) -> Self {
         Self([PackedCM31([a, b]), PackedCM31([c, d])])
     }
@@ -99,6 +105,7 @@ impl PackedQM31 {
 impl Add for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: Self) -> Self::Output {
         Self([self.a() + rhs.a(), self.b() + rhs.b()])
     }
@@ -107,35 +114,63 @@ impl Add for PackedQM31 {
 impl Sub for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: Self) -> Self::Output {
         Self([self.a() - rhs.a(), self.b() - rhs.b()])
     }
 }
 
-impl Mul for PackedQM31 {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
+impl PackedQM31 {
+    /// Returns `self * rhs` with the base field multiplication kernels expanded at the call site.
+    #[inline(always)]
+    pub(crate) fn mul_inline(self, rhs: Self) -> Self {
         // Compute using Karatsuba.
         //   (a + ub) * (c + ud) =
         //   (ac + (2+i)bd) + (ad + bc)u =
         //   ac + 2bd + ibd + (ad + bc)u.
-        let ac = self.a() * rhs.a();
-        let bd = self.b() * rhs.b();
+        let ac = self.a().mul_inline(rhs.a());
+        let bd = self.b().mul_inline(rhs.b());
         let bd_times_1_plus_i = PackedCM31([bd.a() - bd.b(), bd.a() + bd.b()]);
         // Computes ac + bd.
         let ac_p_bd = ac + bd;
         // Computes ad + bc.
-        let ad_p_bc = (self.a() + self.b()) * (rhs.a() + rhs.b()) - ac_p_bd;
+        let ad_p_bc = (self.a() + self.b()).mul_inline(rhs.a() + rhs.b()) - ac_p_bd;
         // ac + 2bd + ibd =
         // ac + bd + bd + ibd
         let l =
             PackedCM31([ac_p_bd.a() + bd_times_1_plus_i.a(), ac_p_bd.b() + bd_times_1_plus_i.b()]);
         Self([l, ad_p_bc])
     }
+
+    /// Returns `self * rhs` with the base field multiplication kernels expanded at the call site.
+    #[inline(always)]
+    pub(crate) fn mul_m31_inline(self, rhs: PackedM31) -> Self {
+        let Self([a, b]) = self;
+        Self([a.mul_m31_inline(rhs), b.mul_m31_inline(rhs)])
+    }
+}
+
+impl Mul for PackedQM31 {
+    type Output = Self;
+
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self::Output {
+        mul_qm31(self, rhs)
+    }
+}
+
+/// Returns `a * b`. Not inlinable from other crates, see [`cm31::mul_cm31`].
+pub(crate) fn mul_qm31(a: PackedQM31, b: PackedQM31) -> PackedQM31 {
+    a.mul_inline(b)
+}
+
+/// Returns `a * b`; see [`mul_qm31`].
+pub(crate) fn mul_qm31_m31(a: PackedQM31, b: PackedM31) -> PackedQM31 {
+    a.mul_m31_inline(b)
 }
 
 impl Zero for PackedQM31 {
+    #[inline(always)]
     fn zero() -> Self {
         Self([PackedCM31::zero(), PackedCM31::zero()])
     }
@@ -146,18 +181,21 @@ impl Zero for PackedQM31 {
 }
 
 impl One for PackedQM31 {
+    #[inline(always)]
     fn one() -> Self {
         Self([PackedCM31::one(), PackedCM31::zero()])
     }
 }
 
 impl AddAssign for PackedQM31 {
+    #[inline(always)]
     fn add_assign(&mut self, rhs: Self) {
         *self = *self + rhs;
     }
 }
 
 impl MulAssign for PackedQM31 {
+    #[inline(always)]
     fn mul_assign(&mut self, rhs: Self) {
         *self = *self * rhs;
     }
@@ -242,6 +280,7 @@ pub fn batch_inverse_packed_qm31(column: &[PackedQM31], dst: &mut [PackedQM31]) 
 impl Add<PackedM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: PackedM31) -> Self::Output {
         Self([self.a() + rhs, self.b()])
     }
@@ -250,15 +289,16 @@ impl Add<PackedM31> for PackedQM31 {
 impl Mul<PackedM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: PackedM31) -> Self::Output {
-        let Self([a, b]) = self;
-        Self([a * rhs, b * rhs])
+        mul_qm31_m31(self, rhs)
     }
 }
 
 impl Mul<PackedCM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: PackedCM31) -> Self::Output {
         let Self([a, b]) = self;
         Self([a * rhs, b * rhs])
@@ -268,6 +308,7 @@ impl Mul<PackedCM31> for PackedQM31 {
 impl Sub<PackedM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: PackedM31) -> Self::Output {
         let Self([a, b]) = self;
         Self([a - rhs, b])
@@ -277,6 +318,7 @@ impl Sub<PackedM31> for PackedQM31 {
 impl Add<QM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: QM31) -> Self::Output {
         self + PackedQM31::broadcast(rhs)
     }
@@ -285,6 +327,7 @@ impl Add<QM31> for PackedQM31 {
 impl Sub<QM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: QM31) -> Self::Output {
         self - PackedQM31::broadcast(rhs)
     }
@@ -293,6 +336,7 @@ impl Sub<QM31> for PackedQM31 {
 impl Mul<QM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: QM31) -> Self::Output {
         self * PackedQM31::broadcast(rhs)
     }
@@ -317,6 +361,7 @@ impl Add<M31> for PackedQM31 {
 }
 
 impl SubAssign for PackedQM31 {
+    #[inline(always)]
     fn sub_assign(&mut self, rhs: Self) {
         *self = *self - rhs;
     }
@@ -352,6 +397,7 @@ impl<'a> Sum<&'a Self> for PackedQM31 {
 impl Neg for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn neg(self) -> Self::Output {
         let Self([a, b]) = self;
         Self([-a, -b])
@@ -365,6 +411,7 @@ impl Distribution<PackedQM31> for StandardUniform {
 }
 
 impl From<PackedM31> for PackedQM31 {
+    #[inline(always)]
     fn from(value: PackedM31) -> Self {
         PackedQM31::from_packed_m31s([
             value,
@@ -376,6 +423,7 @@ impl From<PackedM31> for PackedQM31 {
 }
 
 impl From<QM31> for PackedQM31 {
+    #[inline(always)]
     fn from(value: QM31) -> Self {
         PackedQM31::broadcast(value)
     }

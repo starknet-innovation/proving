@@ -66,6 +66,65 @@ impl LogupTraceGenerator {
         col_gen.finalize_col();
     }
 
+    /// Generate consecutive logup columns in one pass over row chunks.
+    /// The closure returns (numerator, denominator) for a column and packed row.
+    pub fn write_frac_cols(
+        &mut self,
+        n_columns: usize,
+        fraction: impl Fn(usize, usize) -> (PackedSecureField, PackedSecureField) + Sync,
+    ) {
+        if n_columns == 0 {
+            return;
+        }
+        const CHUNK_SIZE: usize = 1024;
+        let n_rows: usize = 1 << (self.log_size - LOG_N_LANES);
+        let mut columns: Vec<_> = (0..n_columns)
+            .map(|_| SecureColumnByCoords::<SimdBackend>::zeros(1 << self.log_size))
+            .collect();
+        let mut tasks: Vec<Vec<_>> =
+            (0..n_rows.div_ceil(CHUNK_SIZE)).map(|_| Vec::with_capacity(n_columns)).collect();
+        for column in &mut columns {
+            for (task, chunk) in tasks.iter_mut().zip(column.chunks_mut(CHUNK_SIZE)) {
+                task.push(chunk);
+            }
+        }
+        let previous = self.trace.last();
+        #[cfg(feature = "parallel")]
+        let tasks = tasks.into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let tasks = tasks.into_iter();
+        tasks.enumerate().for_each(|(chunk_index, mut outputs)| {
+            let start = chunk_index * CHUNK_SIZE;
+            let len = n_rows - start;
+            let len = len.min(CHUNK_SIZE);
+            let mut numerators = vec![PackedSecureField::zero(); len];
+            let mut denominators = vec![PackedSecureField::zero(); len];
+            let mut inverses = vec![PackedSecureField::zero(); len];
+            let mut running: Vec<_> = (start..start + len)
+                .map(|row| {
+                    previous.map_or_else(PackedSecureField::zero, |col| {
+                        PackedSecureField::from_packed_m31s(
+                            col.columns.each_ref().map(|coord| coord.data[row]),
+                        )
+                    })
+                })
+                .collect();
+            for (col, output) in outputs.iter_mut().enumerate() {
+                for row in 0..len {
+                    (numerators[row], denominators[row]) = fraction(col, start + row);
+                }
+                batch_inverse_packed_qm31(&denominators, &mut inverses);
+                for row in 0..len {
+                    running[row] = numerators[row] * inverses[row] + running[row];
+                    for (coord, value) in output.0.iter_mut().zip(running[row].into_packed_m31s()) {
+                        coord.0[row] = value;
+                    }
+                }
+            }
+        });
+        self.trace.extend(columns);
+    }
+
     #[cfg(feature = "parallel")]
     pub fn col_from_par_iter(
         &mut self,

@@ -85,9 +85,9 @@ pub fn write_trace(
         preprocessed_trace.get_column(&PreProcessedColumnId { id: "qm31_ops_mults".to_owned() });
 
     let inputs = extract_component_inputs(
-        in0_address,
-        in1_address,
-        out_address,
+        &in0_address,
+        &in1_address,
+        &out_address,
         context_values,
         trace_generator,
     );
@@ -99,6 +99,7 @@ pub fn write_trace(
     let log_size = n_rows.ilog2();
 
     let packed_inputs = pack_values(&inputs);
+    drop(inputs);
 
     let preprocessed_columns = [
         add_flag,
@@ -123,7 +124,6 @@ fn write_trace_simd(
     inputs: Vec<PackedInputType>,
     preprocessed_columns: Vec<Vec<PackedM31>>,
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData) {
-    let m31_gate_relation_id = PackedM31::broadcast(M31::from(378353459));
     let log_n_packed_rows = inputs.len().ilog2();
     let log_size = log_n_packed_rows + LOG_N_LANES;
     let (mut trace, mut lookup_data) = unsafe {
@@ -181,12 +181,9 @@ fn write_trace_simd(
             *row[10] = out_col10;
             let out_col11 = qm_31_ops_input[2][3];
             *row[11] = out_col11;
-            *lookup_data.in_0 =
-                [m31_gate_relation_id, in0_address, in0_col0, in0_col1, in0_col2, in0_col3];
-            *lookup_data.in_1 =
-                [m31_gate_relation_id, in1_address, in1_col4, in1_col5, in1_col6, in1_col7];
-            *lookup_data.out =
-                [m31_gate_relation_id, out_address, out_col8, out_col9, out_col10, out_col11];
+            *lookup_data.in_0 = [in0_address, in0_col0, in0_col1, in0_col2, in0_col3];
+            *lookup_data.in_1 = [in1_address, in1_col4, in1_col5, in1_col6, in1_col7];
+            *lookup_data.out = [out_address, out_col8, out_col9, out_col10, out_col11];
             *lookup_data.mults = mults;
         });
 
@@ -195,9 +192,9 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 pub struct LookupData {
-    in_0: Vec<[PackedM31; 6]>,
-    in_1: Vec<[PackedM31; 6]>,
-    out: Vec<[PackedM31; 6]>,
+    in_0: Vec<[PackedM31; 5]>,
+    in_1: Vec<[PackedM31; 5]>,
+    out: Vec<[PackedM31; 5]>,
     mults: Vec<PackedM31>,
 }
 
@@ -207,13 +204,16 @@ pub fn write_interaction_trace(
     common_lookup_elements: &relations::CommonLookupElements,
 ) -> (Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>, ClaimedSum) {
     let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(log_size) };
+    let tag = PackedM31::broadcast(M31::from(relations::GATE_RELATION_ID));
 
     // Sum logup terms in pairs.
     let mut col_gen = logup_gen.new_col();
     (col_gen.par_iter_mut(), &lookup_data.in_0, &lookup_data.in_1).into_par_iter().for_each(
         |(writer, values0, values1)| {
-            let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-            let denom1: PackedQM31 = common_lookup_elements.combine(values1);
+            let denom0: PackedQM31 = common_lookup_elements
+                .combine(&[tag, values0[0], values0[1], values0[2], values0[3], values0[4]]);
+            let denom1: PackedQM31 = common_lookup_elements
+                .combine(&[tag, values1[0], values1[1], values1[2], values1[3], values1[4]]);
             writer.write_frac(denom0 + denom1, denom0 * denom1);
         },
     );
@@ -223,7 +223,8 @@ pub fn write_interaction_trace(
     let mut col_gen = logup_gen.new_col();
     (col_gen.par_iter_mut(), &lookup_data.out, lookup_data.mults).into_par_iter().for_each(
         |(writer, values, mults)| {
-            let denom = common_lookup_elements.combine(values);
+            let denom = common_lookup_elements
+                .combine(&[tag, values[0], values[1], values[2], values[3], values[4]]);
             writer.write_frac(-PackedQM31::one() * mults, denom);
         },
     );

@@ -1,4 +1,6 @@
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::iter::zip;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{array, mem};
 
 use bytemuck::allocation::cast_vec;
@@ -16,10 +18,82 @@ use super::very_packed_m31::{
     N_VERY_PACKED_ELEMS, VeryPackedBaseField, VeryPackedQM31, VeryPackedSecureField,
 };
 use crate::core::fields::cm31::CM31;
-use crate::core::fields::m31::BaseField;
+use crate::core::fields::m31::{BaseField, P};
 use crate::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use crate::prover::backend::{Column, CpuBackend};
 use crate::prover::secure_column::SecureColumnByCoords;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[cfg(target_os = "linux")]
+    fn madvise(
+        addr: *mut core::ffi::c_void,
+        length: usize,
+        advice: core::ffi::c_int,
+    ) -> core::ffi::c_int;
+    fn mmap(
+        addr: *mut core::ffi::c_void,
+        length: usize,
+        prot: core::ffi::c_int,
+        flags: core::ffi::c_int,
+        fd: core::ffi::c_int,
+        offset: i64,
+    ) -> *mut core::ffi::c_void;
+    fn munmap(addr: *mut core::ffi::c_void, length: usize) -> core::ffi::c_int;
+}
+
+/// Advises the kernel about a large buffer: `MADV_HUGEPAGE` on the whole pages it covers, so that
+/// transparent huge pages back it where the kernel allows them, and with `populate` also
+/// `MADV_POPULATE_WRITE`, which maps all of its pages in one call instead of one fault per page.
+/// Hints only: a no-op off Linux, for buffers below 2 MiB, and when the kernel declines.
+pub(crate) fn advise_pages<T>(data: &[T], populate: bool) {
+    const MADV_HUGEPAGE: core::ffi::c_int = 14;
+    const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
+    let (start, len) = whole_pages(data.as_ptr() as usize, std::mem::size_of_val(data));
+    advise_range(start, len, MADV_HUGEPAGE);
+    if populate {
+        advise_range(start, len, MADV_POPULATE_WRITE);
+    }
+}
+
+/// Tells the kernel that the spare capacity of a buffer (the part past its length, which holds
+/// nothing the program reads before writing it again) need not stay resident: `MADV_DONTNEED`
+/// on the whole pages it covers, which frees them now and maps zero pages back on the next
+/// touch. A hint with the same scope as [`advise_pages`].
+pub(crate) fn release_pages<T>(spare: &[std::mem::MaybeUninit<T>]) {
+    const MADV_DONTNEED: core::ffi::c_int = 4;
+    let (start, len) = whole_pages(spare.as_ptr() as usize, std::mem::size_of_val(spare));
+    advise_range(start, len, MADV_DONTNEED);
+}
+
+/// The whole 4 KiB pages inside `[addr, addr + bytes)`, or an empty range for a buffer below
+/// 2 MiB, which is not worth a system call.
+fn whole_pages(addr: usize, bytes: usize) -> (usize, usize) {
+    const PAGE: usize = 4096;
+    if bytes < 1 << 21 {
+        return (0, 0);
+    }
+    let start = (addr + PAGE - 1) & !(PAGE - 1);
+    let end = (addr + bytes) & !(PAGE - 1);
+    (start, end.saturating_sub(start))
+}
+
+/// `madvise` on a page-aligned range; a no-op off Linux, for an empty range, and when the kernel
+/// declines (the advice is a hint and the program is correct without it).
+fn advise_range(start: usize, len: usize, advice: core::ffi::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        if len > 0 {
+            unsafe {
+                madvise(start as *mut core::ffi::c_void, len, advice);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (start, len, advice);
+    }
+}
 
 /// An efficient structure for storing and operating on a arbitrary number of [`BaseField`] values.
 #[derive(Clone, Debug)]
@@ -74,12 +148,10 @@ impl BaseColumn {
     }
 }
 
-unsafe impl Send for BaseColumn {}
-unsafe impl Sync for BaseColumn {}
-
 impl Column<BaseField> for BaseColumn {
     fn zeros(length: usize) -> Self {
         let data = vec![PackedBaseField::zeroed(); length.div_ceil(N_LANES)];
+        advise_pages(&data, false);
         Self { data, length }
     }
 
@@ -87,6 +159,7 @@ impl Column<BaseField> for BaseColumn {
     unsafe fn uninitialized(length: usize) -> Self {
         let mut data = Vec::with_capacity(length.div_ceil(N_LANES));
         data.set_len(length.div_ceil(N_LANES));
+        advise_pages(&data, false);
         Self { data, length }
     }
 
@@ -98,8 +171,12 @@ impl Column<BaseField> for BaseColumn {
         self.length
     }
 
+    #[inline]
     fn at(&self, index: usize) -> BaseField {
-        self.data[index / N_LANES].to_array()[index % N_LANES]
+        // The scalar form of `self.data[..].to_array()[..]`: `to_array` reduces every lane to
+        // `[0, P)` as `min(x, x - P)`.
+        let x = self.data[index / N_LANES].into_simd()[index % N_LANES];
+        BaseField::from_u32_unchecked(x.min(x.wrapping_sub(P)))
     }
 
     fn set(&mut self, index: usize, value: BaseField) {
@@ -114,6 +191,60 @@ impl Column<BaseField> for BaseColumn {
             Self { data: self.data, length: self.length / 2 },
             Self { data: second, length: self.length - self.length / 2 },
         )
+    }
+
+    fn truncate(&mut self, len: usize) -> bool {
+        if len > self.length {
+            return false;
+        }
+        self.data.truncate(len.div_ceil(N_LANES));
+        self.length = len;
+        true
+    }
+
+    #[allow(clippy::uninit_vec)]
+    fn grow(&mut self, len: usize) -> bool {
+        let n_vecs = len.div_ceil(N_LANES);
+        if len < self.length || n_vecs > self.data.capacity() {
+            return false;
+        }
+        // The new elements are left uninitialized, as by `uninitialized`: the caller writes them
+        // before reading them.
+        unsafe { self.data.set_len(n_vecs) };
+        self.length = len;
+        true
+    }
+
+    fn release_spare(&mut self) {
+        release_pages(self.data.spare_capacity_mut());
+    }
+
+    fn release_zeroed_pages(&mut self) {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            // Membership proves the exact allocation base is a live private anonymous mapping
+            // from LargeBlockCache. A size or alignment test alone cannot establish that fact.
+            let allocation_base = self.data.as_mut_ptr() as usize;
+            if self.length < (1 << 21) / mem::size_of::<BaseField>()
+                || !LIVE_ANONYMOUS_BLOCKS.contains(allocation_base)
+            {
+                return;
+            }
+            // Inspect only initialized logical words, not spare capacity or packed padding.
+            // P is another field encoding of zero but is not the literal bytes restored by
+            // MADV_DONTNEED, so it must not satisfy this check.
+            let initialized_bytes = {
+                let initialized = self.as_slice();
+                if !initialized.iter().all(|value| value.0 == 0) {
+                    return;
+                }
+                mem::size_of_val(initialized)
+            };
+            let (start, len) = whole_pages(allocation_base, initialized_bytes);
+            // Exclusive ownership keeps the allocation live throughout membership, scanning,
+            // and advice. Inward rounding excludes every byte outside the initialized slice.
+            advise_range(start, len, 4);
+        }
     }
 }
 
@@ -144,9 +275,6 @@ pub struct CM31Column {
     pub data: Vec<PackedCM31>,
     pub length: usize,
 }
-
-unsafe impl Send for CM31Column {}
-unsafe impl Sync for CM31Column {}
 
 impl Column<CM31> for CM31Column {
     fn zeros(length: usize) -> Self {
@@ -264,9 +392,6 @@ impl SecureColumn {
         SecureColumnByCoords { columns: columns.map(|col| BaseColumn { data: col, length }) }
     }
 }
-
-unsafe impl Send for SecureColumn {}
-unsafe impl Sync for SecureColumn {}
 
 impl Column<SecureField> for SecureColumn {
     fn zeros(length: usize) -> Self {
@@ -422,6 +547,7 @@ impl VeryPackedSecureColumnByCoordsMutSlice<'_> {
     /// # Safety
     ///
     /// `vec_index` must be a valid index.
+    #[inline]
     pub unsafe fn packed_at(&self, vec_index: usize) -> VeryPackedSecureField {
         VeryPackedQM31::from_very_packed_m31s(std::array::from_fn(|i| {
             *self.0[i].0.get_unchecked(vec_index)
@@ -431,6 +557,7 @@ impl VeryPackedSecureColumnByCoordsMutSlice<'_> {
     /// # Safety
     ///
     /// `vec_index` must be a valid index.
+    #[inline]
     pub unsafe fn set_packed(&mut self, vec_index: usize, value: VeryPackedSecureField) {
         let [a, b, c, d] = value.into_very_packed_m31s();
         *self.0[0].0.get_unchecked_mut(vec_index) = a;
@@ -748,6 +875,238 @@ impl VeryPackedSecureColumnByCoords {
                     VeryPackedBaseColumnMutSlice(d),
                 ])
             })
+    }
+}
+
+/// A global allocator that keeps large blocks in a cache every thread shares.
+///
+/// glibc serves each thread from its own arena. A large temporary that one rayon worker frees (an
+/// interaction writer's denominators, a FRI layer, a quotient accumulator, a Merkle layer) stays in
+/// that worker's arena, where the other workers cannot reuse it, so across 16 workers the freed
+/// blocks pile up as holes: about 1.4 GB at the privacy proof's peak. Handing them back to the
+/// kernel instead (a lower mmap threshold, one arena, `malloc_trim`) frees that memory but costs
+/// 3.5% to 16% of the run in system calls and page faults.
+///
+/// Blocks of 1 MiB and up are mapped here instead, rounded up to a quarter of a power of two, which
+/// is exact for the power-of-two sizes of most columns and layers. A freed block waits in its class
+/// for the next request of that class, from any thread, which takes it without a system call. Idle
+/// blocks stay bounded: past [`LARGE_IDLE_CAP`] a freed block is unmapped, and a request that finds
+/// its class empty first unmaps idle blocks of other classes, down to [`LARGE_LOW_WATER`], so that
+/// a new phase's blocks replace the idle ones instead of adding to them. Smaller blocks, and blocks
+/// aligned past a page, go to the system allocator as before. Proof bytes do not depend on where
+/// buffers come from.
+#[cfg(unix)]
+pub struct LargeBlockCache;
+
+const LARGE_MIN_LOG: u32 = 20;
+const LARGE_MAX_LOG: u32 = 40;
+const LARGE_CLASSES: usize = ((LARGE_MAX_LOG - LARGE_MIN_LOG) * 4) as usize + 1;
+/// Idle blocks a class can hold.
+const LARGE_SLOTS: usize = 128;
+/// The most idle memory the cache holds.
+const LARGE_IDLE_CAP: usize = 0;
+/// Idle memory a request with an empty class leaves alone: enough to absorb the churn between
+/// classes within a phase without a system call.
+const LARGE_LOW_WATER: usize = 0;
+/// Blocks of 2 MiB and up start on a 2 MiB boundary, so transparent huge pages can back all of
+/// them.
+const HUGE_PAGE: usize = 1 << 21;
+const PROT_READ: core::ffi::c_int = 1;
+const PROT_WRITE: core::ffi::c_int = 2;
+const MAP_PRIVATE: core::ffi::c_int = 2;
+#[cfg(target_os = "linux")]
+const MAP_ANONYMOUS: core::ffi::c_int = 0x20;
+#[cfg(not(target_os = "linux"))]
+const MAP_ANONYMOUS: core::ffi::c_int = 0x1000;
+
+/// The idle blocks, as addresses in per-class slots, and their total size.
+struct LargeBlocks {
+    idle: AtomicUsize,
+    counts: [AtomicUsize; LARGE_CLASSES],
+    slots: [[AtomicUsize; LARGE_SLOTS]; LARGE_CLASSES],
+}
+
+static LARGE_BLOCKS: LargeBlocks = LargeBlocks {
+    idle: AtomicUsize::new(0),
+    counts: [const { AtomicUsize::new(0) }; LARGE_CLASSES],
+    slots: [const { [const { AtomicUsize::new(0) }; LARGE_SLOTS] }; LARGE_CLASSES],
+};
+
+/// A conservative, allocation-free record of currently live private anonymous allocation bases.
+/// Collisions lose optimization opportunities; they never replace a different live address.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct LiveAnonymousBlocks {
+    slots: [AtomicUsize; 1 << 14],
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+static LIVE_ANONYMOUS_BLOCKS: LiveAnonymousBlocks = LiveAnonymousBlocks {
+    slots: [const { AtomicUsize::new(0) }; 1 << 14],
+};
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl LiveAnonymousBlocks {
+    fn slot(&self, address: usize) -> &AtomicUsize {
+        &self.slots[((address >> 21) ^ (address >> 35)) & (self.slots.len() - 1)]
+    }
+
+    fn register(&self, address: usize) {
+        if address != 0 {
+            let _ = self.slot(address).compare_exchange(
+                0, address, Ordering::SeqCst, Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn unregister(&self, address: usize) {
+        if address != 0 {
+            let _ = self.slot(address).compare_exchange(
+                address, 0, Ordering::SeqCst, Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn contains(&self, address: usize) -> bool {
+        // Use a locked read-modify-write, not a potentially stale load. It observes the latest
+        // slot modification, so an address removed before unmap cannot authorize a later,
+        // unrelated allocation reusing that address. Exclusive Vec ownership prevents the
+        // currently matching allocation from being deallocated before the caller's advice.
+        address != 0 && self.slot(address).compare_exchange(
+            address, address, Ordering::SeqCst, Ordering::SeqCst,
+        ).is_ok()
+    }
+}
+
+impl LargeBlocks {
+    /// An idle block of the class, if there is one.
+    fn take(&self, class: usize) -> Option<usize> {
+        if self.counts[class].load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        for slot in &self.slots[class] {
+            if slot.load(Ordering::Relaxed) != 0 {
+                let block = slot.swap(0, Ordering::Acquire);
+                if block != 0 {
+                    self.counts[class].fetch_sub(1, Ordering::Relaxed);
+                    self.idle.fetch_sub(large_class_size(class), Ordering::Relaxed);
+                    return Some(block);
+                }
+            }
+        }
+        None
+    }
+
+    /// Keeps a freed block of the class, unless the cache is full; the counters go up before the
+    /// block is visible, so they never fall below what the slots hold.
+    fn keep(&self, class: usize, block: usize) -> bool {
+        let size = large_class_size(class);
+        if self.idle.fetch_add(size, Ordering::Relaxed) + size > LARGE_IDLE_CAP {
+            self.idle.fetch_sub(size, Ordering::Relaxed);
+            return false;
+        }
+        self.counts[class].fetch_add(1, Ordering::Relaxed);
+        for slot in &self.slots[class] {
+            if slot.compare_exchange(0, block, Ordering::Release, Ordering::Relaxed).is_ok() {
+                return true;
+            }
+        }
+        self.counts[class].fetch_sub(1, Ordering::Relaxed);
+        self.idle.fetch_sub(size, Ordering::Relaxed);
+        false
+    }
+
+    /// An idle block of the largest class that has one, with its size, while the idle memory is
+    /// above the low-water mark.
+    fn evict(&self) -> Option<(usize, usize)> {
+        if self.idle.load(Ordering::Relaxed) <= LARGE_LOW_WATER {
+            return None;
+        }
+        (0..LARGE_CLASSES).rev().find_map(|class| Some((self.take(class)?, large_class_size(class))))
+    }
+}
+
+/// The class of a block the cache serves, or `None` for one the system allocator serves.
+fn large_class(layout: Layout) -> Option<usize> {
+    let size = layout.size();
+    if size < 1 << LARGE_MIN_LOG || size > 1 << LARGE_MAX_LOG || layout.align() > 4096 {
+        return None;
+    }
+    if size == 1 << LARGE_MIN_LOG {
+        return Some(0);
+    }
+    // 2^k < size <= 2^(k + 1), rounded up to a quarter of 2^k.
+    let k = usize::BITS - 1 - (size - 1).leading_zeros();
+    Some(((k - LARGE_MIN_LOG) * 4) as usize + size.div_ceil(1 << (k - 2)) - 4)
+}
+
+fn large_class_size(class: usize) -> usize {
+    if class == 0 {
+        return 1 << LARGE_MIN_LOG;
+    }
+    ((class - 1) % 4 + 5) << (LARGE_MIN_LOG + ((class - 1) / 4) as u32 - 2)
+}
+
+#[cfg(unix)]
+unsafe impl GlobalAlloc for LargeBlockCache {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let Some(class) = large_class(layout) else {
+            return System.alloc(layout);
+        };
+        if let Some(block) = LARGE_BLOCKS.take(class) {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            LIVE_ANONYMOUS_BLOCKS.register(block);
+            return block as *mut u8;
+        }
+        let size = large_class_size(class);
+        let mut freed = 0;
+        while freed < size
+            && let Some((block, block_size)) = LARGE_BLOCKS.evict()
+        {
+            munmap(block as *mut core::ffi::c_void, block_size);
+            freed += block_size;
+        }
+        let align = if size >= HUGE_PAGE { HUGE_PAGE } else { 1 };
+        let len = size + align - 1;
+        let mapped = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if mapped as isize == -1 {
+            return std::ptr::null_mut();
+        }
+        // Trim the mapping to the aligned block; the trimmed ends were never touched.
+        let start = mapped as usize;
+        let block = (start + align - 1) & !(align - 1);
+        if block > start {
+            munmap(mapped, block - start);
+        }
+        if start + len > block + size {
+            munmap((block + size) as *mut core::ffi::c_void, start + len - block - size);
+        }
+        // In `madvise` THP mode the alignment alone buys nothing: ask for huge pages, so the
+        // block takes one fault per 2 MiB instead of 512. A hint; the block is correct either way.
+        #[cfg(target_os = "linux")]
+        if align == HUGE_PAGE {
+            madvise(block as *mut core::ffi::c_void, size, 14);
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        LIVE_ANONYMOUS_BLOCKS.register(block);
+        block as *mut u8
+    }
+
+    unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
+        let Some(class) = large_class(layout) else {
+            return System.dealloc(block, layout);
+        };
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        LIVE_ANONYMOUS_BLOCKS.unregister(block as usize);
+        if !LARGE_BLOCKS.keep(class, block as usize) {
+            munmap(block.cast(), large_class_size(class));
+        }
     }
 }
 

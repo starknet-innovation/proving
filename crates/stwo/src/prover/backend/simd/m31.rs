@@ -68,8 +68,32 @@ unsafe impl Sync for PackedM31 {}
 
 impl PackedM31 {
     /// Constructs a new instance with all vector elements set to `value`.
+    #[inline(always)]
     pub const fn broadcast(M31(value): M31) -> Self {
         Self(Simd::splat(value))
+    }
+
+    /// Returns `self * rhs` with the multiplication kernel expanded at the call site.
+    ///
+    /// `Mul for PackedM31` calls the out of line `mul_*` wrapper, which keeps the code of the many
+    /// witness generation call sites small. The extension field operators and the
+    /// `Vectorized` operators that the constraint evaluators are written against use this
+    /// entry point instead.
+    #[inline(always)]
+    pub(crate) fn mul_inline(self, rhs: Self) -> Self {
+        cfg_if::cfg_if! {
+            if #[cfg(all(target_arch = "aarch64", target_feature = "neon"))] {
+                mul_neon(self, rhs)
+            } else if #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))] {
+                mul_wasm(self, rhs)
+            } else if #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))] {
+                mul_doubled_avx512(self, rhs.0 + rhs.0)
+            } else if #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))] {
+                mul_doubled_avx2(self, rhs.0 + rhs.0)
+            } else {
+                mul_doubled_simd(self, rhs.0 + rhs.0)
+            }
+        }
     }
 
     pub fn from_array(values: [M31; N_LANES]) -> PackedM31 {
@@ -113,6 +137,7 @@ impl PackedM31 {
         self + self
     }
 
+    #[inline(always)]
     pub const fn into_simd(self) -> Simd<u32, N_LANES> {
         self.0
     }
@@ -458,6 +483,7 @@ cfg_if::cfg_if! {
         /// Returns `a * b`.
         ///
         /// `b_double` should be in the range `[0, 2P]`.
+        #[inline(always)]
         pub(crate) fn mul_doubled_avx512(a: PackedM31, b_double: u32x16) -> PackedM31 {
             let a: __m512i = unsafe { transmute(a) };
             let b_double: __m512i = unsafe { transmute(b_double) };
@@ -509,6 +535,7 @@ cfg_if::cfg_if! {
         /// Returns `a * b`.
         ///
         /// `b_double` should be in the range `[0, 2P]`.
+        #[inline(always)]
         pub(crate) fn mul_doubled_avx2(a: PackedM31, b_double: u32x16) -> PackedM31 {
             let [a0, a1]: [__m256i; 2] = unsafe { transmute::<PackedM31, [__m256i; 2]>(a) };
             let [b0_dbl, b1_dbl]: [__m256i; 2] = unsafe { transmute::<u32x16, [__m256i; 2]>(b_double) };
@@ -574,6 +601,7 @@ cfg_if::cfg_if! {
         /// Should only be used in the absence of a platform specific implementation.
         ///
         /// `b_double` should be in the range `[0, 2P]`.
+        #[inline(always)]
         pub(crate) fn mul_doubled_simd(a: PackedM31, b_double: u32x16) -> PackedM31 {
             const MASK_EVENS: Simd<u64, { N_LANES / 2 }> = Simd::from_array([0xFFFFFFFF; { N_LANES / 2 }]);
 

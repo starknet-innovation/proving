@@ -10,7 +10,7 @@ pub type PackedInputType = [PackedM31; 2];
 
 pub struct ClaimGenerator {
     pub mults: [AtomicMultiplicityColumn; 8],
-    input_to_row: HashMap<[M31; 2], usize>,
+    input_to_row: InputToRow<2>,
     preprocessed_trace: Arc<PreProcessedTrace>,
 }
 
@@ -52,8 +52,7 @@ impl AddInputs for ClaimGenerator {
         });
     }
     fn add_input(&self, input: &InputType, relation_index: usize) {
-        self.mults[relation_index]
-            .increase_at((*self.input_to_row.get(input).unwrap()).try_into().unwrap());
+        self.mults[relation_index].increase_at(self.input_to_row.row(input).try_into().unwrap());
     }
 }
 
