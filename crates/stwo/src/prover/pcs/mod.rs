@@ -16,17 +16,17 @@ use crate::core::pcs::quotients::{
 };
 use crate::core::pcs::utils::prepare_preprocessed_query_positions;
 use crate::core::pcs::{PcsConfig, TreeSubspan, TreeVec};
-use crate::core::poly::circle::CanonicCoset;
+use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::core::utils::MaybeOwned;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::ExtendedMerkleDecommitmentLifted;
 use crate::prover::air::component_prover::{Poly, Trace, WeightsHashMap};
-use crate::prover::backend::{BackendForChannel, Column};
+use crate::prover::backend::{BackendForChannel, Col, Column};
 use crate::prover::fri::{FriDecommitResult, FriProver};
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::pcs::quotient_ops::compute_fri_quotients;
 use crate::prover::poly::BitReversedOrder;
-use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
+use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::secure_column::SecureColumnByCoords;
 use crate::prover::vcs_lifted::prover::MerkleProverLifted;
@@ -266,14 +266,22 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Lambda that evaluates a polynomial on a collection of circle points and returns a vector
         // of point samples.
         let eval_at_points = |(poly, points): (&Poly<B>, &Vec<CirclePoint<SecureField>>)| {
+            // A striped column without coefficients regrows them once for all its points.
+            let regrown = (poly.coeffs.is_none()
+                && weights_hash_map.is_none()
+                && poly.evals.values.len() < poly.evals.domain.size())
+            .then(|| poly.regrown_coefficients());
             points
                 .iter()
-                .map(|&point| PointSample {
-                    point,
-                    value: poly.eval_at_point(
-                        point.repeated_double(lifting_log_size - poly.evals.domain.log_size()),
-                        weights_hash_map.as_ref(),
-                    ),
+                .map(|&point| {
+                    let point_at = point.repeated_double(lifting_log_size - poly.evals.domain.log_size());
+                    PointSample {
+                        point,
+                        value: match &regrown {
+                            Some(coeffs) => coeffs.eval_at_point(point_at),
+                            None => poly.eval_at_point(point_at, weights_hash_map.as_ref()),
+                        },
+                    }
                 })
                 .collect_vec()
         };
@@ -313,6 +321,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Point samples are complete; subsequent quotient and opening paths use evaluations.
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
+                // A striped tree's small columns keep their coefficients for its decommitment.
+                if tree.is_striped() {
+                    continue;
+                }
                 for poly in &mut tree.polynomials {
                     drop(poly.coeffs.take());
                 }
@@ -367,28 +379,33 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 })
                 .collect::<Vec<_>>(),
         );
+        // The FRI input column is dead once FRI has decommitted: free it before the striped trees
+        // regrow their stripes.
+        for column in quotients.values.columns {
+            self.base_column_pool.give_back(lifting_log_size, column);
+        }
+        self.base_column_pool.release_all_idle();
         let commitments = self.roots();
+        let twiddles = self.twiddles;
+        let pool: &BaseColumnPool<B> = &self.base_column_pool;
         let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = self
             .trees
             .as_ref()
             .zip_eq(query_positions_tree)
-            .map(|(tree, query_positions)| tree.decommit(query_positions))
+            .map(|(tree, query_positions)| {
+                tree.decommit(query_positions, twiddles, pool, self.config.fri_config.log_blowup_factor)
+            })
             .0
             .into_iter()
             .map(|(v, x)| (v, x.decommitment, x.aux))
             .multiunzip();
 
-        // The FRI input column is no longer needed: its four coordinate buffers go back to the
-        // pool, where the next proof's evaluations of the same size reuse them.
-        for column in quotients.values.columns {
-            self.base_column_pool.give_back(lifting_log_size, column);
-        }
-
         // Return evaluation buffers to the memory pool for reuse (owned trees only).
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
                 for poly in tree.polynomials.drain(..) {
-                    let log_size = poly.evals.domain.log_size();
+                    // A striped column holds only a prefix of its domain.
+                    let log_size = poly.evals.values.len().ilog2();
                     self.base_column_pool.give_back(log_size, poly.evals.values);
                 }
             }
@@ -469,12 +486,23 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         lifting_log_size: u32,
         base_column_pool: &BaseColumnPool<B>,
     ) -> Self {
+        if B::STRIPES && can_stripe(&polynomials, log_blowup_factor, lifting_log_size) {
+            return Self::new_striped(
+                polynomials,
+                log_blowup_factor,
+                twiddles,
+                lifting_log_size,
+                base_column_pool,
+            );
+        }
         let span = span!(Level::INFO, "Extension").entered();
+        // A tree that is not striped keeps its coefficients where trees are striped: composition
+        // then extends every column from its coefficients (see `compute_composition_polynomial`).
         let polynomials = B::evaluate_polynomials(
             polynomials,
             log_blowup_factor,
             twiddles,
-            store_polynomials_coefficients,
+            store_polynomials_coefficients || B::STRIPES,
             base_column_pool,
         );
         span.exit();
@@ -489,6 +517,157 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         CommitmentTreeProver { polynomials, commitment: tree }
     }
 
+    /// Commits the extension of `polynomials` one subdomain stripe at a time. The extension of a
+    /// column on its domain is `2^log_blowup_factor` independent FFTs, one per subdomain of the
+    /// coefficients' size, each writing one contiguous block of the bit-reversed evaluation.
+    /// Stripe `k` of every column is computed into a scratch column, and its Merkle subtree is
+    /// built from the scratch columns; the subtrees are the lowest layers of the tree. A column
+    /// keeps only stripe 0, its evaluation on the first subdomain, which determines it (small
+    /// columns keep their whole extension and their coefficients); everything else is regrown
+    /// from stripe 0 where it is read. No column's full extension is ever resident.
+    fn new_striped(
+        polynomials: ColumnVec<CircleCoefficients<B>>,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<B>,
+        lifting_log_size: u32,
+        base_column_pool: &BaseColumnPool<B>,
+    ) -> Self {
+        let _span = span!(Level::INFO, "Striped extension and Merkle").entered();
+        let n_stripes = 1usize << log_blowup_factor;
+        let stripe_lifting_log_size = lifting_log_size - log_blowup_factor;
+        let domains = polynomials
+            .iter()
+            .map(|poly| CanonicCoset::new(poly.log_size() + log_blowup_factor).circle_domain())
+            .collect_vec();
+        let prefix = domains.iter().map(|&domain| keeps_prefix(domain, log_blowup_factor)).collect_vec();
+        // Prefix columns get their stripe-0 buffer now (the last stripe hashed, which the FFT writes
+        // in place). Whole-extension columns are evaluated now.
+        let mut evals = polynomials
+            .iter()
+            .zip(&domains)
+            .zip(&prefix)
+            .map(|((poly, &domain), &prefix)| {
+                if prefix {
+                    base_column_pool.take_or_alloc(poly.log_size())
+                } else {
+                    let buffer = base_column_pool.take_or_alloc(domain.log_size());
+                    B::evaluate_into(poly, domain, twiddles, buffer).values
+                }
+            })
+            .collect_vec();
+        let mut scratch = polynomials
+            .iter()
+            .map(|poly| base_column_pool.take_or_alloc(poly.log_size()))
+            .collect_vec();
+        let mut coeffs = polynomials.into_iter().map(Some).collect_vec();
+
+        // Stripe 0, the only one a prefix column keeps, last and in place.
+        let order = (1..n_stripes).chain([0]).collect_vec();
+        let mut stripe_layers: Vec<Option<Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>>>> =
+            (0..n_stripes).map(|_| None).collect();
+        for &stripe in &order {
+            if stripe == 0 {
+                // Stripe 0 is written in place, so the prefix columns' scratch is dead: free it
+                // first.
+                for (i, column) in scratch.iter_mut().enumerate() {
+                    if prefix[i] {
+                        drop(std::mem::replace(column, Col::<B, BaseField>::zeros(0)));
+                    }
+                }
+                base_column_pool.release_all_idle();
+            }
+            let fill = |((((poly, &domain), &prefix), eval), column): (
+                (((&Option<CircleCoefficients<B>>, &CircleDomain), &bool), &mut Col<B, BaseField>),
+                &mut Col<B, BaseField>,
+            )| {
+                let poly = poly.as_ref().unwrap();
+                let len = 1usize << poly.log_size();
+                if !prefix {
+                    B::copy_block(eval, stripe * len, column, 0, len);
+                } else if stripe == 0 {
+                    B::evaluate_stripe_into(poly, domain, twiddles, 0, eval);
+                } else {
+                    B::evaluate_stripe_into(poly, domain, twiddles, stripe, column);
+                }
+            };
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator};
+                coeffs
+                    .par_iter()
+                    .zip(domains.par_iter())
+                    .zip(prefix.par_iter())
+                    .zip(evals.par_iter_mut())
+                    .zip(scratch.par_iter_mut())
+                    .for_each(fill);
+            }
+            #[cfg(not(feature = "parallel"))]
+            coeffs
+                .iter()
+                .zip(&domains)
+                .zip(&prefix)
+                .zip(evals.iter_mut())
+                .zip(scratch.iter_mut())
+                .for_each(fill);
+            let columns = (0..coeffs.len())
+                .map(|i| if prefix[i] && stripe == 0 { &evals[i] } else { &scratch[i] })
+                .sorted_by_key(|column| column.len())
+                .collect_vec();
+            stripe_layers[stripe] = Some(B::build_layers_sparse(&columns, stripe_lifting_log_size));
+        }
+        // A prefix column's coefficients are regrown from stripe 0 where they are needed (the
+        // out-of-domain samples, composition and the decommitment), one column or tree at a time.
+        let log_sizes = coeffs.iter().map(|poly| poly.as_ref().unwrap().log_size()).collect_vec();
+        for (poly, &prefix) in coeffs.iter_mut().zip(&prefix) {
+            if prefix {
+                drop(poly.take());
+            }
+        }
+        for (&log_size, column) in log_sizes.iter().zip(scratch) {
+            if column.len() == 1 << log_size {
+                base_column_pool.give_back(log_size, column);
+            }
+        }
+        base_column_pool.release_all_idle();
+        let stripe_layers = stripe_layers.into_iter().map(Option::unwrap).collect_vec();
+
+        // Level `l` of the tree, up to the stripes' roots, is the concatenation of the stripes'
+        // levels `l`, in stripe order.
+        let mut layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> = (0
+            ..=stripe_lifting_log_size as usize)
+            .map(|level| {
+                stripe_layers.iter().flat_map(|layers| layers[level].to_cpu()).collect()
+            })
+            .collect();
+        drop(stripe_layers);
+        for _ in stripe_lifting_log_size..lifting_log_size {
+            let next = B::build_next_layer(layers.last().unwrap());
+            layers.push(next);
+        }
+        layers.reverse();
+
+        let polynomials = coeffs
+            .into_iter()
+            .zip(domains)
+            .zip(evals)
+            .map(|((coeffs, domain), values)| {
+                let mut evals = CircleEvaluation::new(
+                    CanonicCoset::new(values.len().ilog2()).circle_domain(),
+                    values,
+                );
+                evals.domain = domain;
+                Poly::new(coeffs, evals)
+            })
+            .collect();
+        CommitmentTreeProver { polynomials, commitment: MerkleProverLifted { layers } }
+    }
+
+    /// Whether the tree was committed by [`Self::new_striped`] with a column that keeps only a
+    /// prefix of its extension.
+    pub fn is_striped(&self) -> bool {
+        self.polynomials.iter().any(|poly| poly.evals.values.len() < poly.evals.domain.size())
+    }
+
     /// Decommits the merkle tree on the given query positions.
     /// Returns the values at the queried positions and the decommitment.
     /// The queries are given as a mapping from the log size of the layer size to the queried
@@ -496,10 +675,122 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     fn decommit(
         &self,
         queries: &[usize],
+        twiddles: &TwiddleTree<B>,
+        base_column_pool: &BaseColumnPool<B>,
+        log_blowup_factor: u32,
     ) -> (ColumnVec<Vec<BaseField>>, ExtendedMerkleDecommitmentLifted<MC::H>) {
+        if self.is_striped() {
+            return self.decommit_striped(queries, twiddles, base_column_pool, log_blowup_factor);
+        }
         let eval_vec = self.polynomials.iter().map(|poly| &poly.evals.values).collect_vec();
         self.commitment.decommit(queries, eval_vec)
     }
+
+    /// [`Self::decommit`] for a striped tree. Column by column, the coefficients and every stripe
+    /// that holds a queried position or a leaf the decommitment rehashes are regrown, and only
+    /// the rows read there are kept; the leaves are then hashed from those rows.
+    fn decommit_striped(
+        &self,
+        queries: &[usize],
+        twiddles: &TwiddleTree<B>,
+        base_column_pool: &BaseColumnPool<B>,
+        log_blowup_factor: u32,
+    ) -> (ColumnVec<Vec<BaseField>>, ExtendedMerkleDecommitmentLifted<MC::H>) {
+        let _span = span!(Level::INFO, "Striped decommit").entered();
+        let lifting_log_size = self.commitment.layers.len() as u32 - 1;
+        let stripe_log_size = lifting_log_size - log_blowup_factor;
+        let leaf_positions = self.commitment.omitted_leaf_positions(queries);
+        let positions = queries.iter().chain(&leaf_positions).copied().collect_vec();
+        let stripes = positions
+            .iter()
+            .map(|position| position >> stripe_log_size)
+            .sorted()
+            .dedup()
+            .collect_vec();
+        // The rows of `positions` in one column, read from its stripes as the tree lifts them.
+        let read_rows = |poly: &Poly<B>| -> Vec<BaseField> {
+            let regrown = poly.coeffs.is_none().then(|| poly.regrown_coefficients());
+            let coeffs = poly.coeffs.as_ref().or(regrown.as_ref()).unwrap();
+            let len = 1usize << coeffs.log_size();
+            let shift = stripe_log_size - coeffs.log_size();
+            let mut column = base_column_pool.take_or_alloc(coeffs.log_size());
+            let mut rows = vec![BaseField::from(0); positions.len()];
+            for &stripe in &stripes {
+                if (stripe + 1) * len <= poly.evals.values.len() {
+                    B::copy_block(&poly.evals.values, stripe * len, &mut column, 0, len);
+                } else {
+                    B::evaluate_stripe_into(coeffs, poly.evals.domain, twiddles, stripe, &mut column);
+                }
+                for (row, &position) in rows.iter_mut().zip(&positions) {
+                    if position >> stripe_log_size == stripe {
+                        let local = position - (stripe << stripe_log_size);
+                        *row = column.at((local >> (shift + 1) << 1) + (local & 1));
+                    }
+                }
+            }
+            base_column_pool.give_back(coeffs.log_size(), column);
+            rows
+        };
+        #[cfg(feature = "parallel")]
+        let rows: Vec<Vec<BaseField>> = self.polynomials.par_iter().map(read_rows).collect();
+        #[cfg(not(feature = "parallel"))]
+        let rows: Vec<Vec<BaseField>> = self.polynomials.iter().map(read_rows).collect();
+        base_column_pool.release_all_idle();
+
+        let queried_values = rows.iter().map(|rows| rows[..queries.len()].to_vec()).collect_vec();
+        // A leaf hashes its row column by column in increasing size, 16 values of one size per
+        // update, as `MerkleOpsLifted::build_leaves` does.
+        let by_size = rows
+            .iter()
+            .zip(&self.polynomials)
+            .sorted_by_key(|(_, poly)| poly.evals.domain.log_size())
+            .collect_vec();
+        let leaves: HashMap<usize, <MC::H as MerkleHasherLifted>::Hash> = leaf_positions
+            .iter()
+            .enumerate()
+            .map(|(i, &position)| {
+                let mut hasher = MC::H::default();
+                for (_, group) in &by_size.iter().group_by(|(_, poly)| poly.evals.domain.log_size()) {
+                    for chunk in &group.chunks(16) {
+                        let values = chunk.map(|(rows, _)| rows[queries.len() + i]).collect_vec();
+                        hasher.update_leaf(&values);
+                    }
+                }
+                (position, hasher.finalize())
+            })
+            .collect();
+        self.commitment.decommit_from(queries, queried_values, |positions| {
+            positions.iter().map(|position| leaves[position]).collect()
+        })
+    }
+}
+
+/// Whether a column of `domain` keeps only stripe 0 of its extension in a striped
+/// tree. Small columns keep it whole: some CPU paths read their whole extension.
+fn keeps_prefix(domain: CircleDomain, log_blowup_factor: u32) -> bool {
+    domain.log_size() >= log_blowup_factor + 10
+}
+
+/// Whether [`CommitmentTreeProver::new_striped`] applies: a blowup of at least 4 (a prefix of
+/// half the extension saves nothing below it), a stripe of every column at least one packed
+/// word, and a column large enough to keep only a prefix.
+fn can_stripe<B: PolyOps>(
+    polynomials: &[CircleCoefficients<B>],
+    log_blowup_factor: u32,
+    lifting_log_size: u32,
+) -> bool {
+    log_blowup_factor >= 2
+        && lifting_log_size >= log_blowup_factor + 10
+        && !polynomials.is_empty()
+        && polynomials.iter().all(|poly| {
+            poly.log_size() >= 4 && poly.log_size() + log_blowup_factor <= lifting_log_size
+        })
+        && polynomials.iter().any(|poly| {
+            keeps_prefix(
+                CanonicCoset::new(poly.log_size() + log_blowup_factor).circle_domain(),
+                log_blowup_factor,
+            )
+        })
 }
 
 fn print_column_size_histogram<B: BackendForChannel<MC>, MC: MerkleChannel>(

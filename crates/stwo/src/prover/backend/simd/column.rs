@@ -40,6 +40,19 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut core::ffi::c_void;
     fn munmap(addr: *mut core::ffi::c_void, length: usize) -> core::ffi::c_int;
+    /// glibc: hands the free pages of every malloc arena back to the kernel; thread-safe.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    safe fn malloc_trim(pad: usize) -> core::ffi::c_int;
+}
+
+/// Hands the memory that the system allocator holds free back to the kernel. Blocks below the
+/// large-block cache's 1 MiB live in glibc's per-thread arenas, where a phase's freed temporaries
+/// stay resident as holes under every later phase: about 0.4 GB after a Cairo proof. One call at
+/// the end of a leg, not per free, so the next leg pays a few page faults, not system calls on
+/// every allocation. A no-op off glibc.
+pub fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    malloc_trim(0);
 }
 
 /// Advises the kernel about a large buffer: `MADV_HUGEPAGE` on the whole pages it covers, so that
