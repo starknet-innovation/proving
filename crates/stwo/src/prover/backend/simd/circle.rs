@@ -717,16 +717,71 @@ impl PolyOps for SimdBackend {
         advise_pages(&buffer.data, true);
 
         // FFT from the coefficients buffer directly into the provided buffer.
-        unsafe {
-            rfft::fft_subdomains(
-                transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
-                transmute::<*mut PackedBaseField, *mut u32>(buffer.data.as_mut_ptr()),
-                &subdomain_twiddles,
-                fft_log_size as usize,
-            );
-        }
+        fft_subdomains_into(poly, &mut buffer, &subdomain_twiddles);
 
         CircleEvaluation::new(domain, buffer)
+    }
+
+    const STRIPES: bool = true;
+
+    fn evaluate_stripe_into(
+        poly: &CircleCoefficients<Self>,
+        domain: CircleDomain,
+        twiddles: &TwiddleTree<Self>,
+        stripe: usize,
+        dst: &mut Col<Self, BaseField>,
+    ) {
+        let fft_log_size = poly.log_size();
+        let len = 1usize << fft_log_size;
+        assert!(domain.log_size() >= fft_log_size);
+        assert_eq!(dst.len(), len);
+        if fft_log_size < MIN_FFT_LOG_SIZE {
+            // Small polynomials go through the CPU path of `evaluate`, as a whole.
+            let full = Self::evaluate(poly, domain, twiddles);
+            Self::copy_block(&full.values, stripe * len, dst, 0, len);
+            return;
+        }
+        // The same twiddle slice as subdomain `stripe` of `evaluate_into`.
+        let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
+        let stripe_twiddles = vec![
+            (0..(fft_log_size - 1))
+                .map(|layer_i| {
+                    &line_twiddles[layer_i as usize][stripe << (fft_log_size - 2 - layer_i)
+                        ..(stripe + 1) << (fft_log_size - 2 - layer_i)]
+                })
+                .collect::<Vec<_>>(),
+        ];
+        fft_subdomains_into(poly, dst, &stripe_twiddles);
+    }
+
+    fn copy_block(
+        src: &Col<Self, BaseField>,
+        src_start: usize,
+        dst: &mut Col<Self, BaseField>,
+        dst_start: usize,
+        len: usize,
+    ) {
+        if src_start % N_LANES == 0 && dst_start % N_LANES == 0 && len % N_LANES == 0 {
+            dst.data[dst_start / N_LANES..(dst_start + len) / N_LANES]
+                .copy_from_slice(&src.data[src_start / N_LANES..(src_start + len) / N_LANES]);
+        } else {
+            for i in 0..len {
+                dst.set(dst_start + i, src.at(src_start + i));
+            }
+        }
+    }
+
+    fn subdomain_twiddles(coset: Coset) -> std::sync::Arc<TwiddleTree<Self>> {
+        type Cache = std::collections::HashMap<(usize, u32), std::sync::Arc<TwiddleTree<SimdBackend>>>;
+        static CACHE: std::sync::LazyLock<std::sync::Mutex<Cache>> =
+            std::sync::LazyLock::new(Default::default);
+        let key = (coset.initial_index.0, coset.log_size);
+        if let Some(twiddles) = CACHE.lock().unwrap().get(&key) {
+            return twiddles.clone();
+        }
+        let twiddles = std::sync::Arc::new(Self::precompute_twiddles(coset));
+        CACHE.lock().unwrap().insert(key, twiddles.clone());
+        twiddles
     }
 
     /// Precomputes the (doubled) twiddles for a given coset tower.
@@ -820,6 +875,24 @@ impl PolyOps for SimdBackend {
             CircleCoefficients::new(BaseColumn { data: poly.coeffs.data, length: left_length }),
             CircleCoefficients::new(BaseColumn { data: second, length: right_length }),
         )
+    }
+}
+
+/// Evaluates `poly` on `subdomain_twiddles.len()` subdomains of its size, the `i`-th written to
+/// the `i`-th block of `dst`, which must hold all of them.
+fn fft_subdomains_into(
+    poly: &CircleCoefficients<SimdBackend>,
+    dst: &mut BaseColumn,
+    subdomain_twiddles: &[Vec<&[u32]>],
+) {
+    assert!(dst.len() >= subdomain_twiddles.len() << poly.log_size());
+    unsafe {
+        rfft::fft_subdomains(
+            transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
+            transmute::<*mut PackedBaseField, *mut u32>(dst.data.as_mut_ptr()),
+            subdomain_twiddles,
+            poly.log_size() as usize,
+        );
     }
 }
 

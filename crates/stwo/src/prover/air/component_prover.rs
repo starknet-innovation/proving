@@ -9,7 +9,7 @@ use crate::core::pcs::TreeVec;
 use crate::core::poly::circle::CircleDomain;
 use crate::prover::CirclePoint;
 use crate::prover::air::accumulation::{DomainEvaluationAccumulator, EvaluationMode};
-use crate::prover::backend::Backend;
+use crate::prover::backend::{Backend, Column};
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, SecureCirclePoly};
 use crate::prover::poly::twiddles::TwiddleTree;
@@ -57,6 +57,10 @@ impl<B: Backend> Poly<B> {
     ) -> SecureField {
         if let Some(coeffs) = &self.coeffs {
             coeffs.eval_at_point(point)
+        } else if weights_hash_map.is_none() && self.evals.values.len() < self.evals.domain.size() {
+            // A striped column holds only stripe 0, which determines the polynomial: interpolate
+            // it for the sample.
+            self.regrown_coefficients().eval_at_point(point)
         } else {
             self.evals.barycentric_eval_at_point(
                 &weights_hash_map
@@ -67,6 +71,16 @@ impl<B: Backend> Poly<B> {
         }
     }
 
+    /// The coefficients of a striped column that holds only stripe 0 (its evaluation on the
+    /// first subdomain of the coefficients' size), interpolated from it.
+    pub fn regrown_coefficients(&self) -> CircleCoefficients<B> {
+        let log_blowup_factor = self.evals.domain.log_size() - self.evals.values.len().ilog2();
+        let subdomain = self.evals.domain.split(log_blowup_factor).0;
+        let sub_twiddles = B::subdomain_twiddles(subdomain.half_coset);
+        CircleEvaluation::<B, BaseField, BitReversedOrder>::new(subdomain, self.evals.values.clone())
+            .interpolate_with_twiddles(&sub_twiddles)
+    }
+
     pub fn get_evaluation_on_domain(
         &self,
         domain: CircleDomain,
@@ -74,6 +88,10 @@ impl<B: Backend> Poly<B> {
     ) -> CircleEvaluation<B, BaseField, BitReversedOrder> {
         if let Some(coeffs) = &self.coeffs {
             coeffs.evaluate_with_twiddles(domain, twiddles)
+        } else if self.evals.values.len() < self.evals.domain.size() {
+            // A striped column holds only stripe 0, its evaluation on the first subdomain of the
+            // coefficients' size, which determines the polynomial.
+            self.regrown_coefficients().evaluate_with_twiddles(domain, twiddles)
         } else {
             panic!("The polynomial's coefficients are not stored");
         }
@@ -102,7 +120,19 @@ impl<B: Backend> ComponentProvers<'_, B> {
         let total_constraints: usize = self.components.iter().map(|c| c.n_constraints()).sum();
         let components: Vec<&dyn Component> =
             self.components.iter().map(|c| *c as &dyn Component).collect();
-        let evaluation_mode = EvaluationMode::infer(&components, log_blowup_factor);
+        // A striped commitment keeps only stripe 0 of a column: extend each component's columns
+        // on demand instead of borrowing the committed 2^(n+1) prefix, one size group at a time
+        // so that only one component's extension is resident.
+        let extend = trace
+            .polys
+            .iter()
+            .flatten()
+            .any(|poly| poly.evals.values.len() < poly.evals.domain.size());
+        let evaluation_mode = if extend {
+            EvaluationMode::ExtendToEvalDomain
+        } else {
+            EvaluationMode::infer(&components, log_blowup_factor)
+        };
         let max_log_size = self.components().composition_log_degree_bound();
 
         // Each component accumulates into the column of its evaluation domain's size, with the
@@ -151,7 +181,9 @@ impl<B: Backend> ComponentProvers<'_, B> {
         #[cfg(not(feature = "parallel"))]
         let group_results: Vec<_> = groups.iter().map(run_group).collect();
         #[cfg(feature = "parallel")]
-        let group_results: Vec<_> = {
+        let group_results: Vec<_> = if extend {
+            groups.iter().map(run_group).collect()
+        } else {
             use rayon::prelude::*;
             groups.par_iter().map(run_group).collect()
         };

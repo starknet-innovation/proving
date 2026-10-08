@@ -229,7 +229,7 @@ where
         cairo_claim_generator.write_trace(prover_params.opt_n_id_to_big_components);
     span.exit();
 
-    prove_cairo_common::<MC>(
+    let proof = prove_cairo_common::<MC>(
         twiddles,
         base_column_pool,
         preprocessed_trace,
@@ -239,7 +239,10 @@ where
         interaction_generator,
         prover_params,
         pcs_config,
-    )
+    );
+    // The proof's temporaries are freed: return the small ones to the kernel before the next leg.
+    stwo::prover::backend::simd::column::trim_heap();
+    proof
 }
 
 fn prove_cairo_common<'a, MC: MerkleChannel>(

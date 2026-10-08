@@ -31,6 +31,10 @@ pub struct SimdDomainEvaluator<'a> {
     pub constraint_index: usize,
     pub domain_log_size: u32,
     pub eval_domain_log_size: u32,
+    /// `Some((first, sign))`: the trace columns hold a window of one half coset of the
+    /// evaluation domain in its natural order, where a mask offset `off` is `sign * off` rows
+    /// away, and `vec_row` counts the evaluated rows from the window's vector `first`.
+    pub window: Option<(usize, isize)>,
     pub logup: LogupAtRow<Self>,
 }
 impl<'a> SimdDomainEvaluator<'a> {
@@ -55,6 +59,7 @@ impl<'a> SimdDomainEvaluator<'a> {
             constraint_index: 0,
             domain_log_size,
             eval_domain_log_size: eval_log_size,
+            window: None,
             logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size),
         }
     }
@@ -99,19 +104,27 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
                     let col =
                         &self.trace_eval.get_unchecked(interaction).get_unchecked(col_index).values;
                     let very_packed_col = VeryPackedBaseColumn::transform_under_ref(col);
-                    return *very_packed_col.data.get_unchecked(self.vec_row);
+                    let vec_row = self.vec_row + self.window.map_or(0, |(first, _)| first);
+                    return *very_packed_col.data.get_unchecked(vec_row);
                 };
             }
             // Otherwise, we need to look up the value at the offset.
             // Since the domain is bit-reversed circle domain ordered, we need to look up the value
             // at the bit-reversed natural order index at an offset.
             VeryPackedBaseField::from_array(std::array::from_fn(|i| {
-                let row_index = offset_bit_reversed_circle_domain_index(
-                    (self.vec_row << (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS)) + i,
-                    self.domain_log_size,
-                    self.eval_domain_log_size,
-                    off,
-                );
+                let row_index = match self.window {
+                    Some((first, sign)) => {
+                        let row = ((self.vec_row + first) << (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS))
+                            + i;
+                        (row as isize + sign * off) as usize
+                    }
+                    None => offset_bit_reversed_circle_domain_index(
+                        (self.vec_row << (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS)) + i,
+                        self.domain_log_size,
+                        self.eval_domain_log_size,
+                        off,
+                    ),
+                };
                 self.trace_eval[interaction][col_index].at(row_index)
             }))
         })

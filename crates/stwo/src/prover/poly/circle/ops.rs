@@ -145,6 +145,37 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         twiddles: &TwiddleTree<Self>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder>;
 
+    /// Whether [`Self::evaluate_stripe_into`] and [`Self::copy_block`] are implemented, so that
+    /// a commitment tree can be extended and hashed one subdomain stripe at a time.
+    const STRIPES: bool = false;
+
+    /// Writes the `stripe`-th contiguous block of [`Self::evaluate`]'s output on `domain`, of
+    /// the size of `poly`, into `dst`: the evaluation on the `stripe`-th subdomain, which the
+    /// extension computes as an independent FFT.
+    fn evaluate_stripe_into(
+        _poly: &CircleCoefficients<Self>,
+        _domain: CircleDomain,
+        _twiddles: &TwiddleTree<Self>,
+        _stripe: usize,
+        _dst: &mut Col<Self, BaseField>,
+    ) {
+        unimplemented!("striped extension is not supported by this backend")
+    }
+
+    /// Copies `src[src_start..src_start + len]` into `dst[dst_start..dst_start + len]`.
+    fn copy_block(
+        src: &Col<Self, BaseField>,
+        src_start: usize,
+        dst: &mut Col<Self, BaseField>,
+        dst_start: usize,
+        len: usize,
+    ) {
+        use crate::prover::backend::Column;
+        for i in 0..len {
+            dst.set(dst_start + i, src.at(src_start + i));
+        }
+    }
+
     /// Evaluates the polynomial at all points in the domain, writing results into the provided
     /// buffer instead of allocating a new one. The buffer must have size `domain.size()`.
     fn evaluate_into(
@@ -194,6 +225,12 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
 
     /// Precomputes twiddles for a given coset.
     fn precompute_twiddles(coset: Coset) -> TwiddleTree<Self>;
+
+    /// The twiddles of `coset`, which a backend may keep and share between calls (striped trees
+    /// regrow many columns on the same few subdomains).
+    fn subdomain_twiddles(coset: Coset) -> std::sync::Arc<TwiddleTree<Self>> {
+        std::sync::Arc::new(Self::precompute_twiddles(coset))
+    }
 
     /// Given a polynomial `p`, it outputs two polynomials `p_left`, `p_right` of half the degree,
     /// which satisfy the identity
