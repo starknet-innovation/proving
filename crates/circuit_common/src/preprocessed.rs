@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use circuits::circuit::{
-    Add, BlakeGGate, Circuit, Eq, Gate, M31ToU32, Mul, Permutation, PointwiseMul, Sub, TripleXor,
+    Add, BlakeGGate, Circuit, Eq, M31ToU32, Mul, Permutation, PointwiseMul, Sub, TripleXor,
 };
 use circuits::context::FinalizedContext;
 use circuits::ivalue::IValue;
@@ -235,19 +235,22 @@ enum OpCode {
 }
 
 /// Adds the binary operation gates to the qm31 ops preprocessed trace.
-fn fill_binary_op_columns<G: Gate>(
-    gates: &[G],
+///
+/// `gates` yields each gate's `(in0, in1, out)` read straight from its fields: `Gate::uses` and
+/// `Gate::yields` would allocate two `Vec`s per gate. All gates in one call share the opcode,
+/// so its flag columns are extended once per call.
+fn fill_binary_op_columns(
+    gates: impl ExactSizeIterator<Item = (usize, usize, usize)>,
     op_code: OpCode,
     multiplicities: &[usize],
     columns: &mut [Vec<usize>; N_QM31_OPS_PP_COLUMNS],
 ) {
     let op_code_idx = op_code as usize;
-    for gate in gates.iter() {
-        let [in0, in1] = gate.uses()[..] else { panic!("Expected 2 uses for gate") };
-        let [out] = gate.yields()[..] else { panic!("Expected 1 yield for gate") };
-        (0..N_OP_CODES).for_each(|i| {
-            columns[i].push(if i == op_code_idx { 1 } else { 0 });
-        });
+    let n_gates = gates.len();
+    (0..N_OP_CODES).for_each(|i| {
+        columns[i].extend(std::iter::repeat_n((i == op_code_idx) as usize, n_gates));
+    });
+    for (in0, in1, out) in gates {
         columns[4].push(in0);
         columns[5].push(in1);
         columns[6].push(out);
@@ -275,8 +278,9 @@ fn fill_permutation_columns(
     let add_op_code_idx = OpCode::Add as usize;
     let mut permutation_address = first_unused_address;
     for gate in gates.iter() {
-        let inputs = gate.uses();
-        let outputs = gate.yields();
+        // The gate's own fields, not `Gate::uses`/`Gate::yields`, which would copy them.
+        let inputs = &gate.inputs;
+        let outputs = &gate.outputs;
 
         // Set flag to Add opcode.
         (0..N_OP_CODES).for_each(|i| {
@@ -286,8 +290,7 @@ fn fill_permutation_columns(
             ));
         });
 
-        // TODO(alonf): Parallelize, and insert the above loop inside.
-        for (input, output) in zip_eq(inputs, outputs) {
+        for (&input, &output) in zip_eq(inputs, outputs) {
             // Input row.
             columns[4].push(0);
             columns[5].push(input);
@@ -326,12 +329,34 @@ fn qm31_ops_preprocessed_columns(
     multiplicities: &[usize],
 ) -> (Qm31OpsColumns, Qm31OpsTraceGenerator) {
     let Qm31OpsGates { add, sub, mul, pointwise_mul, permutation } = gates;
-    let mut qm31_ops_columns: [_; N_QM31_OPS_PP_COLUMNS] = std::array::from_fn(|_| vec![]);
-    fill_binary_op_columns(add, OpCode::Add, multiplicities, &mut qm31_ops_columns);
-    fill_binary_op_columns(sub, OpCode::Sub, multiplicities, &mut qm31_ops_columns);
-    fill_binary_op_columns(mul, OpCode::Mul, multiplicities, &mut qm31_ops_columns);
+    // One row per binary gate, then two per permutation wire; reserve each column once.
+    let n_rows = add.len()
+        + sub.len()
+        + mul.len()
+        + pointwise_mul.len()
+        + permutation.iter().map(|gate| gate.inputs.len() + gate.outputs.len()).sum::<usize>();
+    let mut qm31_ops_columns: [_; N_QM31_OPS_PP_COLUMNS] =
+        std::array::from_fn(|_| Vec::with_capacity(n_rows));
     fill_binary_op_columns(
-        pointwise_mul,
+        add.iter().map(|gate| (gate.in0, gate.in1, gate.out)),
+        OpCode::Add,
+        multiplicities,
+        &mut qm31_ops_columns,
+    );
+    fill_binary_op_columns(
+        sub.iter().map(|gate| (gate.in0, gate.in1, gate.out)),
+        OpCode::Sub,
+        multiplicities,
+        &mut qm31_ops_columns,
+    );
+    fill_binary_op_columns(
+        mul.iter().map(|gate| (gate.in0, gate.in1, gate.out)),
+        OpCode::Mul,
+        multiplicities,
+        &mut qm31_ops_columns,
+    );
+    fill_binary_op_columns(
+        pointwise_mul.iter().map(|gate| (gate.in0, gate.in1, gate.out)),
         OpCode::PointwiseMul,
         multiplicities,
         &mut qm31_ops_columns,
@@ -498,7 +523,9 @@ impl CompactColumn {
     /// The value at `row`, without any allocation.
     fn at(&self, row: usize) -> usize {
         match self {
-            Self::Narrow(values) => usize::try_from(values[row]).expect("value originally fit usize"),
+            Self::Narrow(values) => {
+                usize::try_from(values[row]).expect("value originally fit usize")
+            }
             Self::Wide(values) => values[row],
             Self::Bits { words, .. } => ((words[row / 64] >> (row % 64)) & 1) as usize,
             Self::Fixed { log_size, kind } => kind.at(*log_size, row),
@@ -508,7 +535,10 @@ impl CompactColumn {
     /// Materializes the column's exact values.
     fn to_vec(&self) -> Vec<usize> {
         match self {
-            Self::Narrow(values) => values.iter().map(|&value| usize::try_from(value).expect("value originally fit usize")).collect(),
+            Self::Narrow(values) => values
+                .iter()
+                .map(|&value| usize::try_from(value).expect("value originally fit usize"))
+                .collect(),
             Self::Wide(values) => values.clone(),
             _ => (0..self.len()).map(|row| self.at(row)).collect(),
         }
@@ -519,9 +549,9 @@ impl CompactColumn {
     #[cfg(feature = "prover")]
     fn to_field_column<B: Backend>(&self) -> Col<B, BaseField> {
         match self {
-            Self::Narrow(values) => Col::<B, BaseField>::from_iter(
-                values.iter().map(|&value| BaseField::from(usize::try_from(value).expect("value originally fit usize"))),
-            ),
+            Self::Narrow(values) => Col::<B, BaseField>::from_iter(values.iter().map(|&value| {
+                BaseField::from(usize::try_from(value).expect("value originally fit usize"))
+            })),
             Self::Wide(values) => {
                 Col::<B, BaseField>::from_iter(values.iter().cloned().map(BaseField::from))
             }
@@ -749,20 +779,23 @@ impl PreprocessedCircuit {
             || {
                 rayon::join(
                     || {
-                                let mut trace = PreProcessedTrace::default();
-                                triple_xor_preprocessed_columns(triple_xor, multiplicities).push_to(&mut trace);
-                                trace
-                            },
+                        let mut trace = PreProcessedTrace::default();
+                        triple_xor_preprocessed_columns(triple_xor, multiplicities)
+                            .push_to(&mut trace);
+                        trace
+                    },
                     || {
                         rayon::join(
                             || {
                                 let mut trace = PreProcessedTrace::default();
-                                m31_to_u32_preprocessed_columns(m31_to_u32, multiplicities).push_to(&mut trace);
+                                m31_to_u32_preprocessed_columns(m31_to_u32, multiplicities)
+                                    .push_to(&mut trace);
                                 trace
                             },
                             || {
                                 let mut trace = PreProcessedTrace::default();
-                                blake_g_gate_preprocessed_columns(blake_g_gate, multiplicities).push_to(&mut trace);
+                                blake_g_gate_preprocessed_columns(blake_g_gate, multiplicities)
+                                    .push_to(&mut trace);
                                 trace
                             },
                         )
@@ -773,8 +806,13 @@ impl PreprocessedCircuit {
         // Compact within each joined task, then merge by the original component order.
         // A completed component no longer retains its full-width staging columns while
         // another component is still being built.
-        for component in [eq_columns, qm31_ops_columns, triple_xor_columns,
-            m31_to_u32_columns, blake_g_gate_columns] {
+        for component in [
+            eq_columns,
+            qm31_ops_columns,
+            triple_xor_columns,
+            m31_to_u32_columns,
+            blake_g_gate_columns,
+        ] {
             for (id, column) in component.columns {
                 pp_trace.push_compact_column(id, column);
             }
