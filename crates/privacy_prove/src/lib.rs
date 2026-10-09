@@ -86,13 +86,42 @@ pub struct RecursiveProverPrecomputes {
     /// Built on first use, which is after the Cairo proof: its committed evaluations are not
     /// resident while that proof runs, its columns reuse that proof's idle buffers, and the
     /// circuit proof needs them only when it starts.
-    pub circuit_preprocessed_tree: std::mem::ManuallyDrop<LazyCommitmentTree>,
-    pub preprocessed_circuit: std::mem::ManuallyDrop<PreprocessedCircuit>,
+    pub circuit_preprocessed_tree: std::mem::ManuallyDrop<Arc<LazyCommitmentTree>>,
+    /// Built on first use, which is after the Cairo proof: its preprocessed columns are only
+    /// read by the circuit proof, so they are not resident while the Cairo proof runs, which
+    /// sets the whole process's peak.
+    pub preprocessed_circuit: std::mem::ManuallyDrop<Arc<LazyPreprocessedCircuit>>,
     pub circuit_config: CircuitConfig,
     pub proof_config: ProofConfig,
 }
 
 type PrecomputedTree = CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>;
+
+/// The circuit's preprocessed columns, built the first time they are dereferenced.
+pub struct LazyPreprocessedCircuit {
+    circuit: std::sync::OnceLock<PreprocessedCircuit>,
+    build: std::sync::Mutex<Option<Box<dyn FnOnce() -> PreprocessedCircuit + Send>>>,
+}
+
+impl LazyPreprocessedCircuit {
+    pub fn new(build: impl FnOnce() -> PreprocessedCircuit + Send + 'static) -> Self {
+        Self {
+            circuit: std::sync::OnceLock::new(),
+            build: std::sync::Mutex::new(Some(Box::new(build))),
+        }
+    }
+}
+
+impl std::ops::Deref for LazyPreprocessedCircuit {
+    type Target = PreprocessedCircuit;
+
+    fn deref(&self) -> &PreprocessedCircuit {
+        self.circuit.get_or_init(|| {
+            let build = self.build.lock().unwrap().take().expect("the circuit is built once");
+            build()
+        })
+    }
+}
 
 /// A committed preprocessed tree that is built the first time it is dereferenced.
 pub struct LazyCommitmentTree {
@@ -195,58 +224,63 @@ pub fn prepare_recursive_prover_precomputes()
 
     let max_domain_size = max(cairo_lifting_log_size, circuit_lifting_log_size);
 
-    // The circuit-side preprocessing is sequential and independent of the Cairo-side twiddles,
-    // preprocessed trace and tree, so the two run concurrently.
-    let (preprocessed_circuit, (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)) =
-        rayon::join(
-            || get_cairo_preprocessed_circuit(&cairo_verifier_config),
+    let (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree) = {
+        // The twiddles and the Cairo preprocessed trace are independent.
+        let (twiddles, (cairo_preprocessed_trace, cairo_preprocessed_evals)) = rayon::join(
             || {
-                // The twiddles and the Cairo preprocessed trace are independent as well.
-                let (twiddles, (cairo_preprocessed_trace, cairo_preprocessed_evals)) = rayon::join(
-                    || {
-                        info!("Prepare the twiddles");
-                        SimdBackend::precompute_twiddles(
-                            CanonicCoset::new(max_domain_size).circle_domain().half_coset,
-                        )
-                    },
-                    || {
-                        info!("Prepare the cairo prover preprocessed trace");
-                        let cairo_preprocessed_trace = Arc::new(
-                            CAIRO_PROVER_PARAMS.preprocessed_trace.to_preprocessed_trace(),
-                        );
-                        // Warm the Pedersen points table before gen_trace reads it.
-                        warm_pedersen_pp_trace(CAIRO_PROVER_PARAMS.preprocessed_trace);
-                        let evals = gen_trace(cairo_preprocessed_trace.clone());
-                        (cairo_preprocessed_trace, evals)
-                    },
-                );
-                info!("Prepare the cairo prover preprocessed tree");
-                let cairo_preprocessed_trace_polys =
-                    SimdBackend::interpolate_columns(cairo_preprocessed_evals, &twiddles);
-                let cairo_preprocessed_tree =
-                    CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
-                        cairo_preprocessed_trace_polys,
-                        CAIRO_PCS_CONFIG.fri_config.log_blowup_factor,
-                        &twiddles,
-                        CAIRO_PROVER_PARAMS.store_polynomials_coefficients,
-                        cairo_lifting_log_size,
-                        &base_column_pool,
-                    );
-                (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)
+                info!("Prepare the twiddles");
+                SimdBackend::precompute_twiddles(
+                    CanonicCoset::new(max_domain_size).circle_domain().half_coset,
+                )
+            },
+            || {
+                info!("Prepare the cairo prover preprocessed trace");
+                let cairo_preprocessed_trace =
+                    Arc::new(CAIRO_PROVER_PARAMS.preprocessed_trace.to_preprocessed_trace());
+                // Warm the Pedersen points table before gen_trace reads it.
+                warm_pedersen_pp_trace(CAIRO_PROVER_PARAMS.preprocessed_trace);
+                let evals = gen_trace(cairo_preprocessed_trace.clone());
+                (cairo_preprocessed_trace, evals)
             },
         );
+        info!("Prepare the cairo prover preprocessed tree");
+        let cairo_preprocessed_trace_polys =
+            SimdBackend::interpolate_columns(cairo_preprocessed_evals, &twiddles);
+        let cairo_preprocessed_tree =
+            CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
+                cairo_preprocessed_trace_polys,
+                CAIRO_PCS_CONFIG.fri_config.log_blowup_factor,
+                &twiddles,
+                CAIRO_PROVER_PARAMS.store_polynomials_coefficients,
+                cairo_lifting_log_size,
+                &base_column_pool,
+            );
+        (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)
+    };
 
-    info!("Prepare the circuit prover preprocessed trace and tree (built on first use)");
+    info!("Prepare the circuit prover preprocessed circuit and tree (built on first use)");
     let base_column_pool = Arc::new(base_column_pool);
     let twiddles = Arc::new(twiddles);
+    // The circuit's preprocessed columns (about 0.45 GiB) are only read by the circuit proof,
+    // which starts after the Cairo proof has set the process's peak, so they are built when
+    // first dereferenced rather than kept resident from setup.
+    let preprocessed_circuit = {
+        let cairo_verifier_config =
+            get_cairo_verifier_config().expect("the verifier config loaded once already");
+        Arc::new(LazyPreprocessedCircuit::new(move || {
+            let _span = span!(Level::INFO, "prepare_circuit_preprocessed_circuit").entered();
+            get_cairo_preprocessed_circuit(&cairo_verifier_config)
+        }))
+    };
     let circuit_preprocessed_tree = {
-        let preprocessed_trace = preprocessed_circuit.preprocessed_trace.clone();
+        let preprocessed_circuit = preprocessed_circuit.clone();
         let twiddles = twiddles.clone();
         let base_column_pool = base_column_pool.clone();
         let preprocessed_lifting_log_size = circuit_config.config.preprocessed_lifting_log_size;
-        LazyCommitmentTree::new(move || {
+        Arc::new(LazyCommitmentTree::new(move || {
             let _span = span!(Level::INFO, "prepare_circuit_preprocessed_tree").entered();
-            let circuit_preprocessed_trace = preprocessed_trace.get_trace::<SimdBackend>();
+            let circuit_preprocessed_trace =
+                preprocessed_circuit.preprocessed_trace.get_trace::<SimdBackend>();
             let circuit_preprocessed_trace_polys =
                 SimdBackend::interpolate_columns(circuit_preprocessed_trace, &twiddles);
             CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
@@ -257,8 +291,19 @@ pub fn prepare_recursive_prover_precomputes()
                 preprocessed_lifting_log_size,
                 &base_column_pool,
             )
-        })
+        }))
     };
+    // Between the two proofs the harness fills the Cairo verifier circuit serially; the lazy
+    // circuit columns and tree are built alongside that fill rather than after it. Forcing them
+    // early changes when they are built, never what they hold.
+    {
+        let preprocessed_circuit = preprocessed_circuit.clone();
+        let circuit_preprocessed_tree = circuit_preprocessed_tree.clone();
+        circuit_common::deferred::defer(move || {
+            let _columns: &PreprocessedCircuit = &preprocessed_circuit;
+            let _tree: &PrecomputedTree = &circuit_preprocessed_tree;
+        });
+    }
 
     Ok(Arc::new(RecursiveProverPrecomputes {
         base_column_pool: std::mem::ManuallyDrop::new(base_column_pool),

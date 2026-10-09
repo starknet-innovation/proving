@@ -146,27 +146,32 @@ pub fn build_and_fill_cairo_verifier_circuit(
 ) -> FinalizedContext<QM31> {
     let config = &verifier_config.proof_config;
 
-    let mut context = Context::new(N_RESERVED);
-    let statement = CairoStatement::<QM31>::new(
-        &mut context,
-        serialized_aux_data,
-        HashValue::<QM31>::from(output_hash),
-        verifier_config.program.clone(),
-        verifier_config.enabled_bits.clone(),
-        verifier_config.preprocessed_root.clone(),
-        verifier_config.preprocessed_trace_variant,
-    );
+    // The fill is serial; deferred setup (the circuit proof's lazily built preprocessed columns
+    // and tree) runs alongside it instead of after it.
+    circuit_common::deferred::run_with_deferred(move || {
+        let mut context = Context::new(N_RESERVED);
+        let statement = CairoStatement::<QM31>::new(
+            &mut context,
+            serialized_aux_data,
+            HashValue::<QM31>::from(output_hash),
+            verifier_config.program.clone(),
+            verifier_config.enabled_bits.clone(),
+            verifier_config.preprocessed_root.clone(),
+            verifier_config.preprocessed_trace_variant,
+        );
 
-    let proof_vars = proof.guess(&mut context);
-    verify(&mut context, &proof_vars, config, &statement);
+        let proof_vars = proof.guess(&mut context);
+        verify(&mut context, &proof_vars, config, &statement);
 
-    let mut finalized_context = context.finalize(false);
+        let mut finalized_context = context.finalize(false);
 
-    if let Some(zk_blinding_size) = verifier_config.zk_blinding_amount {
-        let zk_blinding_seed = bytes_from_le_u32s(proof.trace_root.0.map(|w| w.get().unpack_u32()));
-        add_zk_blinding(&mut finalized_context, zk_blinding_seed, zk_blinding_size);
-    }
-    finalized_context
+        if let Some(zk_blinding_size) = verifier_config.zk_blinding_amount {
+            let zk_blinding_seed =
+                bytes_from_le_u32s(proof.trace_root.0.map(|w| w.get().unpack_u32()));
+            add_zk_blinding(&mut finalized_context, zk_blinding_seed, zk_blinding_size);
+        }
+        finalized_context
+    })
 }
 
 /// Builds the Cairo verifier circuit topology without needing a proof.
