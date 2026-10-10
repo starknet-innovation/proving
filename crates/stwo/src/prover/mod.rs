@@ -44,6 +44,7 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX].polynomials.len();
     let component_provers =
         ComponentProvers { components: components.to_vec(), n_preprocessed_columns };
+    commitment_scheme.striped_to_coefficients();
     let trace = commitment_scheme.trace();
 
     // Evaluate and commit on composition polynomial.
@@ -106,6 +107,8 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
 
     // Prove the trace and composition OODS values, and retrieve them.
     let commitment_scheme_proof = commitment_scheme.prove_values(sample_points, channel);
+    // This leg's striped caches are dead once it has decommitted.
+    crate::prover::backend::simd::circle::clear_stripe_caches();
     let proof = StarkProof(commitment_scheme_proof.proof);
     info!(proof_size_estimate = proof.size_estimate());
 

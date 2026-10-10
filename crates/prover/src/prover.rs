@@ -224,11 +224,32 @@ where
     // Run Cairo.
     let cairo_claim_generator = create_cairo_claim_generator(input, preprocessed_trace.clone());
     // Base trace.
-    let span = span!(Level::INFO, "Write Base trace").entered();
-    let (trace_evals, claim, interaction_generator) =
-        cairo_claim_generator.write_trace(prover_params.opt_n_id_to_big_components);
-    span.exit();
-
+    let write_trace = || {
+        let _span = span!(Level::INFO, "Write Base trace").entered();
+        cairo_claim_generator.write_trace(prover_params.opt_n_id_to_big_components)
+    };
+    // An empty precomputed tree means the caller left the Cairo preprocessed tree to this leg: build
+    // it here, owned and beside the base trace, so it is freed with the leg instead of staying
+    // resident through the next one.
+    let ((trace_evals, claim, interaction_generator), preprocessed_tree) =
+        if preprocessed_tree.commitment.layers.is_empty() {
+            let (trace, tree) = rayon::join(write_trace, || {
+                let _span = span!(Level::INFO, "Compute preprocessed trace commitment").entered();
+                let polys =
+                    SimdBackend::interpolate_columns(gen_trace(preprocessed_trace.clone()), twiddles);
+                CommitmentTreeProver::<SimdBackend, MC>::new(
+                    polys,
+                    prover_params.fri_config.log_blowup_factor,
+                    twiddles,
+                    prover_params.store_polynomials_coefficients,
+                    lifting_log_size,
+                    base_column_pool,
+                )
+            });
+            (trace, MaybeOwned::Owned(tree))
+        } else {
+            (write_trace(), preprocessed_tree)
+        };
     let proof = prove_cairo_common::<MC>(
         twiddles,
         base_column_pool,

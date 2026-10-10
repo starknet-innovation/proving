@@ -165,6 +165,21 @@ pub struct InputToRow<const N: usize> {
 }
 
 impl<const N: usize> InputToRow<N> {
+    pub fn rows_packed(&self, input: &[PackedM31; N]) -> [u32; 16] {
+        if self.fields.is_empty() {
+            let lanes = input.map(|p| p.to_array());
+            std::array::from_fn(|l| {
+                self.row(&std::array::from_fn(|i| lanes[i][l])).try_into().unwrap()
+            })
+        } else {
+            let mut rows = std::simd::Simd::<u32, 16>::splat(0);
+            for &(i, shift) in &self.fields {
+                rows += input[i].into_simd() << shift;
+            }
+            rows.to_array()
+        }
+    }
+
     /// Builds the lookup for a table given as `n_rows` rows of `N` key values, `at(column, row)`.
     pub fn new(n_rows: usize, at: impl Fn(usize, usize) -> u64) -> Self {
         let log_size = n_rows.ilog2();

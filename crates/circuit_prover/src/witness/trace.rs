@@ -331,20 +331,26 @@ where
     // at its default.
     let mut all_polys = PerComponent::default();
     let mut claimed_sums = PerComponent::default();
+    let CircuitInteractionClaimGenerator {
+        eq_lookup_data,
+        qm31_ops_lookup_data,
+        triple_xor,
+        m_31_to_u_32,
+        blake_g_gate,
+        verify_bitwise_xor_8,
+        verify_bitwise_xor_12,
+        verify_bitwise_xor_4,
+        verify_bitwise_xor_7,
+        verify_bitwise_xor_9,
+        range_check_16,
+    } = circuit_interaction_claim_generator;
+    // The blake gate's interaction trace, the largest, is written before the others, so that its
+    // temporaries do not coexist with theirs.
+    let (trace, claim) =
+        blake_g_gate.write_interaction_trace(&interaction_elements.common_lookup_elements);
+    all_polys.blake_g_gate = SimdBackend::interpolate_columns(trace, twiddles);
+    claimed_sums.blake_g_gate = claim.claimed_sum;
     scope(|s| {
-        let CircuitInteractionClaimGenerator {
-            eq_lookup_data,
-            qm31_ops_lookup_data,
-            triple_xor,
-            m_31_to_u_32,
-            blake_g_gate,
-            verify_bitwise_xor_8,
-            verify_bitwise_xor_12,
-            verify_bitwise_xor_4,
-            verify_bitwise_xor_7,
-            verify_bitwise_xor_9,
-            range_check_16,
-        } = circuit_interaction_claim_generator;
 
         s.spawn(|_| {
             let (trace, claimed_sum) = eq::write_interaction_trace(
@@ -375,12 +381,6 @@ where
                 m_31_to_u_32.write_interaction_trace(&interaction_elements.common_lookup_elements);
             all_polys.m_31_to_u_32 = SimdBackend::interpolate_columns(trace, twiddles);
             claimed_sums.m_31_to_u_32 = claim.claimed_sum;
-        });
-        s.spawn(|_| {
-            let (trace, claim) =
-                blake_g_gate.write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.blake_g_gate = SimdBackend::interpolate_columns(trace, twiddles);
-            claimed_sums.blake_g_gate = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_8

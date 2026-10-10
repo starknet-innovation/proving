@@ -9,7 +9,7 @@ use crate::core::pcs::TreeVec;
 use crate::core::poly::circle::CircleDomain;
 use crate::prover::CirclePoint;
 use crate::prover::air::accumulation::{DomainEvaluationAccumulator, EvaluationMode};
-use crate::prover::backend::{Backend, Column};
+use crate::prover::backend::{Backend, Col, Column};
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, SecureCirclePoly};
 use crate::prover::poly::twiddles::TwiddleTree;
@@ -32,6 +32,9 @@ pub trait ComponentProver<B: Backend>: Component + Sync {
 pub struct Trace<'a, B: Backend> {
     /// Polynomials for each column.
     pub polys: TreeVec<ColumnVec<&'a Poly<B>>>,
+    /// The commitment scheme's twiddles, which cover every canonic domain up to the largest
+    /// committed one: composition extends with them instead of precomputing per component.
+    pub twiddles: Option<&'a TwiddleTree<B>>,
 }
 
 /// A struct for representing a polynomial corresponding to a trace column.
@@ -78,6 +81,17 @@ impl<B: Backend> Poly<B> {
         let subdomain = self.evals.domain.split(log_blowup_factor).0;
         let sub_twiddles = B::subdomain_twiddles(subdomain.half_coset);
         CircleEvaluation::<B, BaseField, BitReversedOrder>::new(subdomain, self.evals.values.clone())
+            .interpolate_with_twiddles(&sub_twiddles)
+    }
+
+    /// [`Self::regrown_coefficients`], interpolating stripe 0 in its own buffer, which the column
+    /// gives up.
+    pub fn take_regrown_coefficients(&mut self) -> CircleCoefficients<B> {
+        let log_blowup_factor = self.evals.domain.log_size() - self.evals.values.len().ilog2();
+        let subdomain = self.evals.domain.split(log_blowup_factor).0;
+        let sub_twiddles = B::subdomain_twiddles(subdomain.half_coset);
+        let values = std::mem::replace(&mut self.evals.values, Col::<B, BaseField>::zeros(0));
+        CircleEvaluation::<B, BaseField, BitReversedOrder>::new(subdomain, values)
             .interpolate_with_twiddles(&sub_twiddles)
     }
 

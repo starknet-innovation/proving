@@ -724,6 +724,16 @@ impl PolyOps for SimdBackend {
 
     const STRIPES: bool = true;
 
+    fn evaluate_from_prefix(
+        prefix: &Col<Self, BaseField>,
+        log_size: u32,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+        scratch: &mut Col<Self, BaseField>,
+    ) -> Option<Vec<Vec<BaseField>>> {
+        evaluate_from_prefix_simd(prefix, log_size, domain, targets, scratch)
+    }
+
     fn evaluate_stripe_into(
         poly: &CircleCoefficients<Self>,
         domain: CircleDomain,
@@ -754,6 +764,17 @@ impl PolyOps for SimdBackend {
         fft_subdomains_into(poly, dst, &stripe_twiddles);
     }
 
+    fn evaluate_block_into(
+        poly: &CircleCoefficients<Self>,
+        domain: CircleDomain,
+        twiddles: &TwiddleTree<Self>,
+        log_block: u32,
+        block: usize,
+        dst: &mut Col<Self, BaseField>,
+    ) {
+        evaluate_block_into(poly, domain, twiddles, log_block, block, dst)
+    }
+
     fn copy_block(
         src: &Col<Self, BaseField>,
         src_start: usize,
@@ -772,15 +793,12 @@ impl PolyOps for SimdBackend {
     }
 
     fn subdomain_twiddles(coset: Coset) -> std::sync::Arc<TwiddleTree<Self>> {
-        type Cache = std::collections::HashMap<(usize, u32), std::sync::Arc<TwiddleTree<SimdBackend>>>;
-        static CACHE: std::sync::LazyLock<std::sync::Mutex<Cache>> =
-            std::sync::LazyLock::new(Default::default);
         let key = (coset.initial_index.0, coset.log_size);
-        if let Some(twiddles) = CACHE.lock().unwrap().get(&key) {
+        if let Some(twiddles) = SUBDOMAIN_TWIDDLES.lock().unwrap().get(&key) {
             return twiddles.clone();
         }
         let twiddles = std::sync::Arc::new(Self::precompute_twiddles(coset));
-        CACHE.lock().unwrap().insert(key, twiddles.clone());
+        SUBDOMAIN_TWIDDLES.lock().unwrap().insert(key, twiddles.clone());
         twiddles
     }
 
@@ -896,6 +914,97 @@ fn fft_subdomains_into(
     }
 }
 
+/// Where `transpose_vecs` moves the vector of index `v` of an array of `2^log_n_vecs` vectors:
+/// `(a, b, c)` to `(c, b, a)`, with `|a| = |c| = log_n_vecs / 2`. The map is its own inverse.
+fn transposed_vec_index(v: usize, log_n_vecs: u32) -> usize {
+    let post = log_n_vecs / 2;
+    let n_b = log_n_vecs & 1;
+    let a = v >> (post + n_b);
+    let b = (v >> post) & ((1 << n_b) - 1);
+    let c = v & ((1 << post) - 1);
+    (c << (post + n_b)) | (b << post) | a
+}
+
+/// Writes the evaluation of `poly` on block `block` of `domain`'s bit-reversed order, of
+/// `2^log_block` rows, into `dst`: the evaluation on a subdomain of that size. A block smaller
+/// than the polynomial folds the coefficients first, one top layer of the FFT at a time
+/// (`lo + t * hi` or `lo - t * hi`, `t` the layer's one twiddle for the block), and evaluates the
+/// folded coefficients with an FFT of the block's size; a block of the polynomial's size is
+/// [`PolyOps::evaluate_stripe_into`].
+pub fn evaluate_block_into(
+    poly: &CircleCoefficients<SimdBackend>,
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<SimdBackend>,
+    log_block: u32,
+    block: usize,
+    dst: &mut BaseColumn,
+) {
+    let log_size = poly.log_size();
+    assert!(log_block <= log_size && log_block >= MIN_FFT_LOG_SIZE && log_block < domain.log_size());
+    assert_eq!(dst.len(), 1 << log_block);
+    if log_block == log_size {
+        return SimdBackend::evaluate_stripe_into(poly, domain, twiddles, block, dst);
+    }
+    let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
+    // Fold from the polynomial's size down to the block's.
+    let mut folded: Option<BaseColumn> = None;
+    for level in (log_block + 1..=log_size).rev() {
+        let stripe = block >> (level - log_block);
+        let sign = (block >> (level - 1 - log_block)) & 1;
+        let t = BaseField::from_u32_unchecked(line_twiddles[(level - 2) as usize][stripe] / 2);
+        let t = PackedBaseField::broadcast(if sign == 0 { t } else { -t });
+        let half_vecs = 1usize << (level - 1 - LOG_N_LANES);
+        match &mut folded {
+            None => {
+                // Large coefficients are stored transposed (see `split_at_mid`): read the vector of
+                // natural index `v` from where the transposition put it.
+                let src = &poly.coeffs.data;
+                let log_n_vecs = log_size - LOG_N_LANES;
+                let at = |v: usize| {
+                    if log_size <= CACHED_FFT_LOG_SIZE {
+                        return src[v];
+                    }
+                    src[transposed_vec_index(v, log_n_vecs)]
+                };
+                let mut out = BaseColumn::zeros(1 << (level - 1));
+                out.data
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(i, x)| *x = at(i) + at(i + half_vecs) * t);
+                folded = Some(out);
+            }
+            Some(buf) => {
+                let (lo, hi) = buf.data[..2 * half_vecs].split_at_mut(half_vecs);
+                lo.par_iter_mut().zip(hi.par_iter()).for_each(|(l, h)| *l = *l + *h * t);
+                buf.data.truncate(half_vecs);
+                buf.length = 1 << (level - 1);
+            }
+        }
+    }
+    let mut folded = folded.unwrap();
+    if log_block > CACHED_FFT_LOG_SIZE {
+        // The FFT reads large coefficients transposed.
+        let natural = folded;
+        let log_n_vecs = log_block - LOG_N_LANES;
+        folded = BaseColumn::zeros(1 << log_block);
+        folded
+            .data
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, x)| *x = natural.data[transposed_vec_index(i, log_n_vecs)]);
+    }
+    let folded = CircleCoefficients::<SimdBackend>::new(folded);
+    let stripe_twiddles = vec![
+        (0..(log_block - 1))
+            .map(|layer_i| {
+                &line_twiddles[layer_i as usize][block << (log_block - 2 - layer_i)
+                    ..(block + 1) << (log_block - 2 - layer_i)]
+            })
+            .collect::<Vec<_>>(),
+    ];
+    fft_subdomains_into(&folded, dst, &stripe_twiddles);
+}
+
 fn compute_small_coset_twiddles(coset: Coset) -> TwiddleTree<SimdBackend> {
     let twiddles = slow_precompute_twiddles(coset);
 
@@ -961,6 +1070,279 @@ fn slow_eval_at_point(
         a.swap_with_slice(&mut c[0..n0]);
     }
     fold(poly.coeffs.as_slice(), &mappings)
+}
+
+/// [`PolyOps::evaluate_from_prefix`] for the SIMD backend. Folding a column's evaluation on its
+/// first subdomain with a point's factors (y, x, pi(x), ...) evaluates it at that point
+/// (`CpuBackend::eval_at_point_by_folding`). The 32 points of an aligned block of a stripe share
+/// every factor past the first five, so:
+/// 1. the first five layers (circle and four line layers) are the first five layers of the
+///    inverse FFT, run unfolded once per column (`ifft_lower_with_vecwise`): chunk `c` of 32
+///    values then holds the 32 partial polynomials at the `c`-th point of the folded domain;
+/// 2. the remaining layers fold pairs of adjacent chunks with each block's shared factor, tile
+///    by tile so that the column is read once for all blocks;
+/// 3. each point combines its block's 32 values with its own five factors.
+/// Everything but the column's values depends only on its size and the rows read, so it is
+/// planned once per size ([`PrefixPlan`]) and shared by every column of that size.
+fn evaluate_from_prefix_simd(
+    prefix: &BaseColumn,
+    log_size: u32,
+    domain: CircleDomain,
+    targets: &[(usize, Vec<usize>)],
+    scratch: &mut BaseColumn,
+) -> Option<Vec<Vec<BaseField>>> {
+    evaluate_from_prefix_mode(prefix, log_size, domain, targets, scratch, bary_tail())
+}
+
+fn evaluate_from_prefix_mode(
+    prefix: &BaseColumn,
+    log_size: u32,
+    domain: CircleDomain,
+    targets: &[(usize, Vec<usize>)],
+    scratch: &mut BaseColumn,
+    bary: bool,
+) -> Option<Vec<Vec<BaseField>>> {
+    if log_size < 10 {
+        return None;
+    }
+    let n = log_size;
+    let plan = PrefixPlan::get(n, domain, targets);
+    // 1. The first five inverse layers, chunk by chunk, in the caller's (pooled) scratch.
+    let n_vecs = 1usize << (n - LOG_N_LANES);
+    let unfolded = &mut scratch.data[..n_vecs];
+    unfolded.copy_from_slice(&prefix.data[..n_vecs]);
+    // The loop body of `ifft::ifft_lower_with_vecwise` for its first five layers.
+    let twiddles = plan.twiddles();
+    for (index, chunk) in unfolded.chunks_exact_mut(2).enumerate() {
+        let (val0, val1) = ifft::vecwise_ibutterflies(
+            chunk[0],
+            chunk[1],
+            std::array::from_fn(|i| twiddles[0][index * 8 + i]),
+            std::array::from_fn(|i| twiddles[1][index * 4 + i]),
+            std::array::from_fn(|i| twiddles[2][index * 2 + i]),
+        );
+        let (val0, val1) =
+            ifft::simd_ibutterfly(val0, val1, std::simd::u32x16::splat(twiddles[3][index]));
+        chunk[0] = val0;
+        chunk[1] = val1;
+    }
+    // 2. The remaining layers, tile by tile, for every block.
+    let n_chunks = 1usize << (n - PrefixPlan::LOW);
+    let tile = 1usize << plan.tile_bits;
+    if bary {
+        // Q722: one weighted accumulate per block, tile by tile so the column is read once.
+        let mut acc = vec![[PackedBaseField::zero(); 2]; plan.blocks.len()];
+        for t in 0..n_chunks >> plan.tile_bits {
+            let src = &unfolded[2 * t * tile..2 * (t + 1) * tile];
+            for (block, acc) in plan.blocks.iter().zip(acc.iter_mut()) {
+                let [mut s0, mut s1] = *acc;
+                for (j, &w) in block.weights[t * tile..(t + 1) * tile].iter().enumerate() {
+                    let w = PackedBaseField::broadcast(w);
+                    s0 += src[2 * j] * w;
+                    s1 += src[2 * j + 1] * w;
+                }
+                *acc = [s0, s1];
+            }
+        }
+        let mut out: Vec<Vec<BaseField>> =
+            targets.iter().map(|(_, rows)| vec![BaseField::zero(); rows.len()]).collect();
+        for (block, acc) in plan.blocks.iter().zip(acc) {
+            let values: Vec<BaseField> = acc.iter().flat_map(|p| p.to_array()).collect();
+            for (k, own) in block.rows.clone().zip(&block.own) {
+                out[block.target][k] = fold(&values, own) * plan.scale;
+            }
+        }
+        return Some(out);
+    }
+    let mut level: Vec<Vec<[PackedBaseField; 2]>> =
+        plan.blocks.iter().map(|_| Vec::with_capacity(n_chunks >> plan.tile_bits)).collect();
+    let mut cur = vec![[PackedBaseField::zero(); 2]; tile / 2];
+    for t in 0..n_chunks >> plan.tile_bits {
+        let src = &unfolded[2 * t * tile..2 * (t + 1) * tile];
+        for (block, level) in plan.blocks.iter().zip(level.iter_mut()) {
+            // The first layer reads the unfolded chunks in place.
+            let coeffs = &block.coeffs[0][t * tile / 2..(t + 1) * tile / 2];
+            for (i, (out, &c)) in cur.iter_mut().zip(coeffs).enumerate() {
+                let c = PackedBaseField::broadcast(c);
+                let (a0, a1, b0, b1) = (src[4 * i], src[4 * i + 1], src[4 * i + 2], src[4 * i + 3]);
+                *out = [(a0 + b0) + (a0 - b0) * c, (a1 + b1) + (a1 - b1) * c];
+            }
+            let mut len = tile / 2;
+            for layer in 1..plan.tile_bits as usize {
+                let base = (t * tile) >> (layer + 1);
+                let coeffs = &block.coeffs[layer][base..base + len / 2];
+                for i in 0..len / 2 {
+                    let c = PackedBaseField::broadcast(coeffs[i]);
+                    let [a0, a1] = cur[2 * i];
+                    let [b0, b1] = cur[2 * i + 1];
+                    cur[i] = [(a0 + b0) + (a0 - b0) * c, (a1 + b1) + (a1 - b1) * c];
+                }
+                len /= 2;
+            }
+            level.push(cur[0]);
+        }
+    }
+    // 3. The layers above the tiles, then each point's own factors.
+    let mut out: Vec<Vec<BaseField>> =
+        targets.iter().map(|(_, rows)| vec![BaseField::zero(); rows.len()]).collect();
+    for (block, mut level) in plan.blocks.iter().zip(level) {
+        let mut len = level.len();
+        for layer in plan.tile_bits as usize..(n - PrefixPlan::LOW) as usize {
+            for i in 0..len / 2 {
+                let c = PackedBaseField::broadcast(block.coeffs[layer][i]);
+                let [a0, a1] = level[2 * i];
+                let [b0, b1] = level[2 * i + 1];
+                level[i] = [(a0 + b0) + (a0 - b0) * c, (a1 + b1) + (a1 - b1) * c];
+            }
+            len /= 2;
+        }
+        let values: Vec<BaseField> = level[0].iter().flat_map(|p| p.to_array()).collect();
+        for (k, own) in block.rows.clone().zip(&block.own) {
+            out[block.target][k] = fold(&values, own) * plan.scale;
+        }
+    }
+    Some(out)
+}
+
+/// The column-independent part of [`evaluate_from_prefix_simd`] for one column size and set of
+/// rows: the subdomain's inverse twiddles and, per block, the shared factor times the twiddle of
+/// every pair of every folded layer, and each point's own five factors.
+type SubdomainTwiddles =
+    std::collections::HashMap<(usize, u32), std::sync::Arc<TwiddleTree<SimdBackend>>>;
+/// The twiddles of the subdomains striped trees regrow or decommit on.
+static SUBDOMAIN_TWIDDLES: std::sync::LazyLock<std::sync::Mutex<SubdomainTwiddles>> =
+    std::sync::LazyLock::new(Default::default);
+/// The decommit plans of [`PrefixPlan::get`], by column size, domain and rows.
+static PREFIX_PLANS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<PrefixPlan>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Drops the striped trees' cached subdomain twiddles and decommit plans: called when a proof's
+/// decommitment is done, so that one leg's caches do not stay resident under the next leg.
+pub fn clear_stripe_caches() {
+    SUBDOMAIN_TWIDDLES.lock().unwrap().clear();
+    PREFIX_PLANS.lock().unwrap().clear();
+}
+
+struct PrefixPlan {
+    sub_twiddles: std::sync::Arc<TwiddleTree<SimdBackend>>,
+    subdomain: CircleDomain,
+    tile_bits: u32,
+    blocks: Vec<PrefixBlock>,
+    scale: BaseField,
+}
+
+struct PrefixBlock {
+    target: usize,
+    rows: std::ops::Range<usize>,
+    /// `coeffs[layer][pair]`: the block's factor of folded layer `layer` (line layer 5 + layer)
+    /// times that layer's inverse twiddle of pair `pair`.
+    coeffs: Vec<Vec<BaseField>>,
+    /// Each point's own factors, highest first (`pi^3(x), ..., x, y`), as `fold` takes them.
+    own: Vec<[BaseField; 5]>,
+    /// Q722: the folded layers as one weighted sum. A fold `(a + b) + (a - b) c` is
+    /// `a (1 + c) + b (1 - c)`, so the top value is `sum_i weights[i] * chunk_i`, the weight of
+    /// chunk `i` being the product of its `(1 +- c)` along its path. Exact: the same field
+    /// operations, reassociated. Empty unless the bary tail is on.
+    weights: Vec<BaseField>,
+}
+
+/// Whether the decommit evaluates the folded layers as one weighted sum per block (Q722).
+fn bary_tail() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| true);
+    *ON
+}
+
+/// The weight of every chunk under the fold coefficients `coeffs[layer][pair]` (layer 0 pairs
+/// chunks), expanded top-down from the single top value.
+fn fold_weights(coeffs: &[Vec<BaseField>]) -> Vec<BaseField> {
+    let one = BaseField::from(1u32);
+    let mut w = vec![one];
+    for layer in coeffs.iter().rev() {
+        debug_assert_eq!(layer.len(), w.len());
+        w = w
+            .iter()
+            .zip(layer)
+            .flat_map(|(&w, &c)| [w * (one + c), w * (one - c)])
+            .collect();
+    }
+    w
+}
+
+impl PrefixPlan {
+    const LOW: u32 = 5;
+
+    fn twiddles(&self) -> Vec<&[u32]> {
+        domain_line_twiddles_from_tree(self.subdomain, &self.sub_twiddles.itwiddles)
+    }
+
+    fn get(n: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) -> std::sync::Arc<Self> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (n, domain.log_size(), domain.half_coset.initial_index.0, targets).hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some(plan) = PREFIX_PLANS.lock().unwrap().get(&key) {
+            return plan.clone();
+        }
+        // Planned outside the lock: planning may run on the thread pool, whose other workers may
+        // be waiting for this lock (a blocking lock held across a join deadlocks).
+        let plan = std::sync::Arc::new(Self::new(n, domain, targets));
+        PREFIX_PLANS.lock().unwrap().entry(key).or_insert(plan).clone()
+    }
+
+    fn new(n: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) -> Self {
+        let low = Self::LOW;
+        let subdomain = domain.split(domain.log_size() - n).0;
+        let sub_twiddles = SimdBackend::subdomain_twiddles(subdomain.half_coset);
+        let twiddles = domain_line_twiddles_from_tree(subdomain, &sub_twiddles.itwiddles);
+        let mut blocks = vec![];
+        for (target, (stripe, rows)) in targets.iter().enumerate() {
+            let mut start = 0;
+            for block in rows.chunk_by(|a, b| a >> low == b >> low) {
+                let factors = block
+                    .iter()
+                    .map(|&row| {
+                        let point =
+                            domain.at(bit_reverse_index((stripe << n) + row, domain.log_size()));
+                        let mut x = point.x;
+                        let mut factors = vec![point.y];
+                        for _ in 1..n {
+                            factors.push(x);
+                            x = CirclePoint::double_x(x);
+                        }
+                        factors
+                    })
+                    .collect::<Vec<_>>();
+                let coeffs: Vec<Vec<BaseField>> = (0..(n - low) as usize)
+                    .map(|layer| {
+                        let alpha = factors[0][low as usize + layer];
+                        twiddles[low as usize - 1 + layer]
+                            .iter()
+                            .map(|&dbl| alpha * BaseField::from_u32_unchecked(dbl >> 1))
+                            .collect()
+                    })
+                    .collect();
+                let weights = if bary_tail() { fold_weights(&coeffs) } else { vec![] };
+                blocks.push(PrefixBlock {
+                    target,
+                    rows: start..start + block.len(),
+                    weights,
+                    coeffs,
+                    own: factors.iter().map(|f| [f[4], f[3], f[2], f[1], f[0]]).collect(),
+                });
+                start += block.len();
+            }
+        }
+        drop(twiddles);
+        Self {
+            sub_twiddles,
+            subdomain,
+            tile_bits: 6.min(n - low),
+            blocks,
+            scale: BaseField::from(1u32 << n).inverse(),
+        }
+    }
 }
 
 #[cfg(test)]

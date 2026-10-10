@@ -39,6 +39,16 @@ impl<E: EvalAtRow> LogupAtRow<E> {
         }
     }
 
+    pub fn new_with_shift(
+        interaction: usize,
+        cumsum_shift: SecureField,
+        log_size: u32,
+        fracs: Vec<Fraction<E::EF, E::EF>>,
+    ) -> Self {
+        debug_assert!(fracs.is_empty());
+        Self { interaction, cumsum_shift, fracs, is_finalized: true, log_size }
+    }
+
     // TODO(alont): Remove this once unnecessary LogupAtRows are gone.
     pub fn dummy() -> Self {
         Self {

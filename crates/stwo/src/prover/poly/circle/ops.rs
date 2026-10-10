@@ -149,6 +149,20 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
     /// a commitment tree can be extended and hashed one subdomain stripe at a time.
     const STRIPES: bool = false;
 
+    /// Evaluates a column of `log_size` at the rows `targets[t].1` (sorted) of stripes
+    /// `targets[t].0` of `domain`, from `prefix`, whose first `2^log_size` values are its stripe 0
+    /// (the evaluation on the first subdomain), without its coefficients. `None` where the
+    /// backend does not support it (the caller then regrows the coefficients).
+    fn evaluate_from_prefix(
+        _prefix: &Col<Self, BaseField>,
+        _log_size: u32,
+        _domain: CircleDomain,
+        _targets: &[(usize, Vec<usize>)],
+        _scratch: &mut Col<Self, BaseField>,
+    ) -> Option<Vec<Vec<BaseField>>> {
+        None
+    }
+
     /// Writes the `stripe`-th contiguous block of [`Self::evaluate`]'s output on `domain`, of
     /// the size of `poly`, into `dst`: the evaluation on the `stripe`-th subdomain, which the
     /// extension computes as an independent FFT.
@@ -160,6 +174,19 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         _dst: &mut Col<Self, BaseField>,
     ) {
         unimplemented!("striped extension is not supported by this backend")
+    }
+
+    /// Writes block `block` of [`Self::evaluate`]'s output on `domain`, of `2^log_block` rows
+    /// (at most the size of `poly`), into `dst`: the evaluation on that subdomain.
+    fn evaluate_block_into(
+        _poly: &CircleCoefficients<Self>,
+        _domain: CircleDomain,
+        _twiddles: &TwiddleTree<Self>,
+        _log_block: u32,
+        _block: usize,
+        _dst: &mut Col<Self, BaseField>,
+    ) {
+        unimplemented!("block extension is not supported by this backend")
     }
 
     /// Copies `src[src_start..src_start + len]` into `dst[dst_start..dst_start + len]`.

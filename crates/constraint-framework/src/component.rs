@@ -128,6 +128,14 @@ impl From<InfoEvaluator> for ComponentInfo {
 }
 
 impl<E: FrameworkEval> FrameworkComponent<E> {
+    /// Per trace column, whether the constraints read it at a nonzero mask offset.
+    pub(crate) fn shifted_columns(&self) -> TreeVec<Vec<bool>> {
+        self.info
+            .mask_offsets
+            .as_ref()
+            .map(|offsets| offsets.iter().map(|o: &Vec<isize>| o.iter().any(|&o| o != 0)).collect())
+    }
+
     pub fn new(
         location_allocator: &mut TraceLocationAllocator,
         eval: E,

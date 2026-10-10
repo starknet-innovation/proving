@@ -20,11 +20,16 @@ pub struct Vectorized<A: Copy, const N: usize>(pub [A; N]);
 
 impl<A: Copy, const N: usize> Vectorized<A, N> {
     #[inline(always)]
-    pub fn from_fn<F>(cb: F) -> Self
+    pub fn from_fn<F>(mut cb: F) -> Self
     where
         F: FnMut(usize) -> A,
     {
-        Vectorized(std::array::from_fn(cb))
+        const { assert!(N > 0) };
+        let mut out = [cb(0); N];
+        for (i, slot) in out.iter_mut().enumerate().skip(1) {
+            *slot = cb(i);
+        }
+        Vectorized(out)
     }
 }
 

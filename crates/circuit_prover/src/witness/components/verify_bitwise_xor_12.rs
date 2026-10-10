@@ -48,9 +48,13 @@ impl ClaimGenerator {
 
     pub fn add_packed_inputs(&self, packed_inputs: &[PackedInputType], _relation_index: usize) {
         packed_inputs.into_par_iter().for_each(|packed_input| {
-            packed_input.unpack().into_iter().for_each(|input| {
-                self.add_input(&input);
-            });
+            let [a, b] = [packed_input[0].into_simd(), packed_input[1].into_simd()];
+            let mask = std::simd::Simd::splat((1 << LIMB_BITS) - 1);
+            let column_index = ((a >> LIMB_BITS) << EXPAND_BITS) + (b >> LIMB_BITS);
+            let row_index = ((a & mask) << LIMB_BITS) + (b & mask);
+            for (column, row) in column_index.to_array().into_iter().zip(row_index.to_array()) {
+                self.mults[column as usize].increase_at(row);
+            }
         });
     }
 }

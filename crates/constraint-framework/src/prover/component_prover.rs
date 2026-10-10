@@ -11,18 +11,23 @@ use stwo::core::pcs::TreeVec;
 use stwo::core::poly::circle::{CanonicCoset, CircleDomain};
 use stwo::core::utils::bit_reverse;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::simd::column::{BaseColumn, VeryPackedSecureColumnByCoords};
+use stwo::prover::backend::simd::circle::evaluate_block_into;
+use stwo::prover::backend::simd::column::{
+    BaseColumn, VeryPackedSecureColumnByCoords, VeryPackedSecureColumnByCoordsMutSlice,
+};
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 use stwo::prover::backend::simd::very_packed_m31::{LOG_N_VERY_PACKED_ELEMS, VeryPackedBaseField};
-use stwo::prover::backend::{Backend, Column, ColumnOps, CpuBackend};
+use stwo::prover::backend::{Backend, Column, CpuBackend};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
+use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::secure_column::SecureColumnByCoords;
 use stwo::prover::{ComponentProver, DomainEvaluationAccumulator, EvaluationMode, Poly, Trace};
 use tracing::{Level, span};
 
 use super::{CpuDomainEvaluator, SimdDomainEvaluator};
-use crate::{FrameworkComponent, FrameworkEval, PREPROCESSED_TRACE_IDX};
+use crate::logup::LogupAtRow;
+use crate::{FrameworkComponent, FrameworkEval, INTERACTION_TRACE_IDX, PREPROCESSED_TRACE_IDX};
 
 const CHUNK_SIZE: usize = 1;
 
@@ -39,6 +44,7 @@ fn get_trace_columns<'a, B: Backend>(
     component_polys: TreeVec<Vec<&'a &Poly<B>>>,
     eval_domain: CircleDomain,
     mode: EvaluationMode,
+    twiddles: Option<&TwiddleTree<B>>,
 ) -> TreeVec<Vec<Cow<'a, CircleEvaluation<B, BaseField, BitReversedOrder>>>> {
     match mode {
         EvaluationMode::SubDomain { .. } => {
@@ -53,7 +59,14 @@ fn get_trace_columns<'a, B: Backend>(
         }
         EvaluationMode::ExtendToEvalDomain => {
             let _span = span!(Level::INFO, "Constraint Extension").entered();
-            let twiddles = B::precompute_twiddles(eval_domain.half_coset);
+            let owned;
+            let twiddles = match twiddles {
+                Some(twiddles) => twiddles,
+                None => {
+                    owned = B::precompute_twiddles(eval_domain.half_coset);
+                    &owned
+                }
+            };
             #[cfg(not(feature = "parallel"))]
             {
                 component_polys.as_cols_ref().map_cols(|col| {
@@ -90,7 +103,7 @@ fn get_constraint_quotient_inputs<'a, E: FrameworkEval, B: Backend>(
             CanonicCoset::new(max_constraint_log_degree_bound).circle_domain()
         }
     };
-    let trace = get_trace_columns(component_polys, eval_domain, mode);
+    let trace = get_trace_columns(component_polys, eval_domain, mode, trace.twiddles);
 
     let denom_inv = get_denom_inv(trace_domain, eval_domain);
     ConstraintQuotientInputs { eval_domain, trace_domain, trace, denom_inv }
@@ -121,12 +134,13 @@ fn get_denom_inv(trace_domain: CanonicCoset, eval_domain: CircleDomain) -> Vec<B
     denom_inv
 }
 
-/// The smallest evaluation domain that [`FrameworkComponent::evaluate_in_windows`] evaluates
-/// window by window; smaller components extend at once, as before.
+/// Windowed components are evaluated over `2^LOG_N_BLOCKS` blocks of the evaluation domain
+/// ([`FrameworkComponent::evaluate_in_blocks`]).
+const LOG_N_BLOCKS: u32 = 2;
+
+/// The smallest evaluation domain that [`FrameworkComponent::evaluate_in_blocks`] evaluates
+/// block by block; smaller components extend at once, as before.
 const PARITY_MIN_LOG_SIZE: u32 = 20;
-/// The windows of a half coset in [`FrameworkComponent::evaluate_in_windows`]: each pass extends
-/// every column of the component once and keeps `2^n / N_WINDOWS` rows of it.
-const N_WINDOWS: usize = 2;
 
 impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponent<E> {
     fn evaluate_constraint_quotients_on_domain(
@@ -142,7 +156,7 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             && eval_log_size == self.eval.log_size() + 1
             && eval_log_size >= PARITY_MIN_LOG_SIZE
         {
-            return self.evaluate_in_windows(trace, evaluation_accumulator);
+            return self.evaluate_in_blocks(trace, evaluation_accumulator, LOG_N_BLOCKS);
         }
 
         let ConstraintQuotientInputs { eval_domain, trace_domain, trace, denom_inv } =
@@ -179,6 +193,7 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             eval_domain.log_size(),
             &denom_inv,
             None,
+            0,
         );
     }
 }
@@ -196,6 +211,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         eval_log_size: u32,
         denom_inv: &[BaseField],
         window: Option<(usize, isize)>,
+        block: usize,
     ) {
         let range = 0..(col.len() >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS));
         let col = unsafe { VeryPackedSecureColumnByCoords::transform_under_mut(col) };
@@ -209,8 +225,8 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         // Define any `self` values outside the loop to prevent the compiler thinking there is a
         // `Sync` requirement on `Self`.
         let self_eval = &self.eval;
-        let self_claimed_sum = self.claimed_sum;
         let trace_log_size = self_eval.log_size();
+        let cumsum_shift = self.claimed_sum / BaseField::from_u32_unchecked(1 << trace_log_size);
         let denom_shift = trace_log_size - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS;
         // In a window, the coset of the trace domain alternates with the row: the parity of the
         // natural row is the top bit of the bit-reversed one, which picks the denominator.
@@ -218,26 +234,35 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
             VeryPackedBaseField::from_array(std::array::from_fn(|i| denom_inv[i & 1]))
         });
 
-        iter.for_each(|(chunk_idx, mut chunk)| {
+        let body = |fracs: &mut Vec<_>,
+                    (chunk_idx, mut chunk): (usize, VeryPackedSecureColumnByCoordsMutSlice<'_>)| {
             for idx_in_chunk in 0..CHUNK_SIZE {
                 let vec_row = chunk_idx * CHUNK_SIZE + idx_in_chunk;
                 // Evaluate constrains at row.
-                let mut eval = SimdDomainEvaluator::new(
+                let mut eval = SimdDomainEvaluator::new_with_logup(
                     trace_cols,
                     vec_row,
                     random_coeff_powers,
                     trace_log_size,
                     eval_log_size,
-                    self_eval.log_size(),
-                    self_claimed_sum,
+                    LogupAtRow::new_with_shift(
+                        INTERACTION_TRACE_IDX,
+                        cumsum_shift,
+                        trace_log_size,
+                        std::mem::take(fracs),
+                    ),
                 );
                 eval.window = window;
-                let row_res = self_eval.evaluate(eval).row_res;
+                eval.block = block;
+                let mut eval = self_eval.evaluate(eval);
+                let row_res = eval.row_res;
+                *fracs = std::mem::take(&mut eval.logup.fracs);
+                fracs.clear();
 
                 // Finalize row.
                 unsafe {
                     let row_denom_inv = window_denom_inv.unwrap_or_else(|| {
-                        VeryPackedBaseField::broadcast(denom_inv[vec_row >> denom_shift])
+                        VeryPackedBaseField::broadcast(denom_inv[(vec_row + block) >> denom_shift])
                     });
                     chunk.set_packed(
                         idx_in_chunk,
@@ -245,19 +270,30 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                     )
                 }
             }
-        });
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut fracs = Vec::new();
+            iter.for_each(|item| body(&mut fracs, item));
+        }
+
+        #[cfg(feature = "parallel")]
+        iter.for_each_init(Vec::new, body);
     }
 
-    /// Evaluates the constraint quotients of a component whose evaluation domain is twice its
-    /// trace domain window by window, so that only a window of each column's extension is
-    /// resident. The evaluation domain is two half cosets, each a coset of the trace domain's
-    /// step: a mask offset moves a row along its half coset, `+off` rows in the first half's
-    /// natural order and `-off` in the second's. A window of [`N_WINDOWS`] of a half coset, with
-    /// one vector of rows on each side, holds every row its rows read.
-    fn evaluate_in_windows(
+    /// Evaluates the constraint quotients of a component whose evaluation domain is twice its trace
+    /// domain over `2^log_n_blocks` contiguous blocks of the evaluation
+    /// domain's bit-reversed order instead of windows of its half cosets. A block is a subdomain,
+    /// so each column's block is one small FFT of coefficients folded to its size
+    /// ([`evaluate_block_into`]), with no extension of the whole domain and no reordering. The few
+    /// columns read at a nonzero mask offset (the logup cumulative sums) reach rows of other
+    /// blocks: they are extended to the whole domain once, for every block.
+    fn evaluate_in_blocks(
         &self,
         trace: &Trace<'_, SimdBackend>,
         evaluation_accumulator: &mut DomainEvaluationAccumulator<SimdBackend>,
+        log_n_blocks: u32,
     ) {
         let log_size = self.eval.log_size();
         let trace_domain = CanonicCoset::new(log_size);
@@ -267,60 +303,101 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         let [mut accum] =
             evaluation_accumulator.columns([(eval_domain.log_size(), self.n_constraints())]);
         accum.random_coeff_powers.reverse();
-        let twiddles = SimdBackend::precompute_twiddles(eval_domain.half_coset);
-        let half_size = 1usize << log_size;
-        let len = half_size / N_WINDOWS;
-        let halo = 1 << (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS);
-        // Natural order, where row `m` of a half coset is row `half * 2^n + m`, while the windows
-        // add to it.
-        let bit_reverse = |column: &mut BaseColumn| {
-            <SimdBackend as ColumnOps<BaseField>>::bit_reverse_column(column)
+        let owned;
+        let twiddles = match trace.twiddles {
+            Some(twiddles) => twiddles,
+            None => {
+                owned = SimdBackend::precompute_twiddles(eval_domain.half_coset);
+                &owned
+            }
         };
-        accum.col.columns.iter_mut().for_each(bit_reverse);
-        for half in 0..2 {
-            let sign = if half == 0 { 1 } else { -1 };
-            for start in (0..half_size).step_by(len) {
-                let window = |poly: &&Poly<SimdBackend>| {
-                    let mut extension =
-                        poly.get_evaluation_on_domain(eval_domain, &twiddles).values;
-                    bit_reverse(&mut extension);
-                    let rows = &extension.as_slice()[half * half_size..][..half_size];
-                    let values: BaseColumn = (0..len + 2 * halo)
-                        .map(|t| rows[(start + half_size + t - halo) % half_size])
-                        .collect();
-                    // The evaluator reads only the values; the domain is a placeholder.
-                    let mut window = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
-                        CanonicCoset::new(1).circle_domain(),
-                        BaseColumn::zeros(2),
-                    );
-                    window.values = values;
-                    window
-                };
-                #[cfg(not(feature = "parallel"))]
-                let windows = component_polys.as_cols_ref().map_cols(|poly| window(poly));
-                #[cfg(feature = "parallel")]
-                let windows = component_polys.as_cols_ref().par_map_cols(|poly| window(poly));
-                let mut rows = SecureColumnByCoords::<SimdBackend>::zeros(len);
-                self.accumulate_rows(
-                    &windows.as_cols_ref(),
-                    &mut rows,
-                    &accum.random_coeff_powers,
-                    eval_domain.log_size(),
-                    &denom_inv,
-                    Some((1, sign)),
-                );
-                drop(windows);
-                for (dst, src) in accum.col.columns.iter_mut().zip(&rows.columns) {
-                    let dst = &mut dst.as_mut_slice()[half * half_size + start..][..len];
-                    #[cfg(not(feature = "parallel"))]
-                    let pairs = dst.iter_mut().zip(src.as_slice());
-                    #[cfg(feature = "parallel")]
-                    let pairs = dst.par_iter_mut().zip(src.as_slice().par_iter());
-                    pairs.for_each(|(dst, src)| *dst += *src);
-                }
+        let log_block = eval_domain.log_size() - log_n_blocks;
+        let block_len = 1usize << log_block;
+        // Per column of `component_polys`: whether a nonzero mask offset reads it. A tree whose
+        // mask does not match its columns one to one counts as read at an offset (extended whole).
+        let mask = self.shifted_columns();
+        let shifted = TreeVec::new(
+            component_polys
+                .iter()
+                .enumerate()
+                .map(|(t, polys)| match mask.get(t) {
+                    Some(m) if m.len() == polys.len() => m.clone(),
+                    // Preprocessed columns are read through their own accessor, at offset 0 (a
+                    // block column read at an offset would index past its end and panic).
+                    Some(m) if m.is_empty() && t == PREPROCESSED_TRACE_IDX => vec![false; polys.len()],
+                    _ => vec![true; polys.len()],
+                })
+                .collect(),
+        );
+        fn coefficients(
+            poly: &Poly<SimdBackend>,
+        ) -> Cow<'_, stwo::prover::poly::circle::CircleCoefficients<SimdBackend>> {
+            match &poly.coeffs {
+                Some(coeffs) => Cow::Borrowed(coeffs),
+                None => Cow::Owned(poly.regrown_coefficients()),
             }
         }
-        accum.col.columns.iter_mut().for_each(bit_reverse);
+        // The shifted columns, extended to the whole domain.
+        let whole = component_polys
+            .as_cols_ref()
+            .zip_cols(shifted.as_cols_ref())
+            .map_cols(|(poly, shifted): (&&&Poly<SimdBackend>, &bool)| {
+                shifted.then(|| poly.get_evaluation_on_domain(eval_domain, &twiddles))
+            });
+        // A block's column buffers are reused by the next block (no fresh pages).
+        let spare = std::sync::Mutex::new(Vec::<BaseColumn>::new());
+        for block in 0..1usize << log_n_blocks {
+            let fill = |(poly, whole): (&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>)| {
+                if whole.is_some() {
+                    return None;
+                }
+                let mut values =
+                    spare.lock().unwrap().pop().unwrap_or_else(|| BaseColumn::zeros(block_len));
+                evaluate_block_into(&coefficients(**poly), eval_domain, &twiddles, log_block, block, &mut values);
+                let mut evaluation = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                    CanonicCoset::new(1).circle_domain(),
+                    BaseColumn::zeros(2),
+                );
+                evaluation.values = values;
+                Some(evaluation)
+            };
+            #[cfg(not(feature = "parallel"))]
+            let blocks = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).map_cols(fill);
+            #[cfg(feature = "parallel")]
+            let blocks = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).par_map_cols(fill);
+            let columns = blocks
+                .as_cols_ref()
+                .zip_cols(whole.as_cols_ref())
+                .map_cols(
+                    |(block, whole): (
+                        &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+                        &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+                    )| block.as_ref().or(whole.as_ref()).unwrap(),
+                );
+            let mut rows = SecureColumnByCoords::<SimdBackend>::zeros(block_len);
+            self.accumulate_rows(
+                &columns,
+                &mut rows,
+                &accum.random_coeff_powers,
+                eval_domain.log_size(),
+                &denom_inv,
+                None,
+                block * block_len >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS),
+            );
+            drop(columns);
+            spare
+                .lock()
+                .unwrap()
+                .extend(blocks.0.into_iter().flatten().flatten().map(|evaluation| evaluation.values));
+            for (dst, src) in accum.col.columns.iter_mut().zip(&rows.columns) {
+                let dst = &mut dst.as_mut_slice()[block * block_len..][..block_len];
+                #[cfg(not(feature = "parallel"))]
+                let pairs = dst.iter_mut().zip(src.as_slice());
+                #[cfg(feature = "parallel")]
+                let pairs = dst.par_iter_mut().zip(src.as_slice().par_iter());
+                pairs.for_each(|(dst, src)| *dst += *src);
+            }
+        }
     }
 }
 
