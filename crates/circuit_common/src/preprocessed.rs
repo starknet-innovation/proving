@@ -722,6 +722,8 @@ pub struct PreprocessedCircuit {
 impl PreprocessedCircuit {
     /// Finalizes the context, then builds the preprocessed circuit.
     pub fn preprocess_circuit(context: &mut FinalizedContext<impl IValue>) -> Self {
+        // The circuit is read after padding here, so it is kept.
+        context.keep_on_padding();
         pad_context(context);
         Self::from_finalized_circuit(context.circuit())
     }

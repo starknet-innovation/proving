@@ -63,6 +63,7 @@ pub fn pad_context(context: &mut FinalizedContext<impl IValue>) {
     // Padding the components to a power of two.
     let padded_sizes = compute_padded_sizes(context);
     pad_to_targets(context, &padded_sizes);
+    context.release_if_requested();
 }
 
 /// Pads each component to its target size by appending trivial gates. The target sizes are passed

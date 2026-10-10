@@ -66,6 +66,22 @@ pub trait IValue:
 
     /// Unpacks a QM31 limb representation `(low_u16, high_u16, 0, 0)` back into a `u32`.
     fn unpack_u32(&self) -> u32;
+
+    /// Takes the values of a context released at padding (see
+    /// [`FinalizedContext::release_on_padding`](crate::context::FinalizedContext::release_on_padding)).
+    /// Only [QM31] values are proved; other values are dropped.
+    fn release_values(values: Vec<Self>) {
+        drop(values);
+    }
+}
+
+/// The values of the last context released at padding, waiting for its proof to take them (see
+/// [`take_released_values`]).
+static RELEASED_VALUES: std::sync::Mutex<Option<Vec<QM31>>> = std::sync::Mutex::new(None);
+
+/// Takes the values of the last context released at padding, if its proof has not taken them yet.
+pub fn take_released_values() -> Option<Vec<QM31>> {
+    RELEASED_VALUES.lock().unwrap().take()
 }
 
 impl IValue for QM31 {
@@ -133,6 +149,10 @@ impl IValue for QM31 {
         };
         assert!(low <= 0xFFFF && high <= 0xFFFF, "low and high coordinates must be u16 values");
         low | (high << 16)
+    }
+
+    fn release_values(values: Vec<Self>) {
+        *RELEASED_VALUES.lock().unwrap() = Some(values);
     }
 }
 

@@ -88,6 +88,9 @@ pub struct Context<Value: IValue> {
     pub assert_eq_on_eval: bool,
     /// Debug only. A map from variable name to the corresponding [Var].
     pub debug_info: HashMap<String, Var>,
+    /// Set by [FinalizedContext::release_on_padding]: padding then hands the values to the proof
+    /// and frees the gates.
+    release_on_padding: bool,
 }
 
 impl<Value: IValue> Context<Value> {
@@ -263,6 +266,7 @@ impl<Value: IValue> Default for Context<Value> {
             reserved_vars: vec![],
             assert_eq_on_eval: false,
             debug_info: HashMap::new(),
+            release_on_padding: false,
         };
         // Register zero, one, and u as the first constants.
         res.constant(QM31::zero());
@@ -317,6 +321,34 @@ impl<Value: IValue> FinalizedContext<Value> {
 
     pub fn get(&self, var: Var) -> Value {
         self.context.get(var)
+    }
+
+    /// Marks this context as one whose padding is its last change before it is proved: padding
+    /// then hands the values over to the proof, which reads them only to write its base trace and
+    /// frees them right after, and frees the gates, which nothing reads once the circuit is padded
+    /// (the proof reads the preprocessed circuit). Afterwards [Self::values] is empty and
+    /// [Self::circuit] keeps only `n_vars`.
+    pub fn release_on_padding(&mut self) {
+        self.context.release_on_padding = true;
+    }
+
+    /// Clears [Self::release_on_padding], for a caller that reads the circuit after padding it.
+    pub fn keep_on_padding(&mut self) {
+        self.context.release_on_padding = false;
+    }
+
+    /// Called once the context is padded: releases it if [Self::release_on_padding] was set.
+    pub fn release_if_requested(&mut self) {
+        let context = &mut self.context;
+        if !std::mem::take(&mut context.release_on_padding) {
+            return;
+        }
+        Value::release_values(std::mem::take(&mut context.values));
+        context.circuit = Circuit { n_vars: context.circuit.n_vars, ..Circuit::default() };
+        context.constants = IndexMap::new();
+        context.unused_vars = HashSet::new();
+        context.maybe_unused_vars = HashSet::new();
+        context.debug_info = HashMap::new();
     }
 }
 

@@ -92,12 +92,14 @@ pub fn verify_fixed_cairo_circuit(
     serialized_aux_data: Vec<M31>,
     output_hash: Blake2sHash,
 ) -> Result<FinalizedContext<QM31>, String> {
-    let context = build_and_fill_cairo_verifier_circuit(
+    let mut context = build_and_fill_cairo_verifier_circuit(
         verifier_config,
         proof,
         serialized_aux_data,
         output_hash,
     );
+    // The returned context is verified, not proved.
+    context.keep_on_padding();
 
     // Check the verifier circuit gates topology only in test mode.
     #[cfg(test)]
@@ -149,7 +151,9 @@ pub fn build_and_fill_cairo_verifier_circuit(
     let proof_vars = proof.guess(&mut context);
     verify(&mut context, &proof_vars, config, &statement);
 
-    context.finalize(false)
+    let mut context = context.finalize(false);
+    context.release_on_padding();
+    context
 }
 
 /// Builds the Cairo verifier circuit topology without needing a proof.

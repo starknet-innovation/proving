@@ -140,6 +140,12 @@ where
     // Preprocessed trace.
     commitment_scheme.commit_tree(preprocessed_tree, channel);
 
+    // A context released at padding hands its values over instead of `values` (see
+    // `FinalizedContext::release_on_padding`); they are freed once the base trace is written.
+    let released_values =
+        if values.is_empty() { circuits::ivalue::take_released_values() } else { None };
+    let values = released_values.as_deref().unwrap_or(values);
+
     // Base trace.
     let mut tree_builder = commitment_scheme.tree_builder();
     let (claim, component_log_sizes, interaction_generator) = write_trace(
@@ -158,6 +164,7 @@ where
     );
     mix_circuit_hash(channel, &circuit_hash);
     claim.mix_into(channel);
+    drop(released_values);
     tree_builder.commit(channel);
 
     // Draw interaction elements.
