@@ -180,6 +180,12 @@ impl Column<BaseField> for BaseColumn {
         self.as_slice().to_vec()
     }
 
+    fn from_fill(len: usize, fill: &dyn Fn(&mut [BaseField])) -> Self {
+        let mut column = Self::zeros(len);
+        fill(column.as_mut_slice());
+        column
+    }
+
     fn len(&self) -> usize {
         self.length
     }

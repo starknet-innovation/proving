@@ -13,7 +13,7 @@ use crate::core::pcs::quotients::{
     ColumnSampleBatch, PointSample, build_samples_with_randomness_and_periodicity,
 };
 use crate::prover::AccumulationOps;
-use crate::prover::backend::ColumnOps;
+use crate::prover::backend::{Column, ColumnOps};
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::poly::circle::{CircleEvaluation, PolyOps, SecureEvaluation};
 use crate::prover::poly::twiddles::TwiddleTree;
@@ -93,6 +93,39 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     twiddles: &TwiddleTree<B>,
     log_blowup_factor: u32,
 ) -> SecureEvaluation<B, BitReversedOrder> {
+    compute_fri_quotients_with_regrowth(
+        columns,
+        None,
+        samples,
+        random_coeff,
+        lifting_log_size,
+        twiddles,
+        log_blowup_factor,
+    )
+}
+
+/// Regrows the stripe-0 evaluation of the column `(tree, column)` that stores no values.
+pub type RegrowStripe<'a, B> =
+    dyn Fn(usize, usize) -> CircleEvaluation<B, BaseField, BitReversedOrder> + Sync + 'a;
+
+/// The most stored-nothing columns whose stripe 0 is regrown at once in
+/// [`compute_fri_quotients_with_regrowth`]: the regrown stripes are its only extra memory.
+const REGROWN_BATCH: usize = 16;
+
+/// [`compute_fri_quotients`] where some columns store no values (an empty evaluation on their
+/// domain) and `regrow` reproduces their stripe 0. Their numerators are accumulated
+/// [`REGROWN_BATCH`] columns at a time and added to those of the stored columns of the same size
+/// and sample point. Field addition is exact, so the accumulations, and the quotients, are those
+/// of a single pass over every column.
+pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
+    columns: &TreeVec<Vec<&CircleEvaluation<B, BaseField, BitReversedOrder>>>,
+    regrow: Option<&RegrowStripe<'_, B>>,
+    samples: &TreeVec<Vec<Vec<PointSample>>>,
+    random_coeff: SecureField,
+    lifting_log_size: u32,
+    twiddles: &TwiddleTree<B>,
+    log_blowup_factor: u32,
+) -> SecureEvaluation<B, BitReversedOrder> {
     let _span = span!(Level::INFO, "Compute FRI quotients", class = "FRIQuotients").entered();
     let mut accumulated_numerators_vec: Vec<AccumulatedNumerators<B>> = vec![];
     let samples_with_randomness = build_samples_with_randomness_and_periodicity(
@@ -110,18 +143,37 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     // Every (log_size, sample_point) accumulation has its own buffer, so they are computed
     // concurrently: the small log sizes do not split into enough row chunks to occupy the
     // threads on their own. The order of the vector is the sequential one.
-    let groups: Vec<(Vec<_>, Vec<ColumnSampleBatch>)> =
-        zip(columns.iter().flatten(), samples_with_randomness.iter().flatten())
-            .sorted_by_key(|(c, _)| c.domain.log_size())
-            .group_by(|(c, _)| c.domain.log_size())
-            .into_iter()
-            .map(|(_, tuples)| {
-                let (columns, samples_with_randomness): (Vec<_>, Vec<_>) = tuples.unzip();
-                // TODO: slice.
-                let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
-                (columns, sample_batches)
-            })
-            .collect();
+    let positions = columns
+        .iter()
+        .enumerate()
+        .flat_map(|(tree, columns)| (0..columns.len()).map(move |column| (tree, column)))
+        .collect_vec();
+    let is_regrown = |column: &CircleEvaluation<B, BaseField, BitReversedOrder>| {
+        regrow.is_some() && column.values.len() == 0
+    };
+    let mut regrown_groups = vec![];
+    let groups: Vec<(Vec<_>, Vec<ColumnSampleBatch>)> = zip(
+        zip(columns.iter().flatten(), samples_with_randomness.iter().flatten()),
+        &positions,
+    )
+    .sorted_by_key(|((c, _), _)| c.domain.log_size())
+    .group_by(|((c, _), _)| c.domain.log_size())
+    .into_iter()
+    .filter_map(|(_, tuples)| {
+        let (stored, regrown): (Vec<_>, Vec<_>) = tuples.partition(|((c, _), _)| !is_regrown(c));
+        if !regrown.is_empty() {
+            regrown_groups.push(regrown);
+        }
+        if stored.is_empty() {
+            return None;
+        }
+        let (columns, samples_with_randomness): (Vec<_>, Vec<_>) =
+            stored.into_iter().map(|(tuple, _)| tuple).unzip();
+        // TODO: slice.
+        let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
+        Some((columns, sample_batches))
+    })
+    .collect();
     let accumulate_batch = |columns: &[&CircleEvaluation<B, BaseField, BitReversedOrder>],
                             batch: &ColumnSampleBatch|
      -> Vec<AccumulatedNumerators<B>> {
@@ -142,6 +194,31 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
         .flat_map(|(columns, batches)| batches.iter().map(|batch| accumulate_batch(columns, batch)))
         .collect();
     accumulated_numerators_vec.extend(accumulations.into_iter().flatten());
+
+    // The columns that store no values, a bounded batch of regrown stripes at a time.
+    for group in regrown_groups {
+        let regrow = regrow.unwrap();
+        for batch in group.chunks(REGROWN_BATCH) {
+            #[cfg(feature = "parallel")]
+            let stripes: Vec<_> =
+                batch.par_iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
+            #[cfg(not(feature = "parallel"))]
+            let stripes: Vec<_> =
+                batch.iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
+            let stripes = stripes.iter().collect_vec();
+            let samples_with_randomness = batch.iter().map(|((_, s), _)| *s).collect_vec();
+            let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
+            #[cfg(feature = "parallel")]
+            let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+                sample_batches.par_iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
+            #[cfg(not(feature = "parallel"))]
+            let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+                sample_batches.iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
+            for accumulation in accumulations.into_iter().flatten() {
+                add_accumulation(&mut accumulated_numerators_vec, accumulation);
+            }
+        }
+    }
 
     // Group and accumulate the numerators per sample point: the accumulations (of different
     // lengths) get lifted and accumulated to a single vector. After this step, there is a single
@@ -179,6 +256,28 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
         log_blowup_factor,
         twiddles,
     )
+}
+
+/// Adds `accumulation` to the accumulation in `accumulations` of the same sample point and size,
+/// or appends it, keeping the vector sorted by size.
+fn add_accumulation<B: AccumulationOps>(
+    accumulations: &mut Vec<AccumulatedNumerators<B>>,
+    accumulation: AccumulatedNumerators<B>,
+) {
+    let len = accumulation.partial_numerators_acc.len();
+    if let Some(existing) = accumulations.iter_mut().find(|existing| {
+        existing.sample_point == accumulation.sample_point
+            && existing.partial_numerators_acc.len() == len
+    }) {
+        B::accumulate(&mut existing.partial_numerators_acc, &accumulation.partial_numerators_acc);
+        existing.first_linear_term_acc += accumulation.first_linear_term_acc;
+        return;
+    }
+    let index = accumulations
+        .iter()
+        .position(|existing| existing.partial_numerators_acc.len() > len)
+        .unwrap_or(accumulations.len());
+    accumulations.insert(index, accumulation);
 }
 
 #[cfg(test)]

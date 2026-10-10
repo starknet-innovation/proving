@@ -594,6 +594,43 @@ impl PolyOps for SimdBackend {
             .sum::<SecureField>();
     }
 
+    fn barycentric_eval_group(
+        evals: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+        weights: &SecureColumnByCoords<Self>,
+    ) -> Vec<SecureField> {
+        if evals.is_empty() {
+            return Vec::new();
+        }
+        // One pass over the weights for all the columns, as in `subdomain_eval_group`.
+        let n_words = weights.len().div_ceil(N_LANES);
+        let zero = || vec![PackedSecureField::zero(); evals.len()];
+        let fold = |mut accumulators: Vec<PackedSecureField>, chunk_index: usize| {
+            let start = chunk_index * 256;
+            let chunk_len = 256.min(n_words - start);
+            let chunk_weights = (start..start + chunk_len)
+                .map(|i| {
+                    PackedSecureField::from_packed_m31s(std::array::from_fn(|j| {
+                        weights.columns[j].data[i]
+                    }))
+                })
+                .collect::<Vec<_>>();
+            for (accumulator, eval) in accumulators.iter_mut().zip(evals) {
+                let values = &eval.values.data[start..start + chunk_len];
+                *accumulator += zip(&chunk_weights, values)
+                    .fold(PackedSecureField::zero(), |sum, (weight, value)| sum + *weight * *value);
+            }
+            accumulators
+        };
+        #[cfg(not(feature = "parallel"))]
+        let sums = (0..n_words.div_ceil(256)).fold(zero(), fold);
+        #[cfg(feature = "parallel")]
+        let sums = (0..n_words.div_ceil(256))
+            .into_par_iter()
+            .fold(zero, fold)
+            .reduce(zero, |a, b| zip(a, b).map(|(x, y)| x + y).collect());
+        sums.into_iter().map(|sum| sum.pointwise_sum()).collect()
+    }
+
     fn subdomain_eval_group(
         coset: CanonicCoset,
         log_blowup: u32,

@@ -51,6 +51,15 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     unsafe fn uninitialized(len: usize) -> Self;
     /// Returns a cpu vector of the column.
     fn to_cpu(&self) -> Vec<T>;
+    /// A column of `len` elements, written by `fill` through a slice.
+    fn from_fill(len: usize, fill: &dyn Fn(&mut [T])) -> Self
+    where
+        T: Copy + Default,
+    {
+        let mut values = vec![T::default(); len];
+        fill(&mut values);
+        values.into_iter().collect()
+    }
     /// Returns the length of the column.
     fn len(&self) -> usize;
     /// Returns true if the column is empty.

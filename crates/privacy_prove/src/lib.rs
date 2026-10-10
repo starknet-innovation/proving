@@ -20,7 +20,7 @@ use circuit_cairo_verifier::verify::{
     prepare_cairo_proof_for_circuit_verifier,
 };
 use circuit_common::finalize::{add_zk_blinding, pad_context};
-use circuit_common::preprocessed::PreprocessedCircuit;
+use circuit_common::preprocessed::{PreprocessedCircuit, PreprocessedColumnSource};
 use circuit_prover::prover::{
     prepare_circuit_proof_for_circuit_verifier, prove_circuit_with_precompute,
 };
@@ -222,13 +222,18 @@ pub fn prepare_recursive_prover_precomputes()
             let circuit_preprocessed_trace = preprocessed_trace.get_trace::<SimdBackend>();
             let circuit_preprocessed_trace_polys =
                 SimdBackend::interpolate_columns(circuit_preprocessed_trace, &twiddles);
-            CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
+            // The compact preprocessed columns stay resident for the circuit proof: the tree
+            // regrows its columns from them instead of keeping a stripe of each extension.
+            let sources =
+                PreprocessedColumnSource::all(&preprocessed_trace).into_iter().map(Some).collect();
+            CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new_with_sources(
                 circuit_preprocessed_trace_polys,
                 CIRCUIT_FRI_CONFIG.log_blowup_factor,
                 &twiddles,
                 CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
                 preprocessed_lifting_log_size,
                 &base_column_pool,
+                sources,
             )
         })
     };

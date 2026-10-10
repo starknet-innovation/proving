@@ -110,6 +110,16 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
     /// Each polynomial has coefficient log size at most `coset.log_size() - log_blowup`.
     /// Backends may interpolate from a sufficient bit-reversed prefix of the domain; the
     /// default implementation retains the backend's existing weight-size contract.
+    /// Evaluates every column of `evals`, all on the domain `weights` were computed for (see
+    /// [`CircleEvaluation::barycentric_weights_into`]), at that point. A backend may read each
+    /// weight once for all the columns.
+    fn barycentric_eval_group(
+        evals: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+        weights: &SecureColumnByCoords<Self>,
+    ) -> Vec<SecureField> {
+        evals.iter().map(|eval| Self::barycentric_eval_at_point(eval, weights)).collect()
+    }
+
     fn subdomain_eval_group(
         coset: CanonicCoset,
         log_blowup: u32,

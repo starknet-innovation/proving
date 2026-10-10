@@ -24,7 +24,8 @@ use crate::prover::air::component_prover::{Poly, Trace, WeightsHashMap};
 use crate::prover::backend::{BackendForChannel, Col, Column};
 use crate::prover::fri::{FriDecommitResult, FriProver};
 use crate::prover::mempool::BaseColumnPool;
-use crate::prover::pcs::quotient_ops::compute_fri_quotients;
+use crate::prover::air::component_prover::{SharedTraceSource, source_column};
+use crate::prover::pcs::quotient_ops::compute_fri_quotients_with_regrowth;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use crate::prover::poly::twiddles::TwiddleTree;
@@ -252,11 +253,17 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         });
         let mut groups: HashMap<(u32, CirclePoint<SecureField>), Vec<(usize, usize, usize)>> =
             HashMap::new();
+        // Columns that store no values are sampled from their source (see below).
+        let mut sourced: Vec<(usize, usize)> = vec![];
         assert_eq!(polynomials.len(), sampled_points.len());
         for (tree_index, columns) in polynomials.iter().enumerate() {
             assert_eq!(columns.len(), sampled_points[tree_index].len());
             for (column_index, poly) in columns.iter().enumerate() {
                 let log_size = poly.evals.domain.log_size();
+                if poly.is_sourced() {
+                    sourced.push((tree_index, column_index));
+                    continue;
+                }
                 for (sample_index, &point) in
                     sampled_points[tree_index][column_index].iter().enumerate()
                 {
@@ -289,6 +296,74 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             assert_eq!(members.len(), values.len());
             for ((tree, column, sample), value) in members.into_iter().zip(values) {
                 samples[tree][column][sample].value = value;
+            }
+        }
+        // Columns that store no values are sampled on their trace domain, whose values their
+        // source reproduces: by size, one barycentric weight block per sample point, shared by
+        // every column of that size, with a bounded batch of columns expanded at a time.
+        let mut sourced_by_size: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+        for (tree, column) in sourced {
+            let log_size = polynomials[tree][column].source.as_ref().unwrap().log_size();
+            sourced_by_size.entry(log_size).or_default().push((tree, column));
+        }
+        for (trace_log_size, members) in sourced_by_size {
+            let coset = CanonicCoset::new(trace_log_size);
+            let project = |tree: usize, column: usize, point: CirclePoint<SecureField>| {
+                let log_size = polynomials[tree][column].evals.domain.log_size();
+                point.repeated_double(lifting_log_size - log_size)
+            };
+            let points = members
+                .iter()
+                .flat_map(|&(tree, column)| {
+                    sampled_points[tree][column].iter().map(move |&point| project(tree, column, point))
+                })
+                .unique_by(|point| (point.x, point.y))
+                .collect_vec();
+            let weights = points
+                .iter()
+                .map(|&point| {
+                    let buffer = SecureColumnByCoords {
+                        columns: array::from_fn(|_| {
+                            self.base_column_pool.take_or_alloc(trace_log_size)
+                        }),
+                    };
+                    CircleEvaluation::<B, BaseField, BitReversedOrder>::barycentric_weights_into(
+                        coset, point, buffer,
+                    )
+                })
+                .collect_vec();
+            for batch in members.chunks(SOURCED_BATCH) {
+                let expand = |&(tree, column): &(usize, usize)| {
+                    let source = polynomials[tree][column].source.as_ref().unwrap();
+                    CircleEvaluation::<B, BaseField, BitReversedOrder>::new(
+                        coset.circle_domain(),
+                        source_column::<B>(source.as_ref()),
+                    )
+                };
+                #[cfg(feature = "parallel")]
+                let evaluations: Vec<_> = batch.par_iter().map(expand).collect();
+                #[cfg(not(feature = "parallel"))]
+                let evaluations: Vec<_> = batch.iter().map(expand).collect();
+                // Every column of the batch is evaluated at every point of its size in one pass
+                // over that point's weights; a column reads only the points it samples.
+                let evaluations = evaluations.iter().collect_vec();
+                for (point, weights) in points.iter().zip(&weights) {
+                    let values = B::barycentric_eval_group(&evaluations, weights);
+                    for (&(tree, column), value) in batch.iter().zip(values) {
+                        for (sample, &sampled) in
+                            samples[tree][column].iter_mut().zip(&sampled_points[tree][column])
+                        {
+                            if project(tree, column, sampled) == *point {
+                                sample.value = value;
+                            }
+                        }
+                    }
+                }
+            }
+            for weight in weights {
+                for column in weight.columns {
+                    self.base_column_pool.give_back(trace_log_size, column);
+                }
             }
         }
         samples
@@ -388,10 +463,17 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         channel.mix_felts(&sampled_values.clone().flatten_cols());
 
         let columns = self.evaluations();
+        // Columns that store no values regrow their stripe 0 in bounded batches.
+        let polynomials = self.polynomials();
+        let quotient_twiddles = self.twiddles;
+        let regrow = |tree: usize, column: usize| {
+            polynomials[tree][column].stripe0(quotient_twiddles).into_owned()
+        };
         print_column_size_histogram::<B, MC>(&columns);
         // Compute oods quotients for boundary constraints on the sampled points.
-        let quotients = compute_fri_quotients(
+        let quotients = compute_fri_quotients_with_regrowth(
             &columns,
+            Some(&regrow),
             &samples,
             channel.draw_secure_felt(),
             lifting_log_size,
@@ -457,6 +539,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             if let MaybeOwned::Owned(tree) = tree {
                 for poly in tree.polynomials.drain(..) {
                     // A striped column holds only a prefix of its domain.
+                    // A column with a source holds no values.
+                    if poly.evals.values.is_empty() {
+                        continue;
+                    }
                     let log_size = poly.evals.values.len().ilog2();
                     self.base_column_pool.give_back(log_size, poly.evals.values);
                 }
@@ -561,6 +647,56 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         base_column_pool: &BaseColumnPool<B>,
         keep_coefficients: bool,
     ) -> Self {
+        let n_columns = polynomials.len();
+        Self::new_ex_with_sources(
+            polynomials,
+            log_blowup_factor,
+            twiddles,
+            store_polynomials_coefficients,
+            lifting_log_size,
+            base_column_pool,
+            keep_coefficients,
+            vec![None; n_columns],
+        )
+    }
+
+    /// [`Self::new`] for a tree whose columns' trace values can be reproduced on demand: a
+    /// striped column with a source in `sources` keeps nothing but the source (no stripe and no
+    /// coefficients), and is regrown from it where it is read. A tree that is not striped ignores
+    /// the sources.
+    pub fn new_with_sources(
+        polynomials: ColumnVec<CircleCoefficients<B>>,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<B>,
+        store_polynomials_coefficients: bool,
+        lifting_log_size: u32,
+        base_column_pool: &BaseColumnPool<B>,
+        sources: Vec<Option<SharedTraceSource>>,
+    ) -> Self {
+        Self::new_ex_with_sources(
+            polynomials,
+            log_blowup_factor,
+            twiddles,
+            store_polynomials_coefficients,
+            lifting_log_size,
+            base_column_pool,
+            false,
+            sources,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_ex_with_sources(
+        polynomials: ColumnVec<CircleCoefficients<B>>,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<B>,
+        store_polynomials_coefficients: bool,
+        lifting_log_size: u32,
+        base_column_pool: &BaseColumnPool<B>,
+        keep_coefficients: bool,
+        sources: Vec<Option<SharedTraceSource>>,
+    ) -> Self {
+        assert_eq!(sources.len(), polynomials.len());
         if B::STRIPES && can_stripe(&polynomials, log_blowup_factor, lifting_log_size) {
             return Self::new_striped(
                 polynomials,
@@ -569,6 +705,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 lifting_log_size,
                 base_column_pool,
                 keep_coefficients,
+                sources,
             );
         }
         let span = span!(Level::INFO, "Extension").entered();
@@ -610,6 +747,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         lifting_log_size: u32,
         base_column_pool: &BaseColumnPool<B>,
         keep_coef: bool,
+        sources: Vec<Option<SharedTraceSource>>,
     ) -> Self {
         let _span = span!(Level::INFO, "Striped extension and Merkle").entered();
         // Each stripe is committed as `2^sub` blocks, so that the scratch of every column is a
@@ -623,6 +761,15 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .map(|poly| CanonicCoset::new(poly.log_size() + log_blowup_factor).circle_domain())
             .collect_vec();
         let prefix = domains.iter().map(|&domain| keeps_prefix(domain, log_blowup_factor)).collect_vec();
+        // A prefix column with a source keeps nothing but the source: every stripe of it, stripe 0
+        // included, is hashed from its scratch column.
+        let sourced = prefix
+            .iter()
+            .zip(&sources)
+            .map(|(&prefix, source): (&bool, &Option<SharedTraceSource>)| {
+                prefix && !keep_coef && source.is_some()
+            })
+            .collect_vec();
         // With `keep_coef`, a prefix column keeps its coefficients instead of stripe 0 (the same size):
         // composition and the samples read coefficients, and stripe 0 is evaluated back only for
         // the quotients (`coefficients_to_striped`).
@@ -632,8 +779,9 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .iter()
             .zip(&domains)
             .zip(&prefix)
-            .map(|((poly, &domain), &prefix)| {
-                if prefix && keep_coef {
+            .zip(&sourced)
+            .map(|(((poly, &domain), &prefix), &sourced)| {
+                if (prefix && keep_coef) || sourced {
                     Col::<B, BaseField>::zeros(0)
                 } else if prefix {
                     base_column_pool.take_or_alloc(poly.log_size())
@@ -659,14 +807,17 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 // Stripe 0 is written in place, so the prefix columns' scratch is dead: free it
                 // first.
                 for (i, column) in scratch.iter_mut().enumerate() {
-                    if prefix[i] {
+                    if prefix[i] && !sourced[i] {
                         drop(std::mem::replace(column, Col::<B, BaseField>::zeros(0)));
                     }
                 }
                 base_column_pool.release_all_idle();
             }
-            let fill = |((((poly, &domain), &prefix), eval), column): (
-                (((&Option<CircleCoefficients<B>>, &CircleDomain), &bool), &mut Col<B, BaseField>),
+            let fill = |(((((poly, &domain), &prefix), &sourced), eval), column): (
+                (
+                    (((&Option<CircleCoefficients<B>>, &CircleDomain), &bool), &bool),
+                    &mut Col<B, BaseField>,
+                ),
                 &mut Col<B, BaseField>,
             )| {
                 let poly = poly.as_ref().unwrap();
@@ -677,10 +828,10 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                     B::evaluate_block_into(poly, domain, twiddles, poly.log_size() - sub, stripe, column);
                 } else if sub > 0 {
                     B::evaluate_block_into(poly, domain, twiddles, poly.log_size() - sub, stripe, column);
-                    if stripe < n_first {
+                    if stripe < n_first && !sourced {
                         B::copy_block(column, 0, eval, stripe * len, len);
                     }
-                } else if stripe == 0 {
+                } else if stripe == 0 && !sourced {
                     B::evaluate_stripe_into(poly, domain, twiddles, 0, eval);
                 } else {
                     B::evaluate_stripe_into(poly, domain, twiddles, stripe, column);
@@ -693,6 +844,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                     .par_iter()
                     .zip(domains.par_iter())
                     .zip(prefix.par_iter())
+                    .zip(sourced.par_iter())
                     .zip(evals.par_iter_mut())
                     .zip(scratch.par_iter_mut())
                     .for_each(fill);
@@ -702,12 +854,17 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 .iter()
                 .zip(&domains)
                 .zip(&prefix)
+                .zip(&sourced)
                 .zip(evals.iter_mut())
                 .zip(scratch.iter_mut())
                 .for_each(fill);
             let columns = (0..coeffs.len())
                 .map(|i| {
-                    if prefix[i] && stripe == 0 && sub == 0 && !keep_coef { &evals[i] } else { &scratch[i] }
+                    if prefix[i] && !sourced[i] && stripe == 0 && sub == 0 && !keep_coef {
+                        &evals[i]
+                    } else {
+                        &scratch[i]
+                    }
                 })
                 .sorted_by_key(|column| column.len())
                 .collect_vec();
@@ -748,7 +905,11 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .into_iter()
             .zip(domains)
             .zip(evals)
-            .map(|((coeffs, domain), values)| {
+            .zip(sources.into_iter().zip(sourced))
+            .map(|(((coeffs, domain), values), (source, sourced))| {
+                if sourced {
+                    return Poly::from_source(domain, source.unwrap());
+                }
                 // (A column that kept its coefficients holds no evaluation yet.)
                 let mut evals = CircleEvaluation::new(
                     CanonicCoset::new(1).circle_domain(),
@@ -824,7 +985,10 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         // stripe 0 (TILE, with the Q722 weighted-sum tail), without regrowing its coefficients.
         // The rows of `positions` in one column, read from its stripes as the tree lifts them.
         let read_rows = |poly: &Poly<B>| -> Vec<BaseField> {
-            if poly.coeffs.is_none() && poly.evals.values.len() < poly.evals.domain.size() {
+            if poly.coeffs.is_none()
+                && !poly.is_sourced()
+                && poly.evals.values.len() < poly.evals.domain.size()
+            {
                 let log_size = poly.evals.domain.log_size() - log_blowup_factor;
                 let resident = poly.evals.values.len() >> log_size;
                 let targets = stripes
@@ -915,6 +1079,10 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         })
     }
 }
+
+/// The most columns without stored values whose trace values are expanded at once when they are
+/// sampled out of domain.
+const SOURCED_BATCH: usize = 16;
 
 /// Whether a column of `domain` keeps only stripe 0 of its extension in a striped
 /// tree. Small columns keep it whole: some CPU paths read their whole extension.

@@ -6,7 +6,7 @@ use crate::core::air::{Component, Components};
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::TreeVec;
-use crate::core::poly::circle::CircleDomain;
+use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::prover::CirclePoint;
 use crate::prover::air::accumulation::{DomainEvaluationAccumulator, EvaluationMode};
 use crate::prover::backend::{Backend, Col, Column};
@@ -37,12 +37,35 @@ pub struct Trace<'a, B: Backend> {
     pub twiddles: Option<&'a TwiddleTree<B>>,
 }
 
+/// The values of a committed column on its trace domain (the canonic coset of the coefficients'
+/// size), in bit-reversed order, reproduced on demand from the data the column was generated
+/// from. They determine the column's polynomial exactly, as stripe 0 of its extension does, so a
+/// striped column that has a source keeps no stripe at all.
+pub trait TraceSource: Send + Sync {
+    /// The log size of the trace domain.
+    fn log_size(&self) -> u32;
+    /// Writes the column's values on its trace domain, in bit-reversed order, into `dst`, of
+    /// length `2^log_size`.
+    fn write_values(&self, dst: &mut [BaseField]);
+}
+
+/// A shared [`TraceSource`].
+pub type SharedTraceSource = std::sync::Arc<dyn TraceSource>;
+
+/// The values of `source` on its trace domain, in bit-reversed order, as a column.
+pub fn source_column<B: Backend>(source: &dyn TraceSource) -> Col<B, BaseField> {
+    Col::<B, BaseField>::from_fill(1 << source.log_size(), &|dst| source.write_values(dst))
+}
+
 /// A struct for representing a polynomial corresponding to a trace column.
 /// A polynomial is defined by it's evaluations on a circle domain of size at least it's degree,
 /// and optionally its coefficients in the FFT basis.
+///
+/// A column with a [`TraceSource`] stores no evaluation values: `evals` keeps only its domain.
 pub struct Poly<B: Backend> {
     pub coeffs: Option<CircleCoefficients<B>>,
     pub evals: CircleEvaluation<B, BaseField, BitReversedOrder>,
+    pub source: Option<SharedTraceSource>,
 }
 
 impl<B: Backend> Poly<B> {
@@ -50,7 +73,45 @@ impl<B: Backend> Poly<B> {
         coeffs: Option<CircleCoefficients<B>>,
         evals: CircleEvaluation<B, BaseField, BitReversedOrder>,
     ) -> Self {
-        Self { coeffs, evals }
+        Self { coeffs, evals, source: None }
+    }
+
+    /// A column that stores no evaluation values and reproduces them from `source`.
+    pub fn from_source(domain: CircleDomain, source: SharedTraceSource) -> Self {
+        // The evaluation keeps only the domain; it is built on a placeholder of matching size.
+        let mut evals = CircleEvaluation::new(
+            CanonicCoset::new(1).circle_domain(),
+            Col::<B, BaseField>::zeros(2),
+        );
+        evals.values = Col::<B, BaseField>::zeros(0);
+        evals.domain = domain;
+        Self { coeffs: None, evals, source: Some(source) }
+    }
+
+    /// Whether the column keeps neither its coefficients nor any of its evaluation values, and
+    /// reproduces them from its [`TraceSource`].
+    pub fn is_sourced(&self) -> bool {
+        self.coeffs.is_none() && self.source.is_some() && self.evals.values.is_empty()
+    }
+
+    /// Stripe 0 of the column's extension (its evaluation on the first subdomain of the
+    /// coefficients' size): borrowed where it is stored, regrown where the column has a source.
+    pub fn stripe0(
+        &self,
+        twiddles: &TwiddleTree<B>,
+    ) -> std::borrow::Cow<'_, CircleEvaluation<B, BaseField, BitReversedOrder>> {
+        if !self.is_sourced() {
+            return std::borrow::Cow::Borrowed(&self.evals);
+        }
+        let coeffs = self.regrown_coefficients();
+        let mut values = Col::<B, BaseField>::zeros(1 << coeffs.log_size());
+        B::evaluate_stripe_into(&coeffs, self.evals.domain, twiddles, 0, &mut values);
+        let mut evals = CircleEvaluation::new(
+            CanonicCoset::new(coeffs.log_size()).circle_domain(),
+            values,
+        );
+        evals.domain = self.evals.domain;
+        std::borrow::Cow::Owned(evals)
     }
 
     pub fn eval_at_point(
@@ -77,6 +138,17 @@ impl<B: Backend> Poly<B> {
     /// The coefficients of a striped column that holds only stripe 0 (its evaluation on the
     /// first subdomain of the coefficients' size), interpolated from it.
     pub fn regrown_coefficients(&self) -> CircleCoefficients<B> {
+        if self.is_sourced() {
+            // The trace values interpolate to the same polynomial as stripe 0 does.
+            let source = self.source.as_ref().unwrap();
+            let domain = CanonicCoset::new(source.log_size()).circle_domain();
+            let twiddles = B::subdomain_twiddles(domain.half_coset);
+            return CircleEvaluation::<B, BaseField, BitReversedOrder>::new(
+                domain,
+                source_column::<B>(source.as_ref()),
+            )
+            .interpolate_with_twiddles(&twiddles);
+        }
         let log_blowup_factor = self.evals.domain.log_size() - self.evals.values.len().ilog2();
         let subdomain = self.evals.domain.split(log_blowup_factor).0;
         let sub_twiddles = B::subdomain_twiddles(subdomain.half_coset);
@@ -87,6 +159,9 @@ impl<B: Backend> Poly<B> {
     /// [`Self::regrown_coefficients`], interpolating stripe 0 in its own buffer, which the column
     /// gives up.
     pub fn take_regrown_coefficients(&mut self) -> CircleCoefficients<B> {
+        if self.is_sourced() {
+            return self.regrown_coefficients();
+        }
         let log_blowup_factor = self.evals.domain.log_size() - self.evals.values.len().ilog2();
         let subdomain = self.evals.domain.split(log_blowup_factor).0;
         let sub_twiddles = B::subdomain_twiddles(subdomain.half_coset);

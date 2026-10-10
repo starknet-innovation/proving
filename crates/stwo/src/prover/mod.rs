@@ -10,7 +10,9 @@ use crate::core::verifier::PREPROCESSED_TRACE_IDX;
 use crate::prover::backend::BackendForChannel;
 
 mod air;
-pub use air::component_prover::{ComponentProver, ComponentProvers, Poly, Trace};
+pub use air::component_prover::{
+    ComponentProver, ComponentProvers, Poly, SharedTraceSource, Trace, TraceSource,
+};
 pub use air::{AccumulationOps, ColumnAccumulator, DomainEvaluationAccumulator, EvaluationMode};
 pub mod pcs;
 pub use pcs::quotient_ops::QuotientOps;

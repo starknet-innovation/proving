@@ -646,6 +646,63 @@ impl PreProcessedTrace {
     }
 }
 
+/// The `index`-th column of a [`PreProcessedTrace`], as the trace values a committed column
+/// reproduces on demand instead of keeping a stripe of its extension: the same values, in the same
+/// order, as that column of [`PreProcessedTrace::get_trace`].
+#[cfg(feature = "prover")]
+pub struct PreprocessedColumnSource {
+    trace: Arc<PreProcessedTrace>,
+    index: usize,
+}
+
+#[cfg(feature = "prover")]
+impl PreprocessedColumnSource {
+    /// A source for every column of `trace`, in the order of [`PreProcessedTrace::get_trace`].
+    pub fn all(trace: &Arc<PreProcessedTrace>) -> Vec<stwo::prover::SharedTraceSource> {
+        (0..trace.n_columns())
+            .map(|index| {
+                Arc::new(Self { trace: trace.clone(), index }) as stwo::prover::SharedTraceSource
+            })
+            .collect()
+    }
+
+    fn column(&self) -> &CompactColumn {
+        self.trace.columns.get_index(self.index).expect("the column exists").1
+    }
+}
+
+#[cfg(feature = "prover")]
+impl stwo::prover::TraceSource for PreprocessedColumnSource {
+    fn log_size(&self) -> u32 {
+        self.column().len().ilog2()
+    }
+
+    fn write_values(&self, dst: &mut [BaseField]) {
+        // The same `BaseField::from(usize)` conversion as `CompactColumn::to_field_column`.
+        let column = self.column();
+        assert_eq!(dst.len(), column.len());
+        match column {
+            CompactColumn::Narrow(values) => {
+                for (value, &narrow) in dst.iter_mut().zip(values) {
+                    *value = BaseField::from(
+                        usize::try_from(narrow).expect("value originally fit usize"),
+                    );
+                }
+            }
+            CompactColumn::Wide(values) => {
+                for (value, &wide) in dst.iter_mut().zip(values) {
+                    *value = BaseField::from(wide);
+                }
+            }
+            _ => {
+                for (row, value) in dst.iter_mut().enumerate() {
+                    *value = BaseField::from(column.at(row));
+                }
+            }
+        }
+    }
+}
+
 /// A finalized circuit ready for proving: its fixed preprocessed trace together with the
 /// parameters derived from the circuit's structure.
 #[derive(Debug, PartialEq)]
