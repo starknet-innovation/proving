@@ -445,6 +445,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         self.base_column_pool.release_all_idle();
 
         self.coefficients_to_striped();
+        crate::prover::backend::simd::column::trim_heap();
         // Point samples are complete; subsequent quotient and opening paths use evaluations.
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
@@ -480,10 +481,14 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             self.twiddles,
             self.config.fri_config.log_blowup_factor,
         );
+        // The quotients' freed accumulations stay in glibc's arenas under FRI and the
+        // decommitment unless they are handed back.
+        crate::prover::backend::simd::column::trim_heap();
 
         // Run FRI commitment phase on the oods quotients.
         let fri_prover =
             FriProver::<B, MC>::commit(channel, self.config.fri_config, &quotients, self.twiddles);
+        crate::prover::backend::simd::column::trim_heap();
 
         // Proof of work.
         let span1 = span!(Level::INFO, "Grind", class = "Queries POW").entered();
@@ -750,6 +755,9 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         sources: Vec<Option<SharedTraceSource>>,
     ) -> Self {
         let _span = span!(Level::INFO, "Striped extension and Merkle").entered();
+        // The witness and interaction writers leave freed temporaries in glibc's arenas: hand
+        // them back before the scratch of the commitment is taken.
+        crate::prover::backend::simd::column::trim_heap();
         // Each stripe is committed as `2^sub` blocks, so that the scratch of every column is a
         // block, not a stripe. The tree is the same: its leaves are rows.
         let sub = 1u32
@@ -884,6 +892,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             }
         }
         base_column_pool.release_all_idle();
+        crate::prover::backend::simd::column::trim_heap();
         let stripe_layers = stripe_layers.into_iter().map(Option::unwrap).collect_vec();
 
         // Level `l` of the tree, up to the stripes' roots, is the concatenation of the stripes'

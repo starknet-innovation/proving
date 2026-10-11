@@ -80,7 +80,8 @@ pub struct RecursiveProverPrecomputes {
     /// resident while that proof runs, its columns reuse that proof's idle buffers, and the
     /// circuit proof needs them only when it starts.
     pub circuit_preprocessed_tree: std::mem::ManuallyDrop<LazyCommitmentTree>,
-    pub preprocessed_circuit: std::mem::ManuallyDrop<PreprocessedCircuit>,
+    /// Built on first use, after the Cairo proof (see [`LazyPreprocessedCircuit`]).
+    pub preprocessed_circuit: std::mem::ManuallyDrop<Arc<LazyPreprocessedCircuit>>,
     pub circuit_config: CircuitConfig,
     pub proof_config: ProofConfig,
 }
@@ -109,6 +110,32 @@ impl std::ops::Deref for LazyCommitmentTree {
         self.tree.get_or_init(|| {
             let build = self.build.lock().unwrap().take().expect("the tree is built once");
             build()
+        })
+    }
+}
+
+/// The circuit's preprocessing, built the first time it is dereferenced: the Cairo proof never
+/// reads it, so it is not resident under the Cairo leg's peak, and the circuit proof builds it
+/// while the verifier circuit is filled (see `pvfast_workload.rs`).
+pub struct LazyPreprocessedCircuit {
+    circuit: std::sync::OnceLock<PreprocessedCircuit>,
+}
+
+impl LazyPreprocessedCircuit {
+    fn new() -> Self {
+        Self { circuit: std::sync::OnceLock::new() }
+    }
+}
+
+impl std::ops::Deref for LazyPreprocessedCircuit {
+    type Target = PreprocessedCircuit;
+
+    fn deref(&self) -> &PreprocessedCircuit {
+        self.circuit.get_or_init(|| {
+            let _span = span!(Level::INFO, "prepare_preprocessed_circuit").entered();
+            let cairo_verifier_config =
+                get_cairo_verifier_config().expect("the Cairo verifier config was built at setup");
+            get_cairo_preprocessed_circuit(&cairo_verifier_config)
         })
     }
 }
@@ -175,50 +202,47 @@ pub fn prepare_recursive_prover_precomputes()
 
     let max_domain_size = max(cairo_lifting_log_size, circuit_lifting_log_size);
 
-    // The circuit-side preprocessing is sequential and independent of the Cairo-side twiddles,
-    // preprocessed trace and tree, so the two run concurrently.
-    let (preprocessed_circuit, (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)) =
-        rayon::join(
-            || get_cairo_preprocessed_circuit(&cairo_verifier_config),
+    // The circuit's preprocessing is built on first use, after the Cairo proof.
+    let preprocessed_circuit = Arc::new(LazyPreprocessedCircuit::new());
+    let (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree) = {
+        // The twiddles and the Cairo preprocessed trace are independent as well.
+        let (twiddles, cairo_preprocessed_trace) = rayon::join(
             || {
-                // The twiddles and the Cairo preprocessed trace are independent as well.
-                let (twiddles, cairo_preprocessed_trace) = rayon::join(
-                    || {
-                        info!("Prepare the twiddles");
-                        SimdBackend::precompute_twiddles(
-                            CanonicCoset::new(max_domain_size).circle_domain().half_coset,
-                        )
-                    },
-                    || {
-                        info!("Prepare the cairo prover preprocessed trace");
-                        let cairo_preprocessed_trace = Arc::new(
-                            CAIRO_PROVER_PARAMS.preprocessed_trace.to_preprocessed_trace(),
-                        );
-                        // Warm the Pedersen points table before the Cairo leg's gen_trace reads it.
-                        warm_pedersen_pp_trace(CAIRO_PROVER_PARAMS.preprocessed_trace);
-                        cairo_preprocessed_trace
-                    },
+                info!("Prepare the twiddles");
+                SimdBackend::precompute_twiddles(
+                    CanonicCoset::new(max_domain_size).circle_domain().half_coset,
+                )
+            },
+            || {
+                info!("Prepare the cairo prover preprocessed trace");
+                let cairo_preprocessed_trace = Arc::new(
+                    CAIRO_PROVER_PARAMS.preprocessed_trace.to_preprocessed_trace(),
                 );
-                // The Cairo preprocessed tree is left empty: the Cairo leg builds it, owned, and frees it
-                // before the circuit leg, which never reads it (see `prove_cairo_with_precompute`).
-                let cairo_preprocessed_tree = PrecomputedTree {
-                    polynomials: vec![],
-                    commitment: MerkleProverLifted { layers: vec![] },
-                };
-                (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)
+                // Warm the Pedersen points table before the Cairo leg's gen_trace reads it.
+                warm_pedersen_pp_trace(CAIRO_PROVER_PARAMS.preprocessed_trace);
+                cairo_preprocessed_trace
             },
         );
+        // The Cairo preprocessed tree is left empty: the Cairo leg builds it, owned, and frees it
+        // before the circuit leg, which never reads it (see `prove_cairo_with_precompute`).
+        let cairo_preprocessed_tree = PrecomputedTree {
+            polynomials: vec![],
+            commitment: MerkleProverLifted { layers: vec![] },
+        };
+        (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)
+    };
 
     info!("Prepare the circuit prover preprocessed trace and tree (built on first use)");
     let base_column_pool = Arc::new(base_column_pool);
     let twiddles = Arc::new(twiddles);
     let circuit_preprocessed_tree = {
-        let preprocessed_trace = preprocessed_circuit.preprocessed_trace.clone();
+        let preprocessed_circuit = preprocessed_circuit.clone();
         let twiddles = twiddles.clone();
         let base_column_pool = base_column_pool.clone();
         let preprocessed_lifting_log_size = circuit_config.config.preprocessed_lifting_log_size;
         LazyCommitmentTree::new(move || {
             let _span = span!(Level::INFO, "prepare_circuit_preprocessed_tree").entered();
+            let preprocessed_trace = preprocessed_circuit.preprocessed_trace.clone();
             let circuit_preprocessed_trace = preprocessed_trace.get_trace::<SimdBackend>();
             let circuit_preprocessed_trace_polys =
                 SimdBackend::interpolate_columns(circuit_preprocessed_trace, &twiddles);

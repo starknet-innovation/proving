@@ -73,6 +73,9 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     tree_builder.extend_polys(right_comp_poly_half.into_coordinate_polys());
     tree_builder.commit(channel);
     span.exit();
+    // Composition's freed block temporaries stay in glibc's arenas under the samples and the
+    // quotients unless they are handed back.
+    crate::prover::backend::simd::column::trim_heap();
 
     // Draw OODS point.
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);

@@ -5,7 +5,7 @@ use itertools::{Itertools, zip_eq};
 use num_traits::Zero;
 #[cfg(feature = "parallel")]
 use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator,
 };
 
 use super::SimdBackend;
@@ -123,7 +123,22 @@ impl QuotientOps for SimdBackend {
             unsafe { SecureColumnByCoords::uninitialized(1 << subdomain_log_size) };
         let sample_points: Vec<CirclePoint<SecureField>> =
             accumulations.iter().map(|x| x.sample_point).collect();
-        let denominators_inverses = denominator_inverses(&sample_points, eval_subdomain);
+        // The denominators are inverted a chunk at a time inside the loop below (one batch
+        // inversion per chunk for every sample point), instead of one whole-subdomain column of
+        // inverses per sample point: the inverses are the same field elements, and the columns
+        // (8 bytes per row and sample point) are never resident. Mechanism: lead rgr1_fec78ebb
+        // (FRI denominators inverted per chunk).
+        let sample_coords: Vec<[PackedCM31; 4]> = sample_points
+            .iter()
+            .map(|point| {
+                [
+                    PackedCM31::broadcast(point.x.0),
+                    PackedCM31::broadcast(point.y.0),
+                    PackedCM31::broadcast(point.x.1),
+                    PackedCM31::broadcast(point.y.1),
+                ]
+            })
+            .collect();
 
         // Precompute values needed inside the loop.
         let log_ratios: Vec<u32> = accumulations
@@ -149,9 +164,17 @@ impl QuotientOps for SimdBackend {
             let mut chunk_acc = [PackedSecureField::zero(); COMBINE_CHUNK_SIZE];
             let chunk_acc = &mut chunk_acc[..packed_chunk_len];
 
+            let mut denominators = Vec::with_capacity(sample_coords.len() * packed_chunk_len);
+            for [prx, pry, pix, piy] in &sample_coords {
+                for points in &subdomain_points[chunk_start..chunk_start + packed_chunk_len] {
+                    denominators.push((*prx - points.x) * *piy - (*pry - points.y) * *pix);
+                }
+            }
+            let chunk_inverses = PackedCM31::batch_inverse(&denominators);
+
             for (((acc, den_inv), log_ratio), first_linear_term) in accumulations
                 .iter()
-                .zip_eq(denominators_inverses.iter())
+                .zip_eq(chunk_inverses.chunks(packed_chunk_len))
                 .zip_eq(log_ratios.iter())
                 .zip_eq(first_linear_terms.iter())
             {
@@ -170,7 +193,7 @@ impl QuotientOps for SimdBackend {
 
                     let numerator = lifted_partial_numerator
                         - *first_linear_term * subdomain_points[domain_idx].y;
-                    *accumulator += numerator * den_inv[domain_idx];
+                    *accumulator += numerator * den_inv[i];
                 }
             }
 
@@ -182,7 +205,7 @@ impl QuotientOps for SimdBackend {
         });
         // Numerator and denominator scratch is dead before the larger-domain extension.
         drop(accumulations);
-        drop(denominators_inverses);
+        drop(sample_coords);
         drop(subdomain_points);
         drop(sample_points);
         drop(log_ratios);
@@ -357,36 +380,6 @@ fn accumulate_numerators_on_subdomain(
         }
     });
     values
-}
-
-fn denominator_inverses(
-    sample_points: &[CirclePoint<SecureField>],
-    domain: CircleDomain,
-) -> Vec<Vec<PackedCM31>> {
-    let domain_points = CircleDomainBitRevIterator::new(domain);
-
-    #[cfg(not(feature = "parallel"))]
-    let (domain_points_iter, sample_points_iter) = (domain_points, sample_points.iter());
-    #[cfg(feature = "parallel")]
-    let (domain_points_iter, sample_points_iter) =
-        (domain_points.par_iter(), sample_points.par_iter());
-
-    sample_points_iter
-        .map(|sample_point| {
-            // Extract Pr, Pi.
-            let prx = PackedCM31::broadcast(sample_point.x.0);
-            let pry = PackedCM31::broadcast(sample_point.y.0);
-            let pix = PackedCM31::broadcast(sample_point.x.1);
-            let piy = PackedCM31::broadcast(sample_point.y.1);
-
-            // The iter itself is cloned for each sample batch.
-            let denominators = domain_points_iter
-                .clone()
-                .map(|points| (prx - points.x) * piy - (pry - points.y) * pix)
-                .collect::<Vec<_>>();
-            PackedCM31::batch_inverse(&denominators)
-        })
-        .collect()
 }
 
 #[cfg(test)]

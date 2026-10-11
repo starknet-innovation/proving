@@ -138,6 +138,13 @@ fn get_denom_inv(trace_domain: CanonicCoset, eval_domain: CircleDomain) -> Vec<B
 /// ([`FrameworkComponent::evaluate_in_blocks`]).
 const LOG_N_BLOCKS: u32 = 2;
 
+/// The most bytes of columns that one block of [`FrameworkComponent::evaluate_in_blocks`] holds
+/// (the columns that are not read at a mask offset); a wider component takes more, smaller
+/// blocks.
+const BLOCK_COLUMNS_BYTES: usize = 96 << 20;
+/// At most `2^MAX_LOG_N_BLOCKS` blocks: each block folds every column's coefficients again.
+const MAX_LOG_N_BLOCKS: u32 = 5;
+
 /// The smallest evaluation domain that [`FrameworkComponent::evaluate_in_blocks`] evaluates
 /// block by block; smaller components extend at once, as before.
 const PARITY_MIN_LOG_SIZE: u32 = 20;
@@ -156,7 +163,16 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             && eval_log_size == self.eval.log_size() + 1
             && eval_log_size >= PARITY_MIN_LOG_SIZE
         {
-            return self.evaluate_in_blocks(trace, evaluation_accumulator, LOG_N_BLOCKS);
+            // Enough blocks that one block of the columns evaluated per block stays under
+            // `BLOCK_COLUMNS_BYTES`: the window of a wide component is its blocks' columns.
+            let n_block_columns = self.n_block_columns(trace);
+            let mut log_n_blocks = LOG_N_BLOCKS;
+            while log_n_blocks < MAX_LOG_N_BLOCKS
+                && n_block_columns * (4usize << (eval_log_size - log_n_blocks)) > BLOCK_COLUMNS_BYTES
+            {
+                log_n_blocks += 1;
+            }
+            return self.evaluate_in_blocks(trace, evaluation_accumulator, log_n_blocks);
         }
 
         let ConstraintQuotientInputs { eval_domain, trace_domain, trace, denom_inv } =
@@ -199,6 +215,22 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
 }
 
 impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
+    /// The number of this component's trace columns that [`Self::evaluate_in_blocks`] evaluates
+    /// block by block: those not read at a nonzero mask offset.
+    fn n_block_columns(&self, trace: &Trace<'_, SimdBackend>) -> usize {
+        let component_polys = get_component_polys(self, trace);
+        let mask = self.shifted_columns();
+        component_polys
+            .iter()
+            .enumerate()
+            .map(|(t, polys)| match mask.get(t) {
+                Some(m) if m.len() == polys.len() => m.iter().filter(|&&shifted| !shifted).count(),
+                Some(m) if m.is_empty() && t == PREPROCESSED_TRACE_IDX => polys.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// Adds the constraint quotients of the rows of `col`: every row of the evaluation domain, or
     /// with `window` the rows of a window of a half coset (see
     /// [`SimdDomainEvaluator::window`]), in its natural order.
