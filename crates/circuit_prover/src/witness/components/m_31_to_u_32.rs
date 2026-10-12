@@ -50,12 +50,14 @@ pub fn write_trace(
     let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
     let log_size = size.ilog2();
 
-    let packed_inputs = pack_values(&inputs);
-
+    // The `usize` address columns are converted (and freed) first, and the unpacked inputs are
+    // freed once packed (a8n Q1463).
     let preprocessed_columns = [input_addr_col, output_addr_col, multiplicity_col]
         .into_iter()
         .map(|col| Col::<SimdBackend, M31>::from_iter(col.iter().map(|&x| M31::from(x))).data)
         .collect_vec();
+    let packed_inputs = pack_values(&inputs);
+    drop(inputs);
 
     let (trace, lookup_data, sub_component_inputs) =
         write_trace_simd(packed_inputs, preprocessed_columns);

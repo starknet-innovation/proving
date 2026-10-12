@@ -91,7 +91,7 @@ fn write_trace_simd(
             let multiplicity_0_col0 = *mults[0].get(row_index).unwrap_or(&PackedM31::zero());
             *row[0] = multiplicity_0_col0;
             *lookup_data.verify_bitwise_xor_4_0 =
-                [M31_45448144, bitwise_xor_4_0, bitwise_xor_4_1, bitwise_xor_4_2];
+                narrow_xor4([M31_45448144, bitwise_xor_4_0, bitwise_xor_4_1, bitwise_xor_4_2]);
             *lookup_data.mults_0 = multiplicity_0_col0;
         },
     );
@@ -101,7 +101,7 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 struct LookupData {
-    verify_bitwise_xor_4_0: Vec<[PackedM31; 4]>,
+    verify_bitwise_xor_4_0: Vec<std::simd::u32x16>,
     mults_0: Vec<PackedM31>,
 }
 
@@ -119,12 +119,12 @@ impl InteractionClaimGenerator {
         let mut col_gen = logup_gen.new_col();
         (
             col_gen.par_iter_mut(),
-            &self.lookup_data.verify_bitwise_xor_4_0,
+            self.lookup_data.verify_bitwise_xor_4_0.par_iter().map(|&w| widen_xor4(w, 45448144)),
             self.lookup_data.mults_0,
         )
             .into_par_iter()
             .for_each(|(writer, values, mult)| {
-                let denom = common_lookup_elements.combine(values);
+                let denom = common_lookup_elements.combine(&values);
                 writer.write_frac((-mult).into(), denom);
             });
         col_gen.finalize_col();

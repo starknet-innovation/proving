@@ -67,6 +67,10 @@ pub fn write_trace(
     preprocessed_trace: &PreProcessedTrace,
     trace_generator: &Qm31OpsTraceGenerator,
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, ComponentLogSize, LookupData) {
+    // SCREEN (a8n Q1461): `A8N_QMW=1` writes the trace straight from the context values.
+    if stwo::prover::m11_env("A8N_QMW", 0) != 0 {
+        return write_trace_direct(context_values, preprocessed_trace, trace_generator);
+    }
     let add_flag =
         preprocessed_trace.get_column(&PreProcessedColumnId { id: "qm31_ops_add_flag".to_owned() });
     let sub_flag =
@@ -118,6 +122,41 @@ pub fn write_trace(
     let (trace, lookup_data) = write_trace_simd(packed_inputs, preprocessed_columns);
 
     (trace, log_size, lookup_data)
+}
+
+/// [`write_trace`] without its intermediates: no `usize` preprocessed columns, no row inputs and
+/// no packed copy of them. Each packed row's twelve trace values are read from the context at its
+/// addresses, as [`lookup_tuple`] reads them, and the packed address and multiplicity columns are
+/// the lookup data itself. The unused operation flags are not read.
+fn write_trace_direct(
+    context_values: &[QM31],
+    preprocessed_trace: &PreProcessedTrace,
+    trace_generator: &Qm31OpsTraceGenerator,
+) -> (ComponentTrace<N_TRACE_COLUMNS>, ComponentLogSize, LookupData) {
+    let packed =
+        |id: &str| preprocessed_trace.get_packed_column(&PreProcessedColumnId { id: id.to_owned() });
+    let in_0 = packed("qm31_ops_in0_address");
+    let in_1 = packed("qm31_ops_in1_address");
+    let out = packed("qm31_ops_out_address");
+    let mults = packed("qm31_ops_mults");
+    let n_rows = in_0.len() * N_LANES;
+    assert_ne!(n_rows, 0);
+    assert!(n_rows.is_power_of_two());
+    let log_size = n_rows.ilog2();
+    let first_permutation_row = trace_generator.first_permutation_row;
+    assert!(first_permutation_row <= n_rows);
+
+    let mut trace = ComponentTrace::<N_TRACE_COLUMNS>::zeroed(log_size);
+    trace.par_iter_mut().enumerate().for_each(|(row, columns)| {
+        let addresses = [&in_0[row], &in_1[row], &out[row]];
+        for slot in 0..3 {
+            let tuple = lookup_tuple(context_values, first_permutation_row, row, addresses, slot);
+            for k in 0..4 {
+                *columns[4 * slot + k] = tuple[1 + k];
+            }
+        }
+    });
+    (trace, log_size, LookupData { in_0, in_1, out, mults })
 }
 
 fn write_trace_simd(
@@ -181,9 +220,11 @@ fn write_trace_simd(
             *row[10] = out_col10;
             let out_col11 = qm_31_ops_input[2][3];
             *row[11] = out_col11;
-            *lookup_data.in_0 = [in0_address, in0_col0, in0_col1, in0_col2, in0_col3];
-            *lookup_data.in_1 = [in1_address, in1_col4, in1_col5, in1_col6, in1_col7];
-            *lookup_data.out = [out_address, out_col8, out_col9, out_col10, out_col11];
+            // Only the addresses are kept (Q1252): the interaction trace reads the values back
+            // from the context.
+            *lookup_data.in_0 = in0_address;
+            *lookup_data.in_1 = in1_address;
+            *lookup_data.out = out_address;
             *lookup_data.mults = mults;
         });
 
@@ -192,24 +233,63 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 pub struct LookupData {
-    in_0: Vec<[PackedM31; 5]>,
-    in_1: Vec<[PackedM31; 5]>,
-    out: Vec<[PackedM31; 5]>,
+    in_0: Vec<PackedM31>,
+    in_1: Vec<PackedM31>,
+    out: Vec<PackedM31>,
     mults: Vec<PackedM31>,
+}
+
+/// The `[address, value]` lookup tuple of slot `slot` (0 = in0, 1 = in1, 2 = out) of packed row
+/// `row`, its value read back from the context as [`extract_component_inputs`] does: a
+/// permutation row (from `first_permutation_row` on) has a zero in0 value and the value at its
+/// in1 address (even offset) or at its out address (odd offset) in both other slots.
+fn lookup_tuple(
+    context_values: &[QM31],
+    first_permutation_row: usize,
+    row: usize,
+    addresses: [&PackedM31; 3],
+    slot: usize,
+) -> [PackedM31; 5] {
+    let lanes = addresses.map(|a| a.to_array());
+    let mut limbs = [[M31::zero(); N_LANES]; 4];
+    for lane in 0..N_LANES {
+        let i = row * N_LANES + lane;
+        let value = if i < first_permutation_row {
+            context_values[lanes[slot][lane].0 as usize].to_m31_array()
+        } else if slot == 0 {
+            QM31::zero().to_m31_array()
+        } else {
+            let source = if (i - first_permutation_row) % 2 == 0 { 1 } else { 2 };
+            context_values[lanes[source][lane].0 as usize].to_m31_array()
+        };
+        for (k, limb) in limbs.iter_mut().enumerate() {
+            limb[lane] = value[k];
+        }
+    }
+    let [l0, l1, l2, l3] = limbs.map(PackedM31::from_array);
+    [*addresses[slot], l0, l1, l2, l3]
 }
 
 pub fn write_interaction_trace(
     log_size: u32,
     lookup_data: LookupData,
     common_lookup_elements: &relations::CommonLookupElements,
+    context_values: &[QM31],
+    first_permutation_row: usize,
 ) -> (Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>, ClaimedSum) {
     let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(log_size) };
     let tag = PackedM31::broadcast(M31::from(relations::GATE_RELATION_ID));
+    let tuple = |row: usize, slot: usize| {
+        let addresses =
+            [&lookup_data.in_0[row], &lookup_data.in_1[row], &lookup_data.out[row]];
+        lookup_tuple(context_values, first_permutation_row, row, addresses, slot)
+    };
 
     // Sum logup terms in pairs.
     let mut col_gen = logup_gen.new_col();
-    (col_gen.par_iter_mut(), &lookup_data.in_0, &lookup_data.in_1).into_par_iter().for_each(
-        |(writer, values0, values1)| {
+    col_gen.par_iter_mut().enumerate().for_each(
+        |(row, writer)| {
+            let (values0, values1) = (tuple(row, 0), tuple(row, 1));
             let denom0: PackedQM31 = common_lookup_elements
                 .combine(&[tag, values0[0], values0[1], values0[2], values0[3], values0[4]]);
             let denom1: PackedQM31 = common_lookup_elements
@@ -221,11 +301,12 @@ pub fn write_interaction_trace(
 
     // Sum last logup term.
     let mut col_gen = logup_gen.new_col();
-    (col_gen.par_iter_mut(), &lookup_data.out, lookup_data.mults).into_par_iter().for_each(
-        |(writer, values, mults)| {
+    (col_gen.par_iter_mut(), &lookup_data.mults).into_par_iter().enumerate().for_each(
+        |(row, (writer, mults))| {
+            let values = tuple(row, 2);
             let denom = common_lookup_elements
                 .combine(&[tag, values[0], values[1], values[2], values[3], values[4]]);
-            writer.write_frac(-PackedQM31::one() * mults, denom);
+            writer.write_frac(-PackedQM31::one() * *mults, denom);
         },
     );
     col_gen.finalize_col();

@@ -15,6 +15,20 @@ use crate::core::vcs_lifted::verifier::{
 use crate::parallel_iter;
 use crate::prover::backend::{Col, Column};
 
+/// SCREEN (1bm Q1530, Q1503): frees `Q1530_DROP` stored levels above the ones the build left
+/// empty (`layers` from the leaves up); `decommit_from` recomputes them from the leaves. A tree
+/// built in full keeps every level, and the top level is always kept.
+pub fn q1530_drop_levels<T, C: Column<T>>(layers: &mut [C]) {
+    let n_empty = layers.iter().take_while(|layer| layer.len() == 0).count();
+    if n_empty == 0 {
+        return;
+    }
+    let end = (n_empty + crate::prover::m11_env("Q1530_DROP", 0)).min(layers.len() - 1);
+    for layer in &mut layers[n_empty.min(end)..end] {
+        *layer = C::zeros(0);
+    }
+}
+
 /// Represents the prover side of a Merkle commitment scheme.
 #[derive(Debug)]
 pub struct MerkleProverLifted<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> {
@@ -68,7 +82,9 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             assert!(lifting_log_size >= max_log_size, "{lifting_log_size} < {max_log_size}");
             // The lowest layers may be left empty; `decommit` recomputes the hashes it needs
             // from the columns.
-            B::build_layers_sparse(&sorted_columns, lifting_log_size)
+            let mut layers = B::build_layers_sparse(&sorted_columns, lifting_log_size);
+            q1530_drop_levels(&mut layers);
+            layers
         };
         layers.reverse();
 

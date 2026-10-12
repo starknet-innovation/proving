@@ -173,6 +173,42 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         None
     }
 
+    /// SCREEN (f2 Q1653): [`Self::evaluate_from_prefix`] from the column's evaluation `values` on
+    /// the circle domain `source` of size `2^log_size` (not necessarily stripe 0).
+    fn evaluate_from_source(
+        _values: &Col<Self, BaseField>,
+        _log_size: u32,
+        _source: CircleDomain,
+        _domain: CircleDomain,
+        _targets: &[(usize, Vec<usize>)],
+        _scratch: &mut Col<Self, BaseField>,
+    ) -> Option<Vec<Vec<BaseField>>> {
+        None
+    }
+
+    /// SCREEN (f2 Q1660): [`Self::evaluate_from_prefix`] read tile by tile from `prefix` (stripe 0,
+    /// resident), with no scratch of the column's size.
+    fn evaluate_from_prefix_stream(
+        _prefix: &Col<Self, BaseField>,
+        _log_size: u32,
+        _domain: CircleDomain,
+        _targets: &[(usize, Vec<usize>)],
+    ) -> Option<Vec<Vec<BaseField>>> {
+        None
+    }
+
+    /// SCREEN (f2 Q1658): [`Self::evaluate_from_source`] with the values produced tile by tile by
+    /// `fill(start, dst)`, holding no buffer of the column's size.
+    fn evaluate_from_fill(
+        _fill: &dyn Fn(usize, &mut [BaseField]),
+        _log_size: u32,
+        _source: CircleDomain,
+        _domain: CircleDomain,
+        _targets: &[(usize, Vec<usize>)],
+    ) -> Option<Vec<Vec<BaseField>>> {
+        None
+    }
+
     /// Writes the `stripe`-th contiguous block of [`Self::evaluate`]'s output on `domain`, of
     /// the size of `poly`, into `dst`: the evaluation on the `stripe`-th subdomain, which the
     /// extension computes as an independent FFT.

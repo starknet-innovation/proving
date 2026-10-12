@@ -257,7 +257,10 @@ where
     use core::sync::atomic::Ordering;
     use std::sync::atomic::AtomicU64;
 
-    let unit_bits = low_bits.min(GRIND_UNIT_BITS);
+    // SCREEN (r77, n9 GU): `R77_GU=k`: units of `2^k` low nonces (the nonce found is the same).
+    let unit_bits = low_bits.min(
+        GRIND_UNIT_BITS,
+    );
     let log_units_per_hi = low_bits - unit_bits;
     let n_workers = rayon::current_num_threads() as u64;
     let next_unit = AtomicU64::new(n_workers);

@@ -164,8 +164,8 @@ where
     );
     mix_circuit_hash(channel, &circuit_hash);
     claim.mix_into(channel);
-    drop(released_values);
     tree_builder.commit(channel);
+    stwo::prover::trim_heap();
 
     // Draw interaction elements.
     let interaction_pow_nonce = SimdBackend::grind(channel, INTERACTION_POW_BITS);
@@ -180,13 +180,18 @@ where
         &mut tree_builder,
         &interaction_elements,
         twiddles,
+        values,
+        trace_generator.qm31_ops_trace_generator.first_permutation_row,
     );
+    // Q1252: qm31_ops' interaction reads its values back from the context, so they live to here.
+    drop(released_values);
 
     // Validate lookup argument.
     assert_eq!(lookup_sum(&claim, &interaction_claim, &interaction_elements), QM31::zero());
 
     interaction_claim.mix_into(channel);
     tree_builder.commit(channel);
+    stwo::prover::trim_heap();
     // Component provers.
     let circuit_components = CircuitComponents::new(
         &interaction_elements,

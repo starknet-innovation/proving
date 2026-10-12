@@ -63,8 +63,11 @@ pub(crate) fn advise_pages<T>(data: &[T], populate: bool) {
     const MADV_HUGEPAGE: core::ffi::c_int = 14;
     const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
     let (start, len) = whole_pages(data.as_ptr() as usize, std::mem::size_of_val(data));
-    advise_range(start, len, MADV_HUGEPAGE);
-    if populate {
+    // SCREEN (a8n Q1452/Q1453): `A8N_NOTHP` / `A8N_NOPOP` drop the hint.
+    if crate::prover::m11_env("A8N_NOTHP", 0) == 0 {
+        advise_range(start, len, MADV_HUGEPAGE);
+    }
+    if populate && crate::prover::m11_env("A8N_NOPOP", 0) == 0 {
         advise_range(start, len, MADV_POPULATE_WRITE);
     }
 }

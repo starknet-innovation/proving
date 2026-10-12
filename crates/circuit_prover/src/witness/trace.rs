@@ -317,6 +317,8 @@ pub fn write_interaction_trace<MC: MerkleChannel>(
     tree_builder: &mut TreeBuilder<'_, '_, SimdBackend, MC>,
     interaction_elements: &CircuitInteractionElements,
     twiddles: &TwiddleTree<SimdBackend>,
+    context_values: &[QM31],
+    first_permutation_row: usize,
 ) -> CircuitInteractionClaim
 where
     SimdBackend: BackendForChannel<MC>,
@@ -348,9 +350,19 @@ where
     // temporaries do not coexist with theirs.
     let (trace, claim) =
         blake_g_gate.write_interaction_trace(&interaction_elements.common_lookup_elements);
-    all_polys.blake_g_gate = SimdBackend::interpolate_columns(trace, twiddles);
     claimed_sums.blake_g_gate = claim.claimed_sum;
-    scope(|s| {
+    // SCREEN (r77, d9x ISEQI): `R77_ISEQI=1` interpolates the blake gate's trace while the other
+    // components' traces are written.
+    let iseqi = true;
+    let mut blake_trace = Some(trace);
+    if !iseqi {
+        all_polys.blake_g_gate =
+            SimdBackend::interpolate_columns(blake_trace.take().unwrap(), twiddles);
+    }
+    let mut blake_polys = None;
+    let blake_interpolation =
+        blake_trace.map(|trace| move || SimdBackend::interpolate_columns(trace, twiddles));
+    let others = || scope(|s| {
 
         s.spawn(|_| {
             let (trace, claimed_sum) = eq::write_interaction_trace(
@@ -366,6 +378,8 @@ where
                 qm31_ops_log_size,
                 qm31_ops_lookup_data,
                 &interaction_elements.common_lookup_elements,
+                context_values,
+                first_permutation_row,
             );
             all_polys.qm31_ops = SimdBackend::interpolate_columns(trace, twiddles);
             claimed_sums.qm31_ops = claimed_sum;
@@ -419,6 +433,13 @@ where
             claimed_sums.range_check_16 = claim.claimed_sum;
         });
     });
+    match blake_interpolation {
+        Some(interpolate) => blake_polys = Some(rayon::join(interpolate, others).0),
+        None => others(),
+    }
+    if let Some(polys) = blake_polys {
+        all_polys.blake_g_gate = polys;
+    }
 
     // Commit the interaction columns.
     for polys in all_polys.into_array() {

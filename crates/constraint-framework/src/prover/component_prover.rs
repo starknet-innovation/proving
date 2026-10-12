@@ -136,7 +136,7 @@ fn get_denom_inv(trace_domain: CanonicCoset, eval_domain: CircleDomain) -> Vec<B
 
 /// Windowed components are evaluated over `2^LOG_N_BLOCKS` blocks of the evaluation domain
 /// ([`FrameworkComponent::evaluate_in_blocks`]).
-const LOG_N_BLOCKS: u32 = 2;
+const LOG_N_BLOCKS: u32 = 4;
 
 /// The most bytes of columns that one block of [`FrameworkComponent::evaluate_in_blocks`] holds
 /// (the columns that are not read at a mask offset); a wider component takes more, smaller
@@ -166,13 +166,58 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             // Enough blocks that one block of the columns evaluated per block stays under
             // `BLOCK_COLUMNS_BYTES`: the window of a wide component is its blocks' columns.
             let n_block_columns = self.n_block_columns(trace);
+            // SCREEN (a8n Q1457): with `A8N_REGROW1`, the coefficients regrown once per component
+            // are resident through its blocks, so the budget counts them.
+            let regrown_bytes = if stwo::prover::m11_env("A8N_REGROW1", 0) != 0 {
+                let column_bytes = 4usize << (eval_log_size - 1);
+                // SCREEN (a8n Q1464): `A8N_REGROW1_MIB` caps the bytes regrown once.
+                let cap = stwo::prover::m11_env("A8N_REGROW1_MIB", usize::MAX >> 20) << 20;
+                (self.n_regrown_columns(trace) * column_bytes).min(cap / column_bytes * column_bytes)
+            } else {
+                0
+            };
             let mut log_n_blocks = LOG_N_BLOCKS;
             while log_n_blocks < MAX_LOG_N_BLOCKS
-                && n_block_columns * (4usize << (eval_log_size - log_n_blocks)) > BLOCK_COLUMNS_BYTES
+                && n_block_columns * (4usize << (eval_log_size - log_n_blocks)) + regrown_bytes
+                    > stwo::prover::m11_env("M11_BLOCK_MIB", BLOCK_COLUMNS_BYTES >> 20) << 20
             {
                 log_n_blocks += 1;
             }
-            return self.evaluate_in_blocks(trace, evaluation_accumulator, log_n_blocks);
+            let mut once_budget = if stwo::prover::m11_env("A8N_REGROW1", 0) != 0 {
+                stwo::prover::m11_env("A8N_REGROW1_MIB", usize::MAX >> 20) << 20
+            } else {
+                0
+            };
+            // SCREEN (f2 Q1650): `F2_OPTNB=1` picks the block count and the columns regrown once
+            // together: the fewest coefficient regrowths (IFFTs) per block, at no more bytes than
+            // the rule above holds (plus `F2_SLACK_MIB`).
+            if stwo::prover::m11_env("F2_OPTNB", 0) != 0 {
+                let column_bytes = 4usize << (eval_log_size - 1);
+                let n_regrown = self.n_regrown_columns(trace);
+                let held = n_block_columns * (4usize << (eval_log_size - log_n_blocks)) + regrown_bytes
+                    + (stwo::prover::m11_env("F2_SLACK_MIB", 0) << 20);
+                let mut best = (usize::MAX, log_n_blocks, regrown_bytes / column_bytes);
+                for nb in LOG_N_BLOCKS..=stwo::prover::m11_env("F2_NBMAX", MAX_LOG_N_BLOCKS as usize) as u32 {
+                    // Under `F2_SUPER=g` a column regrown per block also holds g - 1 blocks ahead.
+                    let g = stwo::prover::m11_env("F2_SUPER", 1).max(1).min(1 << nb);
+                    let block_bytes = 4usize << (eval_log_size - nb);
+                    let blocks = n_block_columns * block_bytes + n_regrown * (g - 1) * block_bytes;
+                    if blocks > held {
+                        continue;
+                    }
+                    // A column regrown once frees its g - 1 blocks ahead.
+                    let k = ((held - blocks) / (column_bytes - (g - 1) * block_bytes).max(1)).min(n_regrown);
+                    let cost = (n_block_columns + (n_regrown - k) * (eval_log_size as usize + 1) / g) << nb;
+                    if cost < best.0 {
+                        best = (cost, nb, k);
+                    }
+                }
+                if best.0 != usize::MAX {
+                    log_n_blocks = best.1;
+                    once_budget = best.2 * column_bytes;
+                }
+            }
+            return self.evaluate_in_blocks(trace, evaluation_accumulator, log_n_blocks, once_budget);
         }
 
         let ConstraintQuotientInputs { eval_domain, trace_domain, trace, denom_inv } =
@@ -231,6 +276,28 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
             .sum()
     }
 
+    /// The number of block columns (see [`Self::n_block_columns`]) that keep no coefficients,
+    /// which [`Self::evaluate_in_blocks`] regrows.
+    fn n_regrown_columns(&self, trace: &Trace<'_, SimdBackend>) -> usize {
+        let component_polys = get_component_polys(self, trace);
+        let mask = self.shifted_columns();
+        component_polys
+            .iter()
+            .enumerate()
+            .map(|(t, polys)| match mask.get(t) {
+                Some(m) if m.len() == polys.len() => polys
+                    .iter()
+                    .zip(m)
+                    .filter(|(poly, shifted)| !**shifted && poly.coeffs.is_none())
+                    .count(),
+                Some(m) if m.is_empty() && t == PREPROCESSED_TRACE_IDX => {
+                    polys.iter().filter(|poly| poly.coeffs.is_none()).count()
+                }
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// Adds the constraint quotients of the rows of `col`: every row of the evaluation domain, or
     /// with `window` the rows of a window of a half coset (see
     /// [`SimdDomainEvaluator::window`]), in its natural order.
@@ -245,14 +312,39 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         window: Option<(usize, isize)>,
         block: usize,
     ) {
-        let range = 0..(col.len() >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS));
+        self.accumulate_rows_at(trace_cols, col, None, random_coeff_powers, eval_log_size, denom_inv, window, block, None)
+    }
+
+    /// [`Self::accumulate_rows`] into the rows `at = (start, len)` of `col` (all of it if `None`);
+    /// the evaluated rows are numbered from 0 as they are without `at`.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_rows_at(
+        &self,
+        trace_cols: &TreeVec<Vec<&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>>,
+        col: &mut SecureColumnByCoords<SimdBackend>,
+        at: Option<(usize, usize)>,
+        random_coeff_powers: &[SecureField],
+        eval_log_size: u32,
+        denom_inv: &[BaseField],
+        window: Option<(usize, isize)>,
+        block: usize,
+        shift_window: Option<(u32, u32)>,
+    ) {
+        let (start, len) = at.unwrap_or((0, col.len()));
+        let shift = LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS;
+        let range = 0..(len >> shift);
         let col = unsafe { VeryPackedSecureColumnByCoords::transform_under_mut(col) };
 
         #[cfg(not(feature = "parallel"))]
-        let iter = range.step_by(CHUNK_SIZE).zip(col.chunks_mut(CHUNK_SIZE));
+        let iter = range
+            .step_by(CHUNK_SIZE)
+            .zip(col.chunks_mut(CHUNK_SIZE).skip((start >> shift) / CHUNK_SIZE));
 
         #[cfg(feature = "parallel")]
-        let iter = range.into_par_iter().step_by(CHUNK_SIZE).zip(col.par_chunks_mut(CHUNK_SIZE));
+        let iter = range
+            .into_par_iter()
+            .step_by(CHUNK_SIZE)
+            .zip(col.par_chunks_mut(CHUNK_SIZE).skip((start >> shift) / CHUNK_SIZE));
 
         // Define any `self` values outside the loop to prevent the compiler thinking there is a
         // `Sync` requirement on `Self`.
@@ -286,6 +378,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                 );
                 eval.window = window;
                 eval.block = block;
+                eval.shift_window = shift_window;
                 let mut eval = self_eval.evaluate(eval);
                 let row_res = eval.row_res;
                 *fracs = std::mem::take(&mut eval.logup.fracs);
@@ -326,6 +419,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         trace: &Trace<'_, SimdBackend>,
         evaluation_accumulator: &mut DomainEvaluationAccumulator<SimdBackend>,
         log_n_blocks: u32,
+        once_budget: usize,
     ) {
         let log_size = self.eval.log_size();
         let trace_domain = CanonicCoset::new(log_size);
@@ -369,23 +463,175 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                 None => Cow::Owned(poly.regrown_coefficients()),
             }
         }
-        // The shifted columns, extended to the whole domain.
-        let whole = component_polys
+        // SCREEN (w5 Q1608): `W5_SHIFTWIN=1` keeps the shifted columns as a sliding window of four
+        // blocks instead of extending them to the whole domain: a block's rows at mask offset -1
+        // or +1 lie in the blocks next to it in natural low-bit order (`r - 1`, `r + 1` for block
+        // `reverse(r)`), so the blocks are visited in that order and each is evaluated once (the
+        // first one twice).
+        let shiftwin = stwo::prover::m11_env("W5_SHIFTWIN", 0) != 0 && log_n_blocks >= 2;
+        let window_coeffs = component_polys
             .as_cols_ref()
             .zip_cols(shifted.as_cols_ref())
             .map_cols(|(poly, shifted): (&&&Poly<SimdBackend>, &bool)| {
+                (shiftwin && *shifted).then(|| coefficients(**poly))
+            });
+        // The shifted columns, extended to the whole domain.
+        let mut whole = component_polys
+            .as_cols_ref()
+            .zip_cols(shifted.as_cols_ref())
+            .map_cols(|(poly, shifted): (&&&Poly<SimdBackend>, &bool)| {
+                if shiftwin && *shifted {
+                    let mut evaluation = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                        CanonicCoset::new(1).circle_domain(),
+                        BaseColumn::zeros(2),
+                    );
+                    evaluation.values = BaseColumn::zeros(4 << log_block);
+                    return Some(evaluation);
+                }
                 shifted.then(|| poly.get_evaluation_on_domain(eval_domain, &twiddles))
             });
+        let mut slots: [Option<usize>; 4] = [None; 4];
+        let reverse = |r: usize| r.reverse_bits() >> (usize::BITS - log_n_blocks);
+        // SCREEN (w5 Q1606 census): `W5_WHOLEDBG=1` prints, per windowed component, its size, the
+        // columns extended whole (read at an offset) and their bytes, and the block plan.
+        if false {
+            let n_whole = whole.as_cols_ref().flatten().iter().filter(|w| w.is_some()).count();
+            eprintln!(
+                "W5WHOLE log_size {log_size} blocks {log_n_blocks} whole_cols {n_whole} whole_mib {} block_cols {} block_mib {}",
+                (n_whole << (log_size + 3)) >> 20,
+                self.n_block_columns(trace),
+                (self.n_block_columns(trace) << (log_block + 2)) >> 20,
+            );
+        }
+        // SCREEN (a8n Q1457): `A8N_REGROW1=1` regrows a block column's coefficients once for all
+        // the blocks instead of once per block.
+        // SCREEN (a8n Q1464): at most `once_budget` bytes of coefficients regrown once, the first
+        // columns in order; the others are regrown per block as before.
+        let regrow_once = once_budget > 0;
+        let mut regrow_cap = once_budget;
+        // SCREEN (w5 Q1609): `W5_COMPRSS=<MiB>` sizes the bytes regrown once from the headroom
+        // under a target resident set: the target minus the resident set now, minus this
+        // component's block columns and accumulator, minus 16 MiB of margin (never below the
+        // static cap). Linux only (reads /proc/self/statm); the proof is the same at any cap.
+        // SCREEN (w5 Q1612): `W5_COMPEST=<MiB>` is the same budget from a deterministic stand-in for
+        // the resident set: the tree bytes held at `prove_ex` plus `W5_COMPOFF` MiB (default 320).
+        let est_target = stwo::prover::m11_env("W5_COMPEST", 0) << 20;
+        if est_target > 0 {
+            let resident = stwo::prover::W5_HELD.load(std::sync::atomic::Ordering::Relaxed)
+                + (stwo::prover::m11_env("W5_COMPOFF", 320) << 20);
+            let blocks = self.n_block_columns(trace) * (4usize << log_block) + (16usize << log_block);
+            regrow_cap = regrow_cap.max(est_target.saturating_sub(resident + blocks + (16 << 20)));
+        }
+        let column_bytes = 4usize << log_size;
+        let mut budget = regrow_cap;
+        let allowed = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).map_cols(
+            |(poly, whole): (&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>)| {
+                let take = regrow_once && whole.is_none() && poly.coeffs.is_none() && budget >= column_bytes;
+                if take {
+                    budget -= column_bytes;
+                }
+                take
+            },
+        );
+        let once_fn = |((poly, _whole), &take): ((&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>), &bool)| {
+            take.then(|| poly.regrown_coefficients())
+        };
+        #[cfg(not(feature = "parallel"))]
+        let once = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).zip_cols(allowed.as_cols_ref()).map_cols(once_fn);
+        #[cfg(feature = "parallel")]
+        let once = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).zip_cols(allowed.as_cols_ref()).par_map_cols(once_fn);
+        let seq = stwo::prover::m11_env("F2_SEQ", 0) != 0;
+        // SCREEN (f2 Q1663): `F2_SUPER=g` regrows a column without coefficients once per `g`
+        // blocks and keeps the next `g - 1` blocks' values (a block is 1/16..1/32 of the
+        // coefficients' bytes), instead of regrowing it for every block.
+        let mut superg = stwo::prover::m11_env("F2_SUPER", 1).max(1);
+        let n_blocks = 1usize << log_n_blocks;
+        // SCREEN (f2 Q1686): `F2_SUPERMIB=m` caps the blocks kept ahead at m MiB per component: g is
+        // lowered until (g - 1) blocks of every per-block column fit.
+        let super_mib = stwo::prover::m11_env("F2_SUPERMIB", 0);
+        if super_mib > 0 && superg > 1 {
+            let n_per_block = component_polys
+                .as_cols_ref()
+                .zip_cols(whole.as_cols_ref())
+                .zip_cols(once.as_cols_ref())
+                .map_cols(|((poly, whole), once): ((&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>), &Option<stwo::prover::poly::circle::CircleCoefficients<SimdBackend>>)| {
+                    whole.is_none() && once.is_none() && poly.coeffs.is_none()
+                })
+                .0
+                .iter()
+                .flatten()
+                .filter(|&&b| b)
+                .count();
+            let per_block_bytes = (n_per_block * 4 * block_len).max(1);
+            superg = superg.min(1 + (super_mib << 20) / per_block_bytes);
+        }
         // A block's column buffers are reused by the next block (no fresh pages).
         let spare = std::sync::Mutex::new(Vec::<BaseColumn>::new());
-        for block in 0..1usize << log_n_blocks {
-            let fill = |(poly, whole): (&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>)| {
+        let ahead = component_polys.as_cols_ref().map_cols(|_| std::sync::Mutex::new(Vec::<BaseColumn>::new()));
+        type Ahead = std::sync::Mutex<Vec<BaseColumn>>;
+        // Under W5_SHIFTWIN the blocks are visited out of order: look ahead in visiting order.
+        let visit = |s: usize| if shiftwin { reverse(s) } else { s };
+        let per_block = |poly: &Poly<SimdBackend>, ahead: &Ahead, step: usize, dst: &mut BaseColumn| {
+            let mut ahead = ahead.lock().unwrap();
+            if let Some(next) = ahead.pop() {
+                let old = std::mem::replace(dst, next);
+                spare.lock().unwrap().push(old);
+                return;
+            }
+            let coeffs = poly.regrown_coefficients();
+            evaluate_block_into(&coeffs, eval_domain, &twiddles, log_block, visit(step), dst);
+            if superg > 1 {
+                for next in (step + 1..(step + superg).min(n_blocks)).rev() {
+                    let mut values =
+                        spare.lock().unwrap().pop().unwrap_or_else(|| BaseColumn::zeros(block_len));
+                    evaluate_block_into(&coeffs, eval_domain, &twiddles, log_block, visit(next), &mut values);
+                    ahead.push(values);
+                }
+            }
+        };
+        for step in 0..n_blocks {
+            let block = visit(step);
+            if shiftwin {
+                let n = 1usize << log_n_blocks;
+                for r in [(step + n - 1) % n, step, (step + 1) % n] {
+                    let slot = r & 3;
+                    if slots[slot] == Some(r) {
+                        continue;
+                    }
+                    slots[slot] = Some(r);
+                    let fill_slot = |(coeffs, whole): (
+                        &Option<Cow<'_, stwo::prover::poly::circle::CircleCoefficients<SimdBackend>>>,
+                        &mut Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+                    )| {
+                        if let (Some(coeffs), Some(whole)) = (coeffs, whole) {
+                            let mut values = BaseColumn::zeros(block_len);
+                            evaluate_block_into(coeffs, eval_domain, &twiddles, log_block, reverse(r), &mut values);
+                            let n_vecs = block_len >> LOG_N_LANES;
+                            whole.values.data[slot * n_vecs..(slot + 1) * n_vecs].copy_from_slice(&values.data);
+                        }
+                    };
+                    #[cfg(not(feature = "parallel"))]
+                    window_coeffs.as_cols_ref().zip_cols(TreeVec::new(whole.iter_mut().map(|c| c.iter_mut().collect::<Vec<_>>()).collect::<Vec<_>>())).map_cols(fill_slot);
+                    #[cfg(feature = "parallel")]
+                    window_coeffs.as_cols_ref().zip_cols(TreeVec::new(whole.iter_mut().map(|c| c.iter_mut().collect::<Vec<_>>()).collect::<Vec<_>>())).par_map_cols(fill_slot);
+                }
+            }
+            let fill = |(((poly, whole), once), ahead): (((&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>), &Option<stwo::prover::poly::circle::CircleCoefficients<SimdBackend>>), &Ahead)| {
                 if whole.is_some() {
                     return None;
                 }
                 let mut values =
                     spare.lock().unwrap().pop().unwrap_or_else(|| BaseColumn::zeros(block_len));
-                evaluate_block_into(&coefficients(**poly), eval_domain, &twiddles, log_block, block, &mut values);
+                // SCREEN (f2 Q1651): under `F2_SEQ`, columns regrown per block are filled after
+                // this parallel pass, one at a time (each IFFT is parallel inside).
+                if let Some(coeffs) = once {
+                    evaluate_block_into(coeffs, eval_domain, &twiddles, log_block, block, &mut values);
+                } else if poly.coeffs.is_some() {
+                    let coeffs = coefficients(**poly);
+                    evaluate_block_into(&coeffs, eval_domain, &twiddles, log_block, block, &mut values);
+                } else if !seq {
+                    per_block(**poly, ahead, step, &mut values);
+                }
                 let mut evaluation = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
                     CanonicCoset::new(1).circle_domain(),
                     BaseColumn::zeros(2),
@@ -394,9 +640,18 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                 Some(evaluation)
             };
             #[cfg(not(feature = "parallel"))]
-            let blocks = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).map_cols(fill);
+            let mut blocks = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).zip_cols(once.as_cols_ref()).zip_cols(ahead.as_cols_ref()).map_cols(fill);
             #[cfg(feature = "parallel")]
-            let blocks = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).par_map_cols(fill);
+            let mut blocks = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).zip_cols(once.as_cols_ref()).zip_cols(ahead.as_cols_ref()).par_map_cols(fill);
+            if seq {
+                for ((bt, pt), ((ot, wt), at)) in blocks.0.iter_mut().zip(component_polys.0.iter()).zip(once.0.iter().zip(whole.0.iter()).zip(ahead.0.iter())) {
+                    for ((b, p), ((o, w), a)) in bt.iter_mut().zip(pt.iter()).zip(ot.iter().zip(wt.iter()).zip(at.iter())) {
+                        if w.is_none() && o.is_none() && p.coeffs.is_none() {
+                            per_block(p, a, step, &mut b.as_mut().unwrap().values);
+                        }
+                    }
+                }
+            }
             let columns = blocks
                 .as_cols_ref()
                 .zip_cols(whole.as_cols_ref())
@@ -406,22 +661,30 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                         &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
                     )| block.as_ref().or(whole.as_ref()).unwrap(),
                 );
-            let mut rows = SecureColumnByCoords::<SimdBackend>::zeros(block_len);
-            self.accumulate_rows(
+            // SCREEN (r77, d9x DIRECT): `R77_DIRECT=1` accumulates the rows straight into the block
+            // of the accumulator (the same additions: `acc + (0 + r)` is `acc + r`), with no zeroed
+            // block of rows and no second pass adding it in.
+            let direct = true
+                && block_len % (CHUNK_SIZE << (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS)) == 0;
+            let mut rows =
+                SecureColumnByCoords::<SimdBackend>::zeros(if direct { 0 } else { block_len });
+            self.accumulate_rows_at(
                 &columns,
-                &mut rows,
+                if direct { &mut *accum.col } else { &mut rows },
+                direct.then_some((block * block_len, block_len)),
                 &accum.random_coeff_powers,
                 eval_domain.log_size(),
                 &denom_inv,
                 None,
                 block * block_len >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS),
+                shiftwin.then_some((log_block, log_n_blocks)),
             );
             drop(columns);
             spare
                 .lock()
                 .unwrap()
                 .extend(blocks.0.into_iter().flatten().flatten().map(|evaluation| evaluation.values));
-            for (dst, src) in accum.col.columns.iter_mut().zip(&rows.columns) {
+            for (dst, src) in accum.col.columns.iter_mut().zip(&rows.columns).filter(|_| !direct) {
                 let dst = &mut dst.as_mut_slice()[block * block_len..][..block_len];
                 #[cfg(not(feature = "parallel"))]
                 let pairs = dst.iter_mut().zip(src.as_slice());

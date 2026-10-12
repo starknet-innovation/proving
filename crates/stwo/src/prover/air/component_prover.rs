@@ -47,6 +47,100 @@ pub trait TraceSource: Send + Sync {
     /// Writes the column's values on its trace domain, in bit-reversed order, into `dst`, of
     /// length `2^log_size`.
     fn write_values(&self, dst: &mut [BaseField]);
+    /// SCREEN (f2 Q1658): the values of rows `start..start + dst.len()` (bit-reversed order).
+    fn write_range(&self, start: usize, dst: &mut [BaseField]) {
+        let mut all = vec![BaseField::from(0); 1 << self.log_size()];
+        self.write_values(&mut all);
+        dst.copy_from_slice(&all[start..start + dst.len()]);
+    }
+}
+
+/// SCREEN (m11, Q1405 = a8's P2 as a source): a column's values on its trace domain
+/// (bit-reversed order) in the narrowest unsigned type that holds them.
+pub enum PackedTrace {
+    U8(u32, Vec<u8>),
+    U16(u32, Vec<u16>),
+    /// Z1_BITS (Q1582): `base + w`-bit offsets, `w` in {0, 1, 2, 4} (mode 2 also 8, 16), 64 / `w` per
+    /// word, low first.
+    Bits(u32, u32, u32, Vec<u64>),
+}
+
+impl PackedTrace {
+    /// Packs `values` if every one fits in 16 bits.
+    pub fn pack(log_size: u32, values: &[BaseField]) -> Option<Self> {
+        let max = values.iter().map(|v| v.0).max().unwrap_or(0);
+        let min = values.iter().map(|v| v.0).min().unwrap_or(0);
+        let mode = crate::prover::m11_env("Z1_BITS", 0);
+        let widths: &[u32] = if mode >= 2 { &[0, 1, 2, 4, 8, 16] } else { &[0, 1, 2, 4] };
+        if false {
+            let w = [0u32, 1, 2, 4, 8, 12, 16, 20].into_iter().find(|&w| max - min < 1 << w);
+            eprintln!("Z1P log={log_size} min={min} max={max} for_bits={w:?}");
+        }
+        let bits = widths.iter().copied().find(|&w| max - min < 1 << w);
+        if let Some(w) = bits.filter(|_| mode != 0) {
+            let mut words = vec![0u64; if w == 0 { 0 } else { (values.len() * w as usize).div_ceil(64) }];
+            if w > 0 {
+                let per = 64 / w as usize;
+                for (word, chunk) in words.iter_mut().zip(values.chunks(per)) {
+                    for (j, v) in chunk.iter().enumerate() {
+                        *word |= ((v.0 - min) as u64) << (j * w as usize);
+                    }
+                }
+            }
+            return Some(Self::Bits(log_size, w, min, words));
+        }
+        if max < 1 << 8 {
+            Some(Self::U8(log_size, values.iter().map(|v| v.0 as u8).collect()))
+        } else if max < 1 << 16 {
+            Some(Self::U16(log_size, values.iter().map(|v| v.0 as u16).collect()))
+        } else {
+            None
+        }
+    }
+}
+
+impl TraceSource for PackedTrace {
+    fn log_size(&self) -> u32 {
+        match self {
+            Self::U8(l, _) | Self::U16(l, _) | Self::Bits(l, ..) => *l,
+        }
+    }
+
+    fn write_values(&self, dst: &mut [BaseField]) {
+        match self {
+            Self::Bits(_, 0, base, _) => dst.fill(BaseField::from(*base)),
+            Self::Bits(_, w, base, words) => {
+                let (w, mask) = (*w as usize, (1u64 << *w) - 1);
+                for (chunk, &word) in dst.chunks_mut(64 / w).zip(words) {
+                    for (j, d) in chunk.iter_mut().enumerate() {
+                        *d = BaseField::from(base + ((word >> (j * w)) & mask) as u32);
+                    }
+                }
+            }
+            Self::U8(_, v) => dst.iter_mut().zip(v).for_each(|(d, &x)| *d = BaseField::from(x as u32)),
+            Self::U16(_, v) => dst.iter_mut().zip(v).for_each(|(d, &x)| *d = BaseField::from(x as u32)),
+        }
+    }
+
+    fn write_range(&self, start: usize, dst: &mut [BaseField]) {
+        match self {
+            Self::Bits(_, 0, base, _) => dst.fill(BaseField::from(*base)),
+            Self::Bits(_, w, base, words) => {
+                let (w, mask) = (*w as usize, (1u64 << *w) - 1);
+                let per = 64 / w;
+                for (i, d) in dst.iter_mut().enumerate() {
+                    let row = start + i;
+                    *d = BaseField::from(base + ((words[row / per] >> ((row % per) * w)) & mask) as u32);
+                }
+            }
+            Self::U8(_, v) => {
+                dst.iter_mut().zip(&v[start..]).for_each(|(d, &x)| *d = BaseField::from(x as u32))
+            }
+            Self::U16(_, v) => {
+                dst.iter_mut().zip(&v[start..]).for_each(|(d, &x)| *d = BaseField::from(x as u32))
+            }
+        }
+    }
 }
 
 /// A shared [`TraceSource`].
@@ -182,7 +276,10 @@ impl<B: Backend> Poly<B> {
             // coefficients' size, which determines the polynomial.
             self.regrown_coefficients().evaluate_with_twiddles(domain, twiddles)
         } else {
-            panic!("The polynomial's coefficients are not stored");
+            // A column committed without stripes and without its coefficients keeps its whole
+            // extension, which determines the polynomial (Q1532's read-back reaches such columns on
+            // trees too small to stripe).
+            self.evals.clone().interpolate_with_twiddles(twiddles).evaluate_with_twiddles(domain, twiddles)
         }
     }
 }
@@ -270,7 +367,18 @@ impl<B: Backend> ComponentProvers<'_, B> {
         #[cfg(not(feature = "parallel"))]
         let group_results: Vec<_> = groups.iter().map(run_group).collect();
         #[cfg(feature = "parallel")]
-        let group_results: Vec<_> = if extend {
+        let group_results: Vec<_> = if extend && false {
+            // SCREEN (r77, d9x SMALLPAR): the groups below the two largest sizes run one after
+            // another in a task beside the two largest (one small extension more resident).
+            let top = groups.iter().map(|(size, _)| *size).max().unwrap_or(0);
+            let (big, small): (Vec<_>, Vec<_>) =
+                groups.iter().partition(|(size, _)| *size + 1 >= top);
+            let (big_results, small_results) = rayon::join(
+                || big.into_iter().map(&run_group).collect::<Vec<_>>(),
+                || small.into_iter().map(&run_group).collect::<Vec<_>>(),
+            );
+            big_results.into_iter().chain(small_results).collect()
+        } else if extend {
             groups.iter().map(run_group).collect()
         } else {
             use rayon::prelude::*;

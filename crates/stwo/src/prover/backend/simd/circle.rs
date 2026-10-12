@@ -771,6 +771,43 @@ impl PolyOps for SimdBackend {
         evaluate_from_prefix_simd(prefix, log_size, domain, targets, scratch)
     }
 
+    fn evaluate_from_source(
+        values: &Col<Self, BaseField>,
+        log_size: u32,
+        source: CircleDomain,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+        scratch: &mut Col<Self, BaseField>,
+    ) -> Option<Vec<Vec<BaseField>>> {
+        evaluate_from_source_simd(values, log_size, source, domain, targets, scratch)
+    }
+
+    fn evaluate_from_prefix_stream(
+        prefix: &Col<Self, BaseField>,
+        log_size: u32,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+    ) -> Option<Vec<Vec<BaseField>>> {
+        let values = prefix.as_slice();
+        evaluate_from_fill_simd(
+            &|start, dst| dst.copy_from_slice(&values[start..start + dst.len()]),
+            log_size,
+            domain.split(domain.log_size() - log_size).0,
+            domain,
+            targets,
+        )
+    }
+
+    fn evaluate_from_fill(
+        fill: &dyn Fn(usize, &mut [BaseField]),
+        log_size: u32,
+        source: CircleDomain,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+    ) -> Option<Vec<Vec<BaseField>>> {
+        evaluate_from_fill_simd(fill, log_size, source, domain, targets)
+    }
+
     fn evaluate_stripe_into(
         poly: &CircleCoefficients<Self>,
         domain: CircleDomain,
@@ -983,9 +1020,76 @@ pub fn evaluate_block_into(
         return SimdBackend::evaluate_stripe_into(poly, domain, twiddles, block, dst);
     }
     let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
-    // Fold from the polynomial's size down to the block's.
+    // Every level is folded in one pass: block coefficient `i` is
+    // `sum_m c[i + m * 2^log_block] * w[m]`, `w[m]` the product of the levels' twiddles over the bits
+    // of `m`. The same field products as the level-by-level fold, without its half-size buffer.
     let mut folded: Option<BaseColumn> = None;
+    if a8_directfold() {
+        let n_levels = log_size - log_block;
+        let mut weights = vec![PackedBaseField::broadcast(BaseField::from(1)); 1 << n_levels];
+        for k in 0..n_levels {
+            let level = log_block + 1 + k;
+            let stripe = block >> (level - log_block);
+            let sign = (block >> (level - 1 - log_block)) & 1;
+            let t = BaseField::from_u32_unchecked(line_twiddles[(level - 2) as usize][stripe] / 2);
+            let t = PackedBaseField::broadcast(if sign == 0 { t } else { -t });
+            for m in 0..1usize << k {
+                weights[m | 1 << k] = weights[m] * t;
+            }
+        }
+        let src = &poly.coeffs.data;
+        let log_n_vecs = log_size - LOG_N_LANES;
+        let at = |v: usize| {
+            if log_size <= CACHED_FFT_LOG_SIZE {
+                return src[v];
+            }
+            src[transposed_vec_index(v, log_n_vecs)]
+        };
+        let block_vecs = 1usize << (log_block - LOG_N_LANES);
+        let fold_at = |i: usize| {
+            (0..weights.len()).fold(PackedBaseField::broadcast(BaseField::from(0)), |acc, m| {
+                acc + at(i + m * block_vecs) * weights[m]
+            })
+        };
+        // SCREEN (w5 Q1600): `W5_RFOLD=1` folds straight into the transposed order the FFT reads
+        // (vector `j` of the output is natural vector `T(j)`, `T` its own inverse), walking the
+        // output in memory order, so there is no natural-order buffer, no transposing pass and no
+        // zero fill. The same sums per vector.
+        if log_block > CACHED_FFT_LOG_SIZE && crate::prover::m11_env("W5_RFOLD", 0) != 0 {
+            let log_n_block_vecs = log_block - LOG_N_LANES;
+            let mut data = w5_fold_buffer();
+            (0..block_vecs)
+                .into_par_iter()
+                .map(|j| fold_at(transposed_vec_index(j, log_n_block_vecs)))
+                .collect_into_vec(&mut data);
+            let folded = CircleCoefficients::<SimdBackend>::new(BaseColumn { data, length: 1 << log_block });
+            let stripe_twiddles = vec![
+                (0..(log_block - 1))
+                    .map(|layer_i| {
+                        &line_twiddles[layer_i as usize][block << (log_block - 2 - layer_i)
+                            ..(block + 1) << (log_block - 2 - layer_i)]
+                    })
+                    .collect::<Vec<_>>(),
+            ];
+            fft_subdomains_into(&folded, dst, &stripe_twiddles);
+            w5_fold_buffer_return(folded.coeffs.data);
+            return;
+        }
+        // (Q1600: under `W5_RFOLD` a small block is collected, not written over a zeroed buffer.)
+        if crate::prover::m11_env("W5_RFOLD", 0) != 0 && log_block <= CACHED_FFT_LOG_SIZE {
+            let mut data = w5_fold_buffer();
+            (0..block_vecs).into_par_iter().map(fold_at).collect_into_vec(&mut data);
+            folded = Some(BaseColumn { data, length: 1 << log_block });
+        } else {
+            let mut out = a8_scratch(0, 1 << log_block);
+            out.data.par_iter_mut().enumerate().for_each(|(i, x)| *x = fold_at(i));
+            folded = Some(out);
+        }
+    }
     for level in (log_block + 1..=log_size).rev() {
+        if folded.is_some() && a8_directfold() {
+            break;
+        }
         let stripe = block >> (level - log_block);
         let sign = (block >> (level - 1 - log_block)) & 1;
         let t = BaseField::from_u32_unchecked(line_twiddles[(level - 2) as usize][stripe] / 2);
@@ -1023,12 +1127,13 @@ pub fn evaluate_block_into(
         // The FFT reads large coefficients transposed.
         let natural = folded;
         let log_n_vecs = log_block - LOG_N_LANES;
-        folded = BaseColumn::zeros(1 << log_block);
+        folded = if a8_directfold() { a8_scratch(1, 1 << log_block) } else { BaseColumn::zeros(1 << log_block) };
         folded
             .data
             .par_iter_mut()
             .enumerate()
             .for_each(|(i, x)| *x = natural.data[transposed_vec_index(i, log_n_vecs)]);
+        a8_scratch_return(0, natural);
     }
     let folded = CircleCoefficients::<SimdBackend>::new(folded);
     let stripe_twiddles = vec![
@@ -1040,6 +1145,83 @@ pub fn evaluate_block_into(
             .collect::<Vec<_>>(),
     ];
     fft_subdomains_into(&folded, dst, &stripe_twiddles);
+    if crate::prover::m11_env("W5_RFOLD", 0) != 0 && log_block <= CACHED_FFT_LOG_SIZE {
+        w5_fold_buffer_return(folded.coeffs.data);
+        return;
+    }
+    // `A8_FOLDTLS`: the fold's buffers go back to this thread's scratch for its next block.
+    a8_scratch_return(if log_block > CACHED_FFT_LOG_SIZE { 1 } else { 0 }, folded.coeffs);
+}
+
+thread_local! {
+    static W5_FOLD: std::cell::RefCell<Vec<PackedBaseField>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// SCREEN (w5 Q1613): under `W5_FOLDTLS=1`, this thread's fold buffer (its capacity kept from the
+/// previous block, so no fresh pages and no zero fill; `collect_into_vec` writes into it).
+fn w5_fold_buffer() -> Vec<PackedBaseField> {
+    if crate::prover::m11_env("W5_FOLDTLS", 0) == 0 {
+        return Vec::new();
+    }
+    W5_FOLD.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+/// SCREEN (w5 Q1613): keeps a fold buffer of at most `W5_FOLDTLS_KIB` (default 2048) for this
+/// thread's next block.
+fn w5_fold_buffer_return(data: Vec<PackedBaseField>) {
+    if crate::prover::m11_env("W5_FOLDTLS", 0) != 0
+        && data.capacity() * std::mem::size_of::<PackedBaseField>()
+            <= crate::prover::m11_env("W5_FOLDTLS_KIB", 2048) << 10
+    {
+        W5_FOLD.with(|cell| *cell.borrow_mut() = data);
+    }
+}
+
+/// SCREEN (w5 Q1613): frees every thread's fold buffer (end of a striped commit, of composition).
+pub fn w5_clear_fold_buffers() {
+    if crate::prover::m11_env("W5_FOLDTLS", 0) == 0 {
+        return;
+    }
+    rayon::broadcast(|_| W5_FOLD.with(|cell| *cell.borrow_mut() = Vec::new()));
+    W5_FOLD.with(|cell| *cell.borrow_mut() = Vec::new());
+}
+
+/// Per-thread fold scratch (off: its resident buffers raise the peak).
+const fn a8_foldtls() -> bool {
+    false
+}
+
+thread_local! {
+    static A8_SCRATCH: std::cell::RefCell<[Vec<PackedBaseField>; 2]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+}
+
+/// A column of `len` elements, on this thread's scratch buffer `k` when `A8_FOLDTLS` is set (its
+/// contents are overwritten by the caller).
+fn a8_scratch(k: usize, len: usize) -> BaseColumn {
+    if !a8_foldtls() {
+        return BaseColumn::zeros(len);
+    }
+    let mut data = A8_SCRATCH.with(|s| std::mem::take(&mut s.borrow_mut()[k]));
+    data.clear();
+    data.resize(len.div_ceil(N_LANES), PackedBaseField::broadcast(BaseField::from(0)));
+    BaseColumn { data, length: len }
+}
+
+fn a8_scratch_return(k: usize, column: BaseColumn) {
+    if !a8_foldtls() {
+        return;
+    }
+    A8_SCRATCH.with(|s| {
+        let slot = &mut s.borrow_mut()[k];
+        if column.data.capacity() > slot.capacity() {
+            *slot = column.data;
+        }
+    });
+}
+
+const fn a8_directfold() -> bool {
+    true
 }
 
 fn compute_small_coset_twiddles(coset: Coset) -> TwiddleTree<SimdBackend> {
@@ -1139,11 +1321,119 @@ fn evaluate_from_prefix_mode(
     scratch: &mut BaseColumn,
     bary: bool,
 ) -> Option<Vec<Vec<BaseField>>> {
+    evaluate_from_values_mode(prefix, log_size, None, domain, targets, scratch, bary)
+}
+
+/// SCREEN (f2 Q1653): [`evaluate_from_prefix_simd`] from a column's evaluation on any circle
+/// domain `source` of its size (a sourced column's trace values), not only stripe 0: the plan's
+/// inverse layers take `source`'s twiddles; the coefficient basis, and so every point's factors,
+/// is the same.
+pub fn evaluate_from_source_simd(
+    values: &BaseColumn,
+    log_size: u32,
+    source: CircleDomain,
+    domain: CircleDomain,
+    targets: &[(usize, Vec<usize>)],
+    scratch: &mut BaseColumn,
+) -> Option<Vec<Vec<BaseField>>> {
+    evaluate_from_values_mode(values, log_size, Some(source), domain, targets, scratch, bary_tail())
+}
+
+/// SCREEN (f2 Q1658): [`evaluate_from_source_simd`] streamed: the column's values on `source` are
+/// produced tile by tile by `fill(start, dst)` (rows `start..start + dst.len()`), so no buffer of
+/// the column's size is held. The bary tail only (Q722, always on); `None` otherwise.
+pub fn evaluate_from_fill_simd(
+    fill: &dyn Fn(usize, &mut [BaseField]),
+    log_size: u32,
+    source: CircleDomain,
+    domain: CircleDomain,
+    targets: &[(usize, Vec<usize>)],
+) -> Option<Vec<Vec<BaseField>>> {
+    let n = log_size;
+    if n < 10 || !bary_tail() {
+        return None;
+    }
+    let plan = PrefixPlan::get(n, source, domain, targets);
+    let twiddles = plan.twiddles();
+    let n_chunks = 1usize << (n - PrefixPlan::LOW);
+    let tile = 1usize << plan.tile_bits;
+    use std::simd::ToBytes;
+    type W = Simd<u64, 8>;
+    let p64 = W::splat(crate::core::fields::m31::P as u64);
+    let lo32 = W::splat(0xFFFF_FFFF);
+    let fold31 = |x: W| (x & p64) + (x >> 31);
+    let words = |v: PackedBaseField| W::from_ne_bytes(v.into_simd().to_ne_bytes());
+    let mut acc = vec![[W::splat(0); 4]; plan.blocks.len()];
+    let mut vals = vec![BaseField::from(0u32); tile << (PrefixPlan::LOW + 0)];
+    let mut src = vec![PackedBaseField::zero(); 2 * tile];
+    for t in 0..n_chunks >> plan.tile_bits {
+        fill(t * vals.len(), &mut vals);
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = PackedBaseField::from_array(std::array::from_fn(|k| vals[i * N_LANES + k]));
+        }
+        // The first five inverse layers on this tile's chunk pairs (global pair index).
+        for (j, chunk) in src.chunks_exact_mut(2).enumerate() {
+            let index = t * tile + j;
+            let (val0, val1) = ifft::vecwise_ibutterflies(
+                chunk[0],
+                chunk[1],
+                std::array::from_fn(|i| twiddles[0][index * 8 + i]),
+                std::array::from_fn(|i| twiddles[1][index * 4 + i]),
+                std::array::from_fn(|i| twiddles[2][index * 2 + i]),
+            );
+            let (val0, val1) =
+                ifft::simd_ibutterfly(val0, val1, std::simd::u32x16::splat(twiddles[3][index]));
+            chunk[0] = val0;
+            chunk[1] = val1;
+        }
+        for (block, acc) in plan.blocks.iter().zip(acc.iter_mut()) {
+            let [mut e0, mut o0, mut e1, mut o1] = *acc;
+            let weights = &block.weights[t * tile..(t + 1) * tile];
+            for (ws, src) in weights.chunks(4).zip(src.chunks(8)) {
+                for (&w, pair) in ws.iter().zip(src.chunks_exact(2)) {
+                    let w = W::splat(w.0 as u64);
+                    let (a, b) = (words(pair[0]), words(pair[1]));
+                    e0 += (a & lo32) * w;
+                    o0 += (a >> 32) * w;
+                    e1 += (b & lo32) * w;
+                    o1 += (b >> 32) * w;
+                }
+                [e0, o0, e1, o1] = [fold31(e0), fold31(o0), fold31(e1), fold31(o1)];
+            }
+            *acc = [e0, o0, e1, o1];
+        }
+    }
+    let p = crate::core::fields::m31::P as u64;
+    let mut out: Vec<Vec<BaseField>> =
+        targets.iter().map(|(_, rows)| vec![BaseField::zero(); rows.len()]).collect();
+    for (block, acc) in plan.blocks.iter().zip(acc) {
+        let [e0, o0, e1, o1] = acc.map(|x| fold31(x).to_array());
+        let values: Vec<BaseField> = [(e0, o0), (e1, o1)]
+            .iter()
+            .flat_map(|(e, o)| (0..8).flat_map(move |i| [e[i], o[i]]))
+            .map(|v| BaseField::from_u32_unchecked((v % p) as u32))
+            .collect();
+        for (k, own) in block.rows.clone().zip(&block.own) {
+            out[block.target][k] = fold(&values, own) * plan.scale;
+        }
+    }
+    Some(out)
+}
+
+fn evaluate_from_values_mode(
+    prefix: &BaseColumn,
+    log_size: u32,
+    source: Option<CircleDomain>,
+    domain: CircleDomain,
+    targets: &[(usize, Vec<usize>)],
+    scratch: &mut BaseColumn,
+    bary: bool,
+) -> Option<Vec<Vec<BaseField>>> {
     if log_size < 10 {
         return None;
     }
     let n = log_size;
-    let plan = PrefixPlan::get(n, domain, targets);
+    let plan = PrefixPlan::get(n, source.unwrap_or_else(|| domain.split(domain.log_size() - n).0), domain, targets);
     // 1. The first five inverse layers, chunk by chunk, in the caller's (pooled) scratch.
     let n_vecs = 1usize << (n - LOG_N_LANES);
     let unfolded = &mut scratch.data[..n_vecs];
@@ -1167,24 +1457,46 @@ fn evaluate_from_prefix_mode(
     let n_chunks = 1usize << (n - PrefixPlan::LOW);
     let tile = 1usize << plan.tile_bits;
     if bary {
-        // Q722: one weighted accumulate per block, tile by tile so the column is read once.
-        let mut acc = vec![[PackedBaseField::zero(); 2]; plan.blocks.len()];
+        // Q722's weighted accumulate, in 64-bit lanes
+        // reduced every 4 products instead of after each one. A packed value is read as 8 u64
+        // words, its even lanes the low halves and its odd lanes the high halves, so each product
+        // is one 32x32->64 multiply. Exact: the same sum, reduced mod P at the end.
+        use std::simd::ToBytes;
+        type W = Simd<u64, 8>;
+        let p64 = W::splat(crate::core::fields::m31::P as u64);
+        let lo32 = W::splat(0xFFFF_FFFF);
+        let fold31 = |x: W| (x & p64) + (x >> 31);
+        let words = |v: PackedBaseField| W::from_ne_bytes(v.into_simd().to_ne_bytes());
+        let mut acc = vec![[W::splat(0); 4]; plan.blocks.len()];
         for t in 0..n_chunks >> plan.tile_bits {
             let src = &unfolded[2 * t * tile..2 * (t + 1) * tile];
             for (block, acc) in plan.blocks.iter().zip(acc.iter_mut()) {
-                let [mut s0, mut s1] = *acc;
-                for (j, &w) in block.weights[t * tile..(t + 1) * tile].iter().enumerate() {
-                    let w = PackedBaseField::broadcast(w);
-                    s0 += src[2 * j] * w;
-                    s1 += src[2 * j + 1] * w;
+                let [mut e0, mut o0, mut e1, mut o1] = *acc;
+                let weights = &block.weights[t * tile..(t + 1) * tile];
+                for (ws, src) in weights.chunks(4).zip(src.chunks(8)) {
+                    for (&w, pair) in ws.iter().zip(src.chunks_exact(2)) {
+                        let w = W::splat(w.0 as u64);
+                        let (a, b) = (words(pair[0]), words(pair[1]));
+                        e0 += (a & lo32) * w;
+                        o0 += (a >> 32) * w;
+                        e1 += (b & lo32) * w;
+                        o1 += (b >> 32) * w;
+                    }
+                    [e0, o0, e1, o1] = [fold31(e0), fold31(o0), fold31(e1), fold31(o1)];
                 }
-                *acc = [s0, s1];
+                *acc = [e0, o0, e1, o1];
             }
         }
+        let p = crate::core::fields::m31::P as u64;
         let mut out: Vec<Vec<BaseField>> =
             targets.iter().map(|(_, rows)| vec![BaseField::zero(); rows.len()]).collect();
         for (block, acc) in plan.blocks.iter().zip(acc) {
-            let values: Vec<BaseField> = acc.iter().flat_map(|p| p.to_array()).collect();
+            let [e0, o0, e1, o1] = acc.map(|x| fold31(x).to_array());
+            let values: Vec<BaseField> = [(e0, o0), (e1, o1)]
+                .iter()
+                .flat_map(|(e, o)| (0..8).flat_map(move |i| [e[i], o[i]]))
+                .map(|v| BaseField::from_u32_unchecked((v % p) as u32))
+                .collect();
             for (k, own) in block.rows.clone().zip(&block.own) {
                 out[block.target][k] = fold(&values, own) * plan.scale;
             }
@@ -1314,23 +1626,33 @@ impl PrefixPlan {
         domain_line_twiddles_from_tree(self.subdomain, &self.sub_twiddles.itwiddles)
     }
 
-    fn get(n: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) -> std::sync::Arc<Self> {
+    fn get(
+        n: u32,
+        subdomain: CircleDomain,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+    ) -> std::sync::Arc<Self> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         (n, domain.log_size(), domain.half_coset.initial_index.0, targets).hash(&mut hasher);
+        (subdomain.half_coset.initial_index.0, subdomain.half_coset.step_size.0).hash(&mut hasher);
         let key = hasher.finish();
         if let Some(plan) = PREFIX_PLANS.lock().unwrap().get(&key) {
             return plan.clone();
         }
         // Planned outside the lock: planning may run on the thread pool, whose other workers may
         // be waiting for this lock (a blocking lock held across a join deadlocks).
-        let plan = std::sync::Arc::new(Self::new(n, domain, targets));
+        let plan = std::sync::Arc::new(Self::new(n, subdomain, domain, targets));
         PREFIX_PLANS.lock().unwrap().entry(key).or_insert(plan).clone()
     }
 
-    fn new(n: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) -> Self {
+    fn new(
+        n: u32,
+        subdomain: CircleDomain,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+    ) -> Self {
         let low = Self::LOW;
-        let subdomain = domain.split(domain.log_size() - n).0;
         let sub_twiddles = SimdBackend::subdomain_twiddles(subdomain.half_coset);
         let twiddles = domain_line_twiddles_from_tree(subdomain, &sub_twiddles.itwiddles);
         let mut blocks = vec![];

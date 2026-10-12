@@ -34,6 +34,21 @@ pub fn setup() -> Result<()> {
 /// Prove mode. `input` is the whole prepared input; `input[witness_start..]` is the
 /// `stwo_cairo_adapter::ProverInput` JSON. Writes the version-prefixed compressed proof to `out`.
 pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out: &mut impl Write) -> Result<()> {
+    // SCREEN (w5 Q1601): `W5_SCOPE=1` runs the proof body on a worker of the rayon pool, so every
+    // parallel step it starts is pushed onto that worker's own queue (and the worker helps run it)
+    // instead of being injected from outside the pool, with the caller asleep until it is done.
+    let compressed = if false {
+        rayon::scope(|_| prove_body(input, witness_start, output_preimage))?
+    } else {
+        prove_body(input, witness_start, output_preimage)?
+    };
+    out.write_all(&Version::current().serialize())?;
+    out.write_all(&compressed)?;
+    Ok(())
+}
+
+/// The proof of [`prove`]: the zstd-compressed recursive proof, without the version prefix.
+fn prove_body(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]) -> Result<Vec<u8>> {
     let precomputes = prepare_recursive_prover_precomputes().map_err(|e| anyhow!("{e}"))?;
     let prover_input: ProverInput = serde_json::from_slice(&input[witness_start..])?;
     drop(input);
@@ -59,6 +74,16 @@ pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out
         || build_and_fill_cairo_verifier_circuit(&precomputes.cairo_verifier_config, proof, aux, output_hash),
         || {
             let _ = &**precomputes.preprocessed_circuit;
+            // SCREEN (r77): `&**` stops at the `LazyPreprocessedCircuit` and builds nothing, so the
+            // preprocessing runs later, serially, at its first use. `R77_PPJOIN=1` dereferences it
+            // to the `PreprocessedCircuit`, which builds it here, beside the fill.
+            if false {
+                let _ = &***precomputes.preprocessed_circuit;
+                // `R77_TREEJOIN=1` (n9 CTXJOIN): the circuit preprocessed tree is built here too.
+                if false {
+                    let _ = &**precomputes.circuit_preprocessed_tree;
+                }
+            }
         },
     );
     ensure!(context.is_circuit_valid(), "Circuit is not valid");
@@ -91,8 +116,5 @@ pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out
     let (proof_qm31s, _public_data) = prepare_circuit_proof_for_circuit_verifier(circuit_proof);
     let mut proof_bytes: Vec<u8> = vec![];
     proof_qm31s.serialize(&mut proof_bytes);
-    let compressed = zstd::encode_all(&proof_bytes[..], 3)?;
-    out.write_all(&Version::current().serialize())?;
-    out.write_all(&compressed)?;
-    Ok(())
+    Ok(zstd::encode_all(&proof_bytes[..], 3)?)
 }

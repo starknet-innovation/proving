@@ -94,9 +94,9 @@ fn write_trace_simd(
             let multiplicity_1_col1 = *mults[1].get(row_index).unwrap_or(&PackedM31::zero());
             *row[1] = multiplicity_1_col1;
             *lookup_data.verify_bitwise_xor_8_0 =
-                [M31_112558620, bitwise_xor_8_0, bitwise_xor_8_1, bitwise_xor_8_2];
+                narrow_xor4([M31_112558620, bitwise_xor_8_0, bitwise_xor_8_1, bitwise_xor_8_2]);
             *lookup_data.verify_bitwise_xor_8_b_1 =
-                [M31_521092554, bitwise_xor_8_0, bitwise_xor_8_1, bitwise_xor_8_2];
+                narrow_xor4([M31_521092554, bitwise_xor_8_0, bitwise_xor_8_1, bitwise_xor_8_2]);
             *lookup_data.mults_0 = multiplicity_0_col0;
             *lookup_data.mults_1 = multiplicity_1_col1;
         },
@@ -107,8 +107,8 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 struct LookupData {
-    verify_bitwise_xor_8_0: Vec<[PackedM31; 4]>,
-    verify_bitwise_xor_8_b_1: Vec<[PackedM31; 4]>,
+    verify_bitwise_xor_8_0: Vec<std::simd::u32x16>,
+    verify_bitwise_xor_8_b_1: Vec<std::simd::u32x16>,
     mults_0: Vec<PackedM31>,
     mults_1: Vec<PackedM31>,
 }
@@ -127,15 +127,15 @@ impl InteractionClaimGenerator {
         let mut col_gen = logup_gen.new_col();
         (
             col_gen.par_iter_mut(),
-            &self.lookup_data.verify_bitwise_xor_8_0,
-            &self.lookup_data.verify_bitwise_xor_8_b_1,
+            self.lookup_data.verify_bitwise_xor_8_0.par_iter().map(|&w| widen_xor4(w, 112558620)),
+            self.lookup_data.verify_bitwise_xor_8_b_1.par_iter().map(|&w| widen_xor4(w, 521092554)),
             &self.lookup_data.mults_0,
             &self.lookup_data.mults_1,
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1, mult0, mult1)| {
-                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(&values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(&values1);
                 writer.write_frac(-(denom0 * *mult1 + denom1 * *mult0), denom0 * denom1);
             });
         col_gen.finalize_col();

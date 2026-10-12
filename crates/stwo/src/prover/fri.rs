@@ -14,7 +14,7 @@ use crate::core::poly::line::LinePoly;
 use crate::core::queries::{Queries, draw_queries};
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::LOG_PACKED_LEAF_SIZE;
-use crate::prover::backend::{Col, ColumnOps};
+use crate::prover::backend::{Col, Column, ColumnOps};
 use crate::prover::line::LineEvaluation;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::poly::circle::{PolyOps, SecureEvaluation};
@@ -63,6 +63,40 @@ pub trait FriOps: ColumnOps<BaseField> + PolyOps + Sized + ColumnOps<SecureField
         alpha: SecureField,
         twiddles: &TwiddleTree<Self>,
     ) -> LineEvaluation<Self>;
+
+    /// [`Self::fold_circle_into_line`] followed by [`Self::fold_line`] with `line_alphas` (when
+    /// not empty). A backend may fuse them so that the intermediate line evaluation, twice the
+    /// size of the result per folded layer, is never resident.
+    fn fold_circle_into_line_then_lines(
+        src: &SecureEvaluation<Self, BitReversedOrder>,
+        alpha: SecureField,
+        line_alphas: &[SecureField],
+        twiddles: &TwiddleTree<Self>,
+    ) -> LineEvaluation<Self> {
+        let line = Self::fold_circle_into_line(src, alpha, twiddles);
+        if line_alphas.is_empty() {
+            return line;
+        }
+        Self::fold_line(&line, line_alphas, twiddles)
+    }
+
+    /// SCREEN (w5 Q1603): [`Self::fold_circle_into_line_then_lines`] of the circle evaluation on
+    /// `domain` (canonic, `2^log_size` rows) restricted to its rows `[start, start + stripe.len())`
+    /// (`stripe` holds them), written to the matching rows of `dst`, the folded line evaluation of
+    /// the whole domain. The rows of `dst` are the same field elements the whole fold writes.
+    /// Returns the folded line domain.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_circle_stripe_into_line_then_lines(
+        _stripe: &SecureColumnByCoords<Self>,
+        _start: usize,
+        _domain: crate::core::poly::circle::CircleDomain,
+        _alpha: SecureField,
+        _line_alphas: &[SecureField],
+        _twiddles: &TwiddleTree<Self>,
+        _dst: &mut SecureColumnByCoords<Self>,
+    ) -> crate::core::poly::line::LineDomain {
+        unimplemented!("W5_QPOLY: striped FRI layer 0 is SIMD only")
+    }
 
     /// Decomposes a FRI-space polynomial into a polynomial inside the fft-space and the
     /// remainder term.
@@ -123,6 +157,84 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
         Self { config, first_layer, inner_layers, last_layer_poly }
     }
 
+    /// SCREEN (w5 Q1603): [`Self::commit`] for a quotient kept as its polynomial: `coeffs` holds
+    /// the four coordinate coefficient columns (`2^(lifting_log_size - log_blowup_factor)` each).
+    /// Layer 0 is never resident: each of its `2^log_blowup_factor` stripes is evaluated, hashed
+    /// into the layer-0 tree, and dropped; once the root is mixed, each stripe is evaluated again
+    /// and folded into the first line layer. The decommitment evaluates the stripes it reads once
+    /// more. Every root, fold and opened value is the one [`Self::commit`] produces.
+    pub fn commit_striped(
+        channel: &mut MC::C,
+        config: FriConfig,
+        coeffs: [crate::prover::poly::circle::CircleCoefficients<B>; 4],
+        lifting_log_size: u32,
+        log_blowup_factor: u32,
+        twiddles: &'a TwiddleTree<B>,
+    ) -> Self {
+        use crate::core::poly::circle::CanonicCoset;
+        let domain = CanonicCoset::new(lifting_log_size).circle_domain();
+        let stripe_log_size = lifting_log_size - log_blowup_factor;
+        let n_stripes = 1usize << log_blowup_factor;
+        assert!(config.fold_step > 1 && stripe_log_size > LOG_PACKED_LEAF_SIZE + 5);
+        let evaluate = |stripe: usize| -> SecureColumnByCoords<B> {
+            let mut columns = SecureColumnByCoords::<B>::zeros(1 << stripe_log_size);
+            for (coeffs, column) in coeffs.iter().zip(columns.columns.iter_mut()) {
+                B::evaluate_stripe_into(coeffs, domain, twiddles, stripe, column);
+            }
+            columns
+        };
+        // Layer 0: the packed-leaf tree of each stripe, concatenated level by level.
+        let stripe_packed_log_size = stripe_log_size - LOG_PACKED_LEAF_SIZE;
+        let stripe_layers = (0..n_stripes)
+            .map(|stripe| {
+                let columns = evaluate(stripe);
+                let columns: [&Col<B, BaseField>; 4] = std::array::from_fn(|c| &columns.columns[c]);
+                B::build_packed_layers(&columns, stripe_packed_log_size)
+            })
+            .collect_vec();
+        let mut layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> = (0..=stripe_packed_log_size as usize)
+            .map(|level| stripe_layers.iter().flat_map(|layers| layers[level].to_cpu()).collect())
+            .collect();
+        drop(stripe_layers);
+        for _ in stripe_packed_log_size..lifting_log_size - LOG_PACKED_LEAF_SIZE {
+            let next = B::build_next_layer(layers.last().unwrap());
+            layers.push(next);
+        }
+        layers.reverse();
+        let merkle_tree = MerkleProverLifted { layers };
+        MC::mix_root(channel, merkle_tree.root());
+
+        // The circle-to-line fold and the extra line folds, stripe by stripe.
+        let folding_alpha = channel.draw_secure_felt();
+        let extra_line_folds = config.fold_step.saturating_sub(1);
+        let alpha_sq_powers = squared_alpha_powers(folding_alpha * folding_alpha, extra_line_folds);
+        let mut values = SecureColumnByCoords::<B>::zeros(1 << (lifting_log_size - 1 - extra_line_folds));
+        let mut line_domain = None;
+        for stripe in 0..n_stripes {
+            let columns = evaluate(stripe);
+            line_domain = Some(B::fold_circle_stripe_into_line_then_lines(
+                &columns,
+                stripe << stripe_log_size,
+                domain,
+                folding_alpha,
+                &alpha_sq_powers,
+                twiddles,
+                &mut values,
+            ));
+        }
+        let layer_evaluation = LineEvaluation::new(line_domain.unwrap(), values);
+        let first_layer = FriFirstLayerProver {
+            column: None,
+            merkle_tree,
+            pack_leaves: true,
+            striped: Some(StripedFirstLayer { coeffs, twiddles, domain, log_blowup_factor }),
+        };
+        let (inner_layers, last_layer_evaluation) =
+            Self::commit_inner_from(channel, config, layer_evaluation, twiddles);
+        let last_layer_poly = Self::commit_last_layer(channel, config, last_layer_evaluation);
+        Self { config, first_layer, inner_layers, last_layer_poly }
+    }
+
     /// Commits to the first FRI layer.
     fn commit_first_layer(
         channel: &mut MC::C,
@@ -145,20 +257,26 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
         column: &SecureEvaluation<B, BitReversedOrder>,
         twiddles: &TwiddleTree<B>,
     ) -> (Vec<FriInnerLayerProver<B, MC::H>>, LineEvaluation<B>) {
-        let mut layers = Vec::new();
         let folding_alpha = channel.draw_secure_felt();
 
-        let mut layer_evaluation = B::fold_circle_into_line(column, folding_alpha, twiddles);
-        let mut line_log_size = layer_evaluation.domain().log_size();
+        // The circle-to-line fold and any additional line folds of the first stage, in one pass.
+        let extra_line_folds = config.fold_step.saturating_sub(1);
+        let alpha_sq_powers = squared_alpha_powers(folding_alpha * folding_alpha, extra_line_folds);
+        let layer_evaluation =
+            B::fold_circle_into_line_then_lines(column, folding_alpha, &alpha_sq_powers, twiddles);
+        Self::commit_inner_from(channel, config, layer_evaluation, twiddles)
+    }
 
-        // Apply any additional line folds requested for the first stage.
-        if config.fold_step > 1 {
-            let extra_line_folds = config.fold_step - 1;
-            let alpha_sq_powers =
-                squared_alpha_powers(folding_alpha * folding_alpha, extra_line_folds);
-            layer_evaluation = B::fold_line(&layer_evaluation, &alpha_sq_powers, twiddles);
-            line_log_size -= extra_line_folds;
-        }
+    /// The inner layers of [`Self::commit_inner_layers`] from the first line layer on.
+    fn commit_inner_from(
+        channel: &mut MC::C,
+        config: FriConfig,
+        layer_evaluation: LineEvaluation<B>,
+        twiddles: &TwiddleTree<B>,
+    ) -> (Vec<FriInnerLayerProver<B, MC::H>>, LineEvaluation<B>) {
+        let mut layers = Vec::new();
+        let mut line_log_size = layer_evaluation.domain().log_size();
+        let mut layer_evaluation = layer_evaluation;
 
         let last_layer_log_domain_size = config.last_layer_domain_size().ilog2();
         assert!(
@@ -224,7 +342,7 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
 
     /// Returns a FRI proof and the query positions.
     pub fn decommit(self, channel: &mut MC::C) -> FriDecommitResult<MC::H> {
-        let first_layer_log_size = self.first_layer.column.domain.log_size();
+        let first_layer_log_size = self.first_layer.log_size();
         let unsorted_query_locations =
             draw_queries(channel, first_layer_log_size, self.config.n_queries);
         let queries = Queries::new(&unsorted_query_locations, first_layer_log_size);
@@ -271,9 +389,19 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
 
 /// Commitment to the first FRI layer.
 struct FriFirstLayerProver<'a, B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> {
-    column: &'a SecureEvaluation<B, BitReversedOrder>,
+    column: Option<&'a SecureEvaluation<B, BitReversedOrder>>,
     merkle_tree: MerkleProverLifted<B, H>,
     pack_leaves: bool,
+    striped: Option<StripedFirstLayer<'a, B>>,
+}
+
+/// SCREEN (w5 Q1603): the first layer of [`FriProver::commit_striped`]: the quotient's coordinate
+/// polynomials, from which the stripes the decommitment reads are evaluated again.
+struct StripedFirstLayer<'a, B: FriOps> {
+    coeffs: [crate::prover::poly::circle::CircleCoefficients<B>; 4],
+    twiddles: &'a TwiddleTree<B>,
+    domain: crate::core::poly::circle::CircleDomain,
+    log_blowup_factor: u32,
 }
 
 impl<'a, B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriFirstLayerProver<'a, B, H> {
@@ -288,15 +416,104 @@ impl<'a, B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriFirstLayerPro
             log_rows_per_leaf,
         );
 
-        FriFirstLayerProver { column: first_layer_column, merkle_tree, pack_leaves }
+        FriFirstLayerProver { column: Some(first_layer_column), merkle_tree, pack_leaves, striped: None }
+    }
+
+    fn log_size(&self) -> u32 {
+        match (&self.column, &self.striped) {
+            (Some(column), _) => column.domain.log_size(),
+            (None, Some(striped)) => striped.domain.log_size(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The decommitment of a [`StripedFirstLayer`]: the rows it reads (the queries' folding cosets
+    /// and the packed leaves under the omitted tree layers) are read from the stripes holding
+    /// them, evaluated one at a time.
+    fn decommit_striped(self, queries: &Queries, fold_step: u32) -> ExtendedFriLayerProof<H> {
+        let striped = self.striped.as_ref().unwrap();
+        let log_size = striped.domain.log_size();
+        assert_eq!(queries.log_domain_size, log_size);
+        let stripe_log_size = log_size - striped.log_blowup_factor;
+        // Rows of the queries' cosets, then the packed leaves those rows sit in.
+        let coset_rows = queries
+            .positions
+            .iter()
+            .map(|&position| position >> fold_step << fold_step)
+            .dedup()
+            .flat_map(|start| start..start + (1 << fold_step))
+            .collect_vec();
+        let leaf_positions = coset_rows
+            .iter()
+            .map(|&row| row >> LOG_PACKED_LEAF_SIZE)
+            .dedup()
+            .collect_vec();
+        let omitted = self.merkle_tree.omitted_leaf_positions(&leaf_positions);
+        let mut rows = coset_rows
+            .iter()
+            .copied()
+            .chain(omitted.iter().flat_map(|&leaf| {
+                (leaf << LOG_PACKED_LEAF_SIZE)..(leaf + 1) << LOG_PACKED_LEAF_SIZE
+            }))
+            .collect_vec();
+        rows.sort_unstable();
+        rows.dedup();
+        let mut values: HashMap<usize, [BaseField; 4]> = HashMap::new();
+        for (stripe, stripe_rows) in &rows.iter().group_by(|&&row| row >> stripe_log_size) {
+            let mut columns = SecureColumnByCoords::<B>::zeros(1 << stripe_log_size);
+            for (coeffs, column) in striped.coeffs.iter().zip(columns.columns.iter_mut()) {
+                B::evaluate_stripe_into(coeffs, striped.domain, striped.twiddles, stripe, column);
+            }
+            for &row in stripe_rows {
+                let local = row - (stripe << stripe_log_size);
+                values.insert(row, std::array::from_fn(|c| columns.columns[c].at(local)));
+            }
+        }
+        let at = |row: usize| QM31::from_m31_array(values[&row]);
+        let (decommitment_positions, column_witness, value_map) =
+            decommitment_positions_and_witness_evals_at(at, &queries.positions, fold_step);
+        let decommitment_positions = decommitment_positions
+            .iter()
+            .map(|position| position >> LOG_PACKED_LEAF_SIZE)
+            .dedup()
+            .collect_vec();
+        let (_, decommitment) =
+            self.merkle_tree.decommit_from(&decommitment_positions, vec![], |leaves| {
+                // The leaves rebuilt from compact columns holding only their rows.
+                let len = leaves.len().next_power_of_two().max(2);
+                let compact: [Col<B, BaseField>; 4] = std::array::from_fn(|c| {
+                    (0..len << LOG_PACKED_LEAF_SIZE)
+                        .map(|i| {
+                            let leaf = leaves[(i >> LOG_PACKED_LEAF_SIZE).min(leaves.len() - 1)];
+                            values[&((leaf << LOG_PACKED_LEAF_SIZE) + (i & ((1 << LOG_PACKED_LEAF_SIZE) - 1)))][c]
+                        })
+                        .collect()
+                });
+                let compact = compact.iter().collect_vec();
+                let positions = (0..leaves.len()).collect_vec();
+                B::packed_leaf_hashes_at(&compact, len.ilog2(), &positions)
+            });
+        let commitment = self.merkle_tree.root();
+        ExtendedFriLayerProof {
+            proof: FriLayerProof {
+                fri_witness: column_witness,
+                decommitment: decommitment.decommitment,
+                commitment,
+            },
+            aux: FriLayerProofAux { all_values: vec![value_map], decommitment: decommitment.aux },
+        }
     }
 
     fn decommit(self, queries: &Queries, fold_step: u32) -> ExtendedFriLayerProof<H> {
-        assert_eq!(queries.log_domain_size, self.column.domain.log_size());
+        if self.striped.is_some() {
+            return self.decommit_striped(queries, fold_step);
+        }
+        let column = self.column.unwrap();
+        assert_eq!(queries.log_domain_size, column.domain.log_size());
 
         let (decommitment_positions, column_witness, value_map) =
             compute_decommitment_positions_and_witness_evals(
-                self.column,
+                column,
                 &queries.positions,
                 fold_step,
             );
@@ -313,7 +530,7 @@ impl<'a, B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriFirstLayerPro
         // The returned opened values are not used. Retained coordinate columns let both
         // packed and unpacked trees recompute omitted lower layers at decommitment.
         // TODO(Leo): consider adding a method to merkle prover to decommit only the auth paths.
-        let columns: Vec<&Col<B, BaseField>> = self.column.values.columns.iter().collect();
+        let columns: Vec<&Col<B, BaseField>> = column.values.columns.iter().collect();
         let (_, decommitment) = if self.pack_leaves {
             self.merkle_tree.decommit_packed(&decommitment_positions, columns)
         } else {
@@ -395,6 +612,31 @@ impl<B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriInnerLayerProver<
             aux: FriLayerProofAux { all_values: vec![value_map], decommitment: decommitment.aux },
         }
     }
+}
+
+/// SCREEN (w5 Q1603): [`compute_decommitment_positions_and_witness_evals`] with the column read
+/// through `at`.
+fn decommitment_positions_and_witness_evals_at(
+    at: impl Fn(usize) -> QM31,
+    query_positions: &[usize],
+    fold_step: u32,
+) -> (Vec<usize>, Vec<QM31>, HashMap<usize, QM31>) {
+    let mut decommitment_positions = Vec::new();
+    let mut witness_evals = Vec::new();
+    let mut value_map = HashMap::new();
+    for subset_queries in query_positions.chunk_by(|a, b| a >> fold_step == b >> fold_step) {
+        let subset_start = (subset_queries[0] >> fold_step) << fold_step;
+        let mut subset_queries_iter = subset_queries.iter().peekable();
+        for position in subset_start..subset_start + (1 << fold_step) {
+            decommitment_positions.push(position);
+            let eval = at(position);
+            value_map.insert(position, eval);
+            if subset_queries_iter.next_if_eq(&&position).is_none() {
+                witness_evals.push(eval);
+            }
+        }
+    }
+    (decommitment_positions, witness_evals, value_map)
 }
 
 /// Returns a column's merkle tree decommitment positions and the evals the verifier can't

@@ -85,6 +85,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     fn commit(&mut self, polynomials: ColumnVec<CircleCoefficients<B>>, channel: &mut MC::C) {
         let _span = span!(Level::INFO, "Commitment").entered();
         let lifting_log_size = self.config.lifting_log_size(self.trees.len());
+        crate::prover::F2_TREE.store(self.trees.len(), std::sync::atomic::Ordering::Relaxed);
         let mut tree = CommitmentTreeProver::new_ex(
             polynomials,
             self.config.fri_config.log_blowup_factor,
@@ -93,7 +94,19 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             lifting_log_size,
             &self.base_column_pool,
             true,
+            // `M11_PACK_LEGS`: bit 0 packs the circuit leg's base tree (log blowup 2), bit 1 the Cairo
+            // leg's (log blowup 3, which the evaluator's large-Cairo guard times on its own).
+            if self.trees.len() == 1
+                && crate::prover::m11_env("M11_PACK_LEGS", 3)
+                    & if self.config.fri_config.log_blowup_factor == 2 { 1 } else { 2 }
+                    != 0
+            {
+                crate::prover::m11_env("M11_PACK", 0) as u32
+            } else {
+                0
+            },
         );
+        crate::prover::F2_TREE.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
         MC::mix_root(channel, tree.commitment.root());
         // Only newly owned ordinary commitments are considered. Externally supplied or borrowed
         // preprocessed trees use commit_tree and retain their existing storage behavior.
@@ -141,14 +154,26 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
                 let to_coefficients = |poly: &mut Poly<B>| {
-                    if poly.coeffs.is_none() && poly.evals.values.len() < poly.evals.domain.size() {
+                    if poly.coeffs.is_none()
+                        && !poly.is_sourced()
+                        && poly.evals.values.len() < poly.evals.domain.size()
+                    {
                         poly.coeffs = Some(poly.take_regrown_coefficients());
                     }
                 };
                 #[cfg(feature = "parallel")]
                 {
-                    use rayon::iter::IntoParallelRefMutIterator;
-                    tree.polynomials.par_iter_mut().for_each(to_coefficients);
+                    // SCREEN (r77, n9 LPT2): `R77_LPT2=1` takes the largest columns first, one
+                    // column per task.
+                    if false {
+                        use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+                        let mut polys = tree.polynomials.iter_mut().collect::<Vec<_>>();
+                        polys.sort_by_key(|poly| std::cmp::Reverse(poly.evals.domain.log_size()));
+                        polys.into_par_iter().with_max_len(1).for_each(|poly| to_coefficients(poly));
+                    } else {
+                        use rayon::iter::IntoParallelRefMutIterator;
+                        tree.polynomials.par_iter_mut().for_each(to_coefficients);
+                    }
                 }
                 #[cfg(not(feature = "parallel"))]
                 tree.polynomials.iter_mut().for_each(to_coefficients);
@@ -164,17 +189,43 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
                 let to_stripe = |poly: &mut Poly<B>| {
-                    if poly.evals.values.len() == 0 {
+                    if poly.evals.values.len() == 0 && !poly.is_sourced() {
                         let coeffs = poly.coeffs.take().unwrap();
                         let mut stripe = pool.take_or_alloc(coeffs.log_size());
                         B::evaluate_stripe_into(&coeffs, poly.evals.domain, twiddles, 0, &mut stripe);
                         poly.evals.values = stripe;
+                        // SCREEN (w5 Q1611): `W5_B2SPOOL=1` hands the coefficient buffer (the same
+                        // size as the stripe) to the pool, so the next column's stripe reuses it
+                        // instead of the allocator holding both.
+                        if crate::prover::m11_env("W5_B2SPOOL", 0) != 0 {
+                            pool.give_back(coeffs.log_size(), coeffs.coeffs);
+                        }
                     }
                 };
+                // SCREEN (p12 Q1554): `P12_B2S=<log>` converts the columns of at least that log
+                // size one at a time (each FFT is parallel on its own), so that at most one large
+                // column has both its coefficients and its stripe resident.
+                let b2s_log = crate::prover::m11_env("P12_B2S", 0) as u32;
                 #[cfg(feature = "parallel")]
                 {
-                    use rayon::iter::IntoParallelRefMutIterator;
-                    tree.polynomials.par_iter_mut().for_each(to_stripe);
+                    use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+                    if false {
+                        // SCREEN (r77, n9 LPT2): `R77_LPT2=1` takes the largest columns first, one
+                        // column per task.
+                        use rayon::iter::{IndexedParallelIterator, IntoParallelIterator};
+                        let mut polys = tree.polynomials.iter_mut().collect::<Vec<_>>();
+                        polys.sort_by_key(|poly| std::cmp::Reverse(poly.evals.domain.log_size()));
+                        polys.into_par_iter().with_max_len(1).for_each(|poly| to_stripe(poly));
+                    } else if b2s_log > 0 {
+                        let is_large = |poly: &Poly<B>| poly.evals.domain.log_size() > b2s_log;
+                        tree.polynomials.iter_mut().filter(|p| is_large(p)).for_each(to_stripe);
+                        tree.polynomials
+                            .par_iter_mut()
+                            .filter(|p| !is_large(p))
+                            .for_each(to_stripe);
+                    } else {
+                        tree.polynomials.par_iter_mut().for_each(to_stripe);
+                    }
                 }
                 #[cfg(not(feature = "parallel"))]
                 tree.polynomials.iter_mut().for_each(to_stripe);
@@ -255,6 +306,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             HashMap::new();
         // Columns that store no values are sampled from their source (see below).
         let mut sourced: Vec<(usize, usize)> = vec![];
+        // SCREEN (r77, d9x OODSPAR): `R77_OODSPAR=1` evaluates the coefficient columns' samples
+        // concurrently (largest first), and the groups too, instead of one at a time.
+        let oodspar = cfg!(feature = "parallel") && true;
+        let mut jobs = vec![];
         assert_eq!(polynomials.len(), sampled_points.len());
         for (tree_index, columns) in polynomials.iter().enumerate() {
             assert_eq!(columns.len(), sampled_points[tree_index].len());
@@ -269,6 +324,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 {
                     let projected_point = point.repeated_double(lifting_log_size - log_size);
                     if let Some(coefficients) = &poly.coeffs {
+                        if oodspar {
+                            jobs.push((tree_index, column_index, sample_index, coefficients, projected_point));
+                            continue;
+                        }
                         samples[tree_index][column_index][sample_index].value =
                             coefficients.eval_at_point(projected_point);
                     } else {
@@ -282,6 +341,41 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             }
         }
         let log_blowup = self.config.fri_config.log_blowup_factor;
+        #[cfg(feature = "parallel")]
+        let groups = if oodspar {
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+            jobs.sort_by_key(|job| std::cmp::Reverse(job.3.log_size()));
+            let values: Vec<SecureField> = jobs
+                .par_iter()
+                .with_max_len(1)
+                .map(|&(_, _, _, coefficients, point)| coefficients.eval_at_point(point))
+                .collect();
+            for (&(tree, column, sample, _, _), value) in jobs.iter().zip(values) {
+                samples[tree][column][sample].value = value;
+            }
+            let groups = groups.into_iter().collect_vec();
+            let group_values: Vec<Vec<SecureField>> = groups
+                .par_iter()
+                .with_max_len(1)
+                .map(|((log_size, point), members)| {
+                    let evaluations = members
+                        .iter()
+                        .map(|&(tree, column, _)| &polynomials[tree][column].evals)
+                        .collect_vec();
+                    B::subdomain_eval_group(CanonicCoset::new(*log_size), log_blowup, *point, &evaluations)
+                })
+                .collect();
+            for ((_, members), values) in groups.into_iter().zip(group_values) {
+                assert_eq!(members.len(), values.len());
+                for ((tree, column, sample), value) in members.into_iter().zip(values) {
+                    samples[tree][column][sample].value = value;
+                }
+            }
+            HashMap::new()
+        } else {
+            groups
+        };
+        drop(jobs);
         for ((log_size, point), members) in groups {
             let evaluations = members
                 .iter()
@@ -332,7 +426,8 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                     )
                 })
                 .collect_vec();
-            for batch in members.chunks(SOURCED_BATCH) {
+            // SCREEN (f2 Q1684): `F2_SBATCH=k` expands k sourced columns at once (16).
+            for batch in members.chunks(crate::prover::m11_env("F2_SBATCH", SOURCED_BATCH).max(1)) {
                 let expand = |&(tree, column): &(usize, usize)| {
                     let source = polynomials[tree][column].source.as_ref().unwrap();
                     CircleEvaluation::<B, BaseField, BitReversedOrder>::new(
@@ -445,6 +540,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         self.base_column_pool.release_all_idle();
 
         self.coefficients_to_striped();
+        if crate::prover::m11_env("W5_B2SPOOL", 0) != 0 {
+            // (Q1611: the coefficient buffers left over in the pool go before the quotients.)
+            self.base_column_pool.release_all_idle();
+        }
         crate::prover::backend::simd::column::trim_heap();
         // Point samples are complete; subsequent quotient and opening paths use evaluations.
         for tree in &mut self.trees.0 {
@@ -486,8 +585,40 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         crate::prover::backend::simd::column::trim_heap();
 
         // Run FRI commitment phase on the oods quotients.
-        let fri_prover =
-            FriProver::<B, MC>::commit(channel, self.config.fri_config, &quotients, self.twiddles);
+        // SCREEN (w5 Q1603): under `W5_QPOLY` the quotients come back as the coordinate
+        // coefficients of the quotient (smaller than the lifting domain), and FRI commits to them
+        // stripe by stripe.
+        let mut quotients = Some(quotients);
+        let mut striped_coeffs = (quotients.as_ref().unwrap().values.len() < 1 << lifting_log_size)
+            .then(|| quotients.take().unwrap().values.columns.map(crate::prover::poly::circle::CircleCoefficients::new));
+        // A small proof (or one folding a single layer) commits the extended column as before.
+        let fri_config = self.config.fri_config;
+        let stripe_log_size = lifting_log_size - fri_config.log_blowup_factor;
+        if striped_coeffs.is_some()
+            && !(fri_config.fold_step > 1
+                && stripe_log_size > crate::core::vcs_lifted::verifier::LOG_PACKED_LEAF_SIZE + 5
+                && lifting_log_size >= 5 + fri_config.fold_step)
+        {
+            let domain = CanonicCoset::new(lifting_log_size).circle_domain();
+            let columns = striped_coeffs.take().unwrap().map(|c| c.evaluate_with_twiddles(domain, self.twiddles).values);
+            quotients = Some(crate::prover::poly::circle::SecureEvaluation::new(domain, SecureColumnByCoords { columns }));
+        }
+        let fri_prover = match striped_coeffs {
+            Some(coeffs) => FriProver::<B, MC>::commit_striped(
+                channel,
+                self.config.fri_config,
+                coeffs,
+                lifting_log_size,
+                self.config.fri_config.log_blowup_factor,
+                self.twiddles,
+            ),
+            None => FriProver::<B, MC>::commit(
+                channel,
+                self.config.fri_config,
+                quotients.as_ref().unwrap(),
+                self.twiddles,
+            ),
+        };
         crate::prover::backend::simd::column::trim_heap();
 
         // Proof of work.
@@ -520,24 +651,38 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         );
         // The FRI input column is dead once FRI has decommitted: free it before the striped trees
         // regrow their stripes.
-        for column in quotients.values.columns {
-            self.base_column_pool.give_back(lifting_log_size, column);
+        if let Some(quotients) = quotients {
+            for column in quotients.values.columns {
+                self.base_column_pool.give_back(lifting_log_size, column);
+            }
         }
         self.base_column_pool.release_all_idle();
         let commitments = self.roots();
         let twiddles = self.twiddles;
         let pool: &BaseColumnPool<B> = &self.base_column_pool;
-        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = self
-            .trees
-            .as_ref()
-            .zip_eq(query_positions_tree)
-            .map(|(tree, query_positions)| {
-                tree.decommit(query_positions, twiddles, pool, self.config.fri_config.log_blowup_factor)
-            })
-            .0
+        let log_blowup_factor = self.config.fri_config.log_blowup_factor;
+        let pairs = self.trees.as_ref().zip_eq(query_positions_tree).0;
+        // SCREEN (r77, d9x PARDEC): `R77_PARDEC=1` decommits the trees concurrently (in order).
+        #[cfg(feature = "parallel")]
+        let decommitted: Vec<_> = if false {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            pairs
+                .into_par_iter()
+                .map(|(tree, query_positions)| tree.decommit(query_positions, twiddles, pool, log_blowup_factor))
+                .collect()
+        } else {
+            pairs
+                .into_iter()
+                .map(|(tree, query_positions)| tree.decommit(query_positions, twiddles, pool, log_blowup_factor))
+                .collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let decommitted: Vec<_> = pairs
             .into_iter()
-            .map(|(v, x)| (v, x.decommitment, x.aux))
-            .multiunzip();
+            .map(|(tree, query_positions)| tree.decommit(query_positions, twiddles, pool, log_blowup_factor))
+            .collect();
+        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) =
+            decommitted.into_iter().map(|(v, x)| (v, x.decommitment, x.aux)).multiunzip();
 
         // Return evaluation buffers to the memory pool for reuse (owned trees only).
         for tree in &mut self.trees.0 {
@@ -637,6 +782,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             lifting_log_size,
             base_column_pool,
             false,
+            0,
         )
     }
 
@@ -651,6 +797,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         lifting_log_size: u32,
         base_column_pool: &BaseColumnPool<B>,
         keep_coefficients: bool,
+        pack: u32,
     ) -> Self {
         let n_columns = polynomials.len();
         Self::new_ex_with_sources(
@@ -662,6 +809,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             base_column_pool,
             keep_coefficients,
             vec![None; n_columns],
+            pack,
         )
     }
 
@@ -687,6 +835,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             base_column_pool,
             false,
             sources,
+            0,
         )
     }
 
@@ -700,6 +849,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         base_column_pool: &BaseColumnPool<B>,
         keep_coefficients: bool,
         sources: Vec<Option<SharedTraceSource>>,
+        pack: u32,
     ) -> Self {
         assert_eq!(sources.len(), polynomials.len());
         if B::STRIPES && can_stripe(&polynomials, log_blowup_factor, lifting_log_size) {
@@ -711,6 +861,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 base_column_pool,
                 keep_coefficients,
                 sources,
+                pack,
             );
         }
         let span = span!(Level::INFO, "Extension").entered();
@@ -752,7 +903,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         lifting_log_size: u32,
         base_column_pool: &BaseColumnPool<B>,
         keep_coef: bool,
-        sources: Vec<Option<SharedTraceSource>>,
+        mut sources: Vec<Option<SharedTraceSource>>,
+        pack_mode: u32,
     ) -> Self {
         let _span = span!(Level::INFO, "Striped extension and Merkle").entered();
         // The witness and interaction writers leave freed temporaries in glibc's arenas: hand
@@ -760,8 +912,32 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         crate::prover::backend::simd::column::trim_heap();
         // Each stripe is committed as `2^sub` blocks, so that the scratch of every column is a
         // block, not a stripe. The tree is the same: its leaves are rows.
-        let sub = 1u32
-            .min(polynomials.iter().map(|poly| poly.log_size()).min().unwrap() - 4);
+        // SCREEN (r77, n9 CSUB0): `R77_CSUB0=1` commits the Cairo trees (log blowup != 2) in whole
+        // stripes.
+        let csub0 = log_blowup_factor != 2 && false;
+        // SCREEN (w5 Q1616): `W5_CSUB=n+1` commits the Cairo trees (log blowup != 2) as `2^n` blocks per
+        // stripe, whatever `M11_SUB` gives the circuit trees (only the circuit commit needs the split).
+        // SCREEN (f2 Q1661): `F2_SUBK=s+1` is the same for the Cairo leg (log blowup 3), found
+        // independently (z1-s1m: SUB3 costs ~1 s of Cairo folds under windows that do not bind).
+        // SCREEN (f2 Q1674): `F2_SUBT=mask` gives `M11_SUB` only to the circuit leg's trees whose
+        // index is in `mask` (bit 1 = base trace); its other trees commit at sub 1.
+        let csub = crate::prover::m11_env("W5_CSUB", 0);
+        let subt = crate::prover::m11_env("F2_SUBT", 0);
+        let tree = crate::prover::F2_TREE.load(std::sync::atomic::Ordering::Relaxed);
+        let leg_sub = match crate::prover::m11_env("F2_SUBK", 0) {
+            k if k > 0 && log_blowup_factor == 3 => k - 1,
+            _ if csub > 0 && log_blowup_factor != 2 => csub - 1,
+            _ if subt != 0 && log_blowup_factor == 2 && (tree >= 64 || (subt >> tree) & 1 == 0) => 1,
+            _ => crate::prover::m11_env("M11_SUB", 1),
+        };
+        let sub = (if csub0 { 0u32 } else { leg_sub as u32 })
+            .min(polynomials.iter().map(|poly| poly.log_size()).min().unwrap() - crate::prover::m11_env("M11_SUBMIN", 4) as u32);
+        // SCREEN (r77, d9s LPT): `R77_LPT=1` fills the largest columns first, one column per task.
+        let lpt = false;
+        // SCREEN (r77, d9s MULTI): `R77_MULTI=k`: a tree with fewer columns than threads fills and
+        // hashes `k` stripes at once, each into its own scratch columns.
+        let multi =
+            1;
         let n_stripes = 1usize << (log_blowup_factor + sub);
         let stripe_lifting_log_size = lifting_log_size - log_blowup_factor - sub;
         let domains = polynomials
@@ -769,18 +945,45 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .map(|poly| CanonicCoset::new(poly.log_size() + log_blowup_factor).circle_domain())
             .collect_vec();
         let prefix = domains.iter().map(|&domain| keeps_prefix(domain, log_blowup_factor)).collect_vec();
+        // SCREEN (m11, Q1405): a kept-coefficient prefix column whose trace values fit in 16 bits
+        // keeps them packed, as its source, instead of its coefficients.
+        // Mode 1 packs before the stripes (its transients add to the commit window); mode 2 (Q1406)
+        // after them, one column at a time, each column's coefficients dropped once it is packed.
+        let pack = (pack_mode == 1 || pack_mode == 3) && keep_coef;
+        // Mode 3 (Q1407): packs before the stripes like mode 1, but one column at a time, each
+        // column's coefficients dropped once packed; the stripes regrow them from the source.
+        let mut polynomials = polynomials.into_iter().map(Some).collect_vec();
+        if pack_mode == 3 && keep_coef {
+            for ((poly, &prefix), source) in polynomials.iter_mut().zip(&prefix).zip(sources.iter_mut()) {
+                if prefix && source.is_none() {
+                    *source = pack_column(poly.as_ref().unwrap(), twiddles);
+                    if source.is_some() {
+                        *poly = None;
+                    }
+                }
+            }
+        }
+        let log_sizes = domains.iter().map(|d| d.log_size() - log_blowup_factor).collect_vec();
+        if pack_mode == 1 && keep_coef {
+            let polynomials = polynomials.iter().map(|p| p.clone().unwrap()).collect_vec();
+            pack_sources(&polynomials, &prefix, &mut sources, twiddles);
+        }
         // A prefix column with a source keeps nothing but the source: every stripe of it, stripe 0
         // included, is hashed from its scratch column.
         let sourced = prefix
             .iter()
             .zip(&sources)
             .map(|(&prefix, source): (&bool, &Option<SharedTraceSource>)| {
-                prefix && !keep_coef && source.is_some()
+                prefix && (!keep_coef || pack) && source.is_some()
             })
             .collect_vec();
         // With `keep_coef`, a prefix column keeps its coefficients instead of stripe 0 (the same size):
         // composition and the samples read coefficients, and stripe 0 is evaluated back only for
         // the quotients (`coefficients_to_striped`).
+        // Z1_S0 (Q1580): with `sub > 0`, a prefix column's stripe 0 is evaluated whole when the
+        // stripe-0 blocks start, its coefficients are dropped right away and its blocks are copied
+        // from it, so coefficients, stripe 0 and scratch are never all resident at once.
+        let s0 = sub > 0 && !keep_coef && crate::prover::m11_env("Z1_S0", 0) != 0;
         // Prefix columns get their stripe-0 buffer now (the last stripe hashed, which the FFT writes
         // in place). Whole-extension columns are evaluated now.
         let mut evals = polynomials
@@ -788,29 +991,109 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .zip(&domains)
             .zip(&prefix)
             .zip(&sourced)
-            .map(|(((poly, &domain), &prefix), &sourced)| {
-                if (prefix && keep_coef) || sourced {
+            .zip(&log_sizes)
+            .map(|((((poly, &domain), &prefix), &sourced), &log_size)| {
+                if (prefix && keep_coef) || sourced || (s0 && prefix) {
                     Col::<B, BaseField>::zeros(0)
                 } else if prefix {
-                    base_column_pool.take_or_alloc(poly.log_size())
+                    base_column_pool.take_or_alloc(log_size)
                 } else {
                     let buffer = base_column_pool.take_or_alloc(domain.log_size());
-                    B::evaluate_into(poly, domain, twiddles, buffer).values
+                    B::evaluate_into(poly.as_ref().unwrap(), domain, twiddles, buffer).values
                 }
             })
             .collect_vec();
-        let mut scratch = polynomials
+        let mut scratch = log_sizes
             .iter()
-            .map(|poly| base_column_pool.take_or_alloc(poly.log_size() - sub))
+            // Q1409: a column whose block is below one packed word (16 rows) gets a 16-row scratch.
+            .map(|&log_size| base_column_pool.take_or_alloc((log_size - sub).max(LOG_N_LANES_PCS)))
             .collect_vec();
-        let mut coeffs = polynomials.into_iter().map(Some).collect_vec();
+        if false {
+            // Z1 census: what the striped commit holds while it hashes.
+            let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
+            let sbytes: usize = scratch.iter().map(|c| c.len() * 4).sum();
+            let ebytes: usize = evals.iter().map(|c| c.len() * 4).sum();
+            let cbytes: usize =
+                polynomials.iter().flatten().map(|p| (1usize << p.log_size()) * 4).sum();
+            let mut hist = std::collections::BTreeMap::<u32, usize>::new();
+            for &l in &log_sizes {
+                *hist.entry(l).or_default() += 1;
+            }
+            eprintln!(
+                "Z1C commit n={} lift={} sub={} keep_coef={} sourced={} prefix={} scratch={:.1}MiB evals={:.1}MiB coeffs={:.1}MiB hist={:?}",
+                log_sizes.len(), lifting_log_size, sub, keep_coef,
+                sourced.iter().filter(|&&s| s).count(), prefix.iter().filter(|&&p| p).count(),
+                mib(sbytes), mib(ebytes), mib(cbytes), hist
+            );
+        }
+        let mut coeffs = polynomials;
+        let sflags: Vec<(bool, Option<SharedTraceSource>)> =
+            sourced.iter().copied().zip(sources.iter().cloned()).collect();
 
         // Stripe 0, the only one a prefix column keeps, last and in place.
         let n_first = 1usize << sub;
         let order = (n_first..n_stripes).chain(0..n_first).collect_vec();
         let mut stripe_layers: Vec<Option<Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>>>> =
             (0..n_stripes).map(|_| None).collect();
+        let mut done = vec![false; n_stripes];
+        #[cfg(feature = "parallel")]
+        if multi > 1 && coeffs.len() < rayon::current_num_threads() {
+            use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
+            // Only stripes that write no column's resident stripe 0.
+            let safe = order
+                .iter()
+                .copied()
+                .filter(|&stripe| keep_coef || (sub > 0 && stripe >= n_first))
+                .collect_vec();
+            for group in safe.chunks(multi) {
+                let sets = group
+                    .iter()
+                    .map(|_| {
+                        coeffs
+                            .iter()
+                            .map(|poly| base_column_pool.take_or_alloc(poly.as_ref().unwrap().log_size() - sub))
+                            .collect_vec()
+                    })
+                    .collect_vec();
+                let results = group
+                    .par_iter()
+                    .zip(sets.into_par_iter())
+                    .map(|(&stripe, mut set)| {
+                        set.par_iter_mut().enumerate().for_each(|(i, column)| {
+                            let poly = coeffs[i].as_ref().unwrap();
+                            let len = 1usize << (poly.log_size() - sub);
+                            if !prefix[i] {
+                                B::copy_block(&evals[i], stripe * len, column, 0, len);
+                            } else {
+                                B::evaluate_block_into(poly, domains[i], twiddles, poly.log_size() - sub, stripe, column);
+                            }
+                        });
+                        let layers = {
+                            let columns = set.iter().sorted_by_key(|column| column.len()).collect_vec();
+                            B::build_layers_sparse(&columns, stripe_lifting_log_size)
+                        };
+                        (stripe, layers, set)
+                    })
+                    .collect::<Vec<_>>();
+                for (stripe, layers, set) in results {
+                    stripe_layers[stripe] = Some(layers);
+                    done[stripe] = true;
+                    for (poly, column) in coeffs.iter().zip(set) {
+                        base_column_pool.give_back(poly.as_ref().unwrap().log_size() - sub, column);
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
+        let _ = multi;
+        // SCREEN (1bm Q1531, Q1511): each stripe's levels are copied into the tree's levels as
+        // the stripe is hashed, so the levels are never held twice.
+        let in_place = crate::prover::m11_env("Q1531_INPLACE", 0) != 0;
+        let mut levels: Vec<Vec<<MC::H as MerkleHasherLifted>::Hash>> = vec![];
         for &stripe in &order {
+            if done[stripe] {
+                continue;
+            }
             if stripe == 0 && sub == 0 && !keep_coef {
                 // Stripe 0 is written in place, so the prefix columns' scratch is dead: free it
                 // first.
@@ -821,16 +1104,74 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 }
                 base_column_pool.release_all_idle();
             }
-            let fill = |(((((poly, &domain), &prefix), &sourced), eval), column): (
+            if s0 && stripe == 0 {
+                // Q1580: stripe 0 whole, then the coefficients go (see `s0`).
+                let first = |((((poly, eval), &domain), &prefix), &(sourced, _)): (
+                    (((&mut Option<CircleCoefficients<B>>, &mut Col<B, BaseField>), &CircleDomain), &bool),
+                    &(bool, Option<SharedTraceSource>),
+                )| {
+                    if prefix && !sourced {
+                        let coeffs = poly.take().unwrap();
+                        let mut buffer = base_column_pool.take_or_alloc(coeffs.log_size());
+                        B::evaluate_stripe_into(&coeffs, domain, twiddles, 0, &mut buffer);
+                        drop(coeffs);
+                        *eval = buffer;
+                    }
+                };
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
+                    coeffs
+                        .par_iter_mut()
+                        .zip(evals.par_iter_mut())
+                        .zip(domains.par_iter())
+                        .zip(prefix.par_iter())
+                        .zip(sflags.par_iter())
+                        .for_each(first);
+                }
+                #[cfg(not(feature = "parallel"))]
+                coeffs.iter_mut().zip(evals.iter_mut()).zip(&domains).zip(&prefix).zip(&sflags).for_each(first);
+            }
+            let fill = |(((((poly, &domain), &prefix), sflag), eval), column): (
                 (
-                    (((&Option<CircleCoefficients<B>>, &CircleDomain), &bool), &bool),
+                    (((&Option<CircleCoefficients<B>>, &CircleDomain), &bool), &(bool, Option<SharedTraceSource>)),
                     &mut Col<B, BaseField>,
                 ),
                 &mut Col<B, BaseField>,
             )| {
-                let poly = poly.as_ref().unwrap();
+                if s0 && prefix && !sflag.0 && stripe < n_first {
+                    // Q1580: a block of the stripe 0 evaluated above.
+                    let len = eval.len() >> sub;
+                    B::copy_block(eval, stripe * len, column, 0, len);
+                    return;
+                }
+                // A mode-3 packed column regrows its coefficients from its source for each stripe.
+                let regrown;
+                let poly = match poly {
+                    Some(poly) => poly,
+                    None => {
+                        let source = sflag.1.as_ref().unwrap();
+                        let trace = CanonicCoset::new(source.log_size()).circle_domain();
+                        regrown = CircleEvaluation::<B, BaseField, BitReversedOrder>::new(
+                            trace,
+                            crate::prover::air::component_prover::source_column::<B>(source.as_ref()),
+                        )
+                        .interpolate_with_twiddles(twiddles);
+                        &regrown
+                    }
+                };
+                let sourced = sflag.0;
                 let len = 1usize << (poly.log_size() - sub);
-                if !prefix {
+                if !prefix && len < 1 << LOG_N_LANES_PCS {
+                    // Q1409: the block lifted to 16 rows as the tree lifts a column
+                    // (`dup[j] = block[(j >> (k + 1) << 1) + (j & 1)]`, `k` the log ratio): every
+                    // leaf reads the same value of it as of the block, so the hashes are the same,
+                    // and the tree keeps the packed-word leaves of the fused hasher.
+                    let k = LOG_N_LANES_PCS - len.ilog2();
+                    for j in 0..1usize << LOG_N_LANES_PCS {
+                        column.set(j, eval.at(stripe * len + (j >> (k + 1) << 1) + (j & 1)));
+                    }
+                } else if !prefix {
                     B::copy_block(eval, stripe * len, column, 0, len);
                 } else if keep_coef {
                     B::evaluate_block_into(poly, domain, twiddles, poly.log_size() - sub, stripe, column);
@@ -847,26 +1188,44 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             };
             #[cfg(feature = "parallel")]
             {
-                use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator};
-                coeffs
-                    .par_iter()
-                    .zip(domains.par_iter())
-                    .zip(prefix.par_iter())
-                    .zip(sourced.par_iter())
-                    .zip(evals.par_iter_mut())
-                    .zip(scratch.par_iter_mut())
-                    .for_each(fill);
+                use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator};
+                if lpt {
+                    // SCREEN (r77, d9s LPT): the largest columns first, one column per task.
+                    let mut items = coeffs
+                        .iter()
+                        .zip(domains.iter())
+                        .zip(prefix.iter())
+                        .zip(sflags.iter())
+                        .zip(evals.iter_mut())
+                        .zip(scratch.iter_mut())
+                        .collect_vec();
+                    items.sort_by_key(|(((((poly, _), _), _), _), _)| {
+                        std::cmp::Reverse(poly.as_ref().unwrap().log_size())
+                    });
+                    items.into_par_iter().with_max_len(1).for_each(fill);
+                } else {
+                    coeffs
+                        .par_iter()
+                        .zip(domains.par_iter())
+                        .zip(prefix.par_iter())
+                        .zip(sflags.par_iter())
+                        .zip(evals.par_iter_mut())
+                        .zip(scratch.par_iter_mut())
+                        .for_each(fill);
+                }
             }
             #[cfg(not(feature = "parallel"))]
             coeffs
                 .iter()
                 .zip(&domains)
                 .zip(&prefix)
-                .zip(&sourced)
+                .zip(&sflags)
                 .zip(evals.iter_mut())
                 .zip(scratch.iter_mut())
                 .for_each(fill);
+            // Sorted by the columns' own sizes (a lifted block of Q1409 keeps its place).
             let columns = (0..coeffs.len())
+                .sorted_by_key(|&i| log_sizes[i])
                 .map(|i| {
                     if prefix[i] && !sourced[i] && stripe == 0 && sub == 0 && !keep_coef {
                         &evals[i]
@@ -874,13 +1233,31 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                         &scratch[i]
                     }
                 })
-                .sorted_by_key(|column| column.len())
                 .collect_vec();
-            stripe_layers[stripe] = Some(B::build_layers_sparse(&columns, stripe_lifting_log_size));
+            let mut built = B::build_layers_sparse(&columns, stripe_lifting_log_size);
+            crate::prover::vcs_lifted::prover::q1530_drop_levels(&mut built);
+            if in_place {
+                if levels.is_empty() {
+                    levels = built.iter().map(|layer| Vec::with_capacity(layer.len() * n_stripes)).collect();
+                    levels.iter_mut().zip(&built).for_each(|(level, layer)| {
+                        level.resize(layer.len() * n_stripes, Default::default())
+                    });
+                }
+                for (level, layer) in levels.iter_mut().zip(built) {
+                    let len = layer.len();
+                    level[stripe * len..(stripe + 1) * len].copy_from_slice(&layer.to_cpu());
+                }
+            } else {
+                stripe_layers[stripe] = Some(built);
+            }
+            if crate::prover::m11_env("M11_STRIPE_TRIM", 0) != 0 {
+                crate::prover::backend::simd::column::trim_heap();
+            }
         }
+        crate::prover::backend::simd::circle::w5_clear_fold_buffers();
         // A prefix column's coefficients are regrown from stripe 0 where they are needed (the
         // out-of-domain samples, composition and the decommitment), one column or tree at a time.
-        let log_sizes = coeffs.iter().map(|poly| poly.as_ref().unwrap().log_size()).collect_vec();
+
         for (poly, &prefix) in coeffs.iter_mut().zip(&prefix) {
             if prefix && !keep_coef {
                 drop(poly.take());
@@ -893,31 +1270,68 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         }
         base_column_pool.release_all_idle();
         crate::prover::backend::simd::column::trim_heap();
-        let stripe_layers = stripe_layers.into_iter().map(Option::unwrap).collect_vec();
-
         // Level `l` of the tree, up to the stripes' roots, is the concatenation of the stripes'
         // levels `l`, in stripe order.
-        let mut layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> = (0
-            ..=stripe_lifting_log_size as usize)
-            .map(|level| {
-                stripe_layers.iter().flat_map(|layers| layers[level].to_cpu()).collect()
-            })
-            .collect();
-        drop(stripe_layers);
+        let mut layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> = if in_place {
+            levels.into_iter().map(|level| level.into_iter().collect()).collect()
+        } else {
+            let stripe_layers = stripe_layers.into_iter().map(Option::unwrap).collect_vec();
+            (0..=stripe_lifting_log_size as usize)
+                .map(|level| {
+                    stripe_layers.iter().flat_map(|layers| layers[level].to_cpu()).collect()
+                })
+                .collect()
+        };
         for _ in stripe_lifting_log_size..lifting_log_size {
             let next = B::build_next_layer(layers.last().unwrap());
             layers.push(next);
         }
         layers.reverse();
 
+        // SCREEN (w5 Q1605): `W5_PACKPAR=k` packs the mode-2 columns `k` at a time in parallel
+        // (each column's coefficients dropped once it is packed) instead of one after another.
+        let packpar = crate::prover::m11_env("W5_PACKPAR", 0);
+        let mut prepacked: Vec<Option<Option<SharedTraceSource>>> = vec![None; coeffs.len()];
+        #[cfg(feature = "parallel")]
+        if pack_mode == 2 && keep_coef && packpar > 0 {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            let eligible = (0..coeffs.len())
+                .filter(|&i| !sourced[i] && evals[i].len() == 0 && coeffs[i].is_some())
+                .collect_vec();
+            for chunk in eligible.chunks(packpar) {
+                let packed: Vec<Option<SharedTraceSource>> = chunk
+                    .par_iter()
+                    .map(|&i| pack_column(coeffs[i].as_ref().unwrap(), twiddles))
+                    .collect();
+                for (&i, packed) in chunk.iter().zip(packed) {
+                    if packed.is_some() {
+                        coeffs[i] = None;
+                    }
+                    prepacked[i] = Some(packed);
+                }
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
+        let _ = packpar;
         let polynomials = coeffs
             .into_iter()
             .zip(domains)
             .zip(evals)
             .zip(sources.into_iter().zip(sourced))
-            .map(|(((coeffs, domain), values), (source, sourced))| {
+            .zip(prepacked)
+            .map(|((((coeffs, domain), values), (source, sourced)), prepacked)| {
                 if sourced {
                     return Poly::from_source(domain, source.unwrap());
+                }
+                let tried = prepacked.is_some();
+                if let Some(Some(packed)) = prepacked {
+                    return Poly::from_source(domain, packed);
+                }
+                if pack_mode == 2 && keep_coef && values.len() == 0 && !tried {
+                    if let Some(packed) = coeffs.as_ref().and_then(|c| pack_column(c, twiddles)) {
+                        drop(coeffs);
+                        return Poly::from_source(domain, packed);
+                    }
                 }
                 // (A column that kept its coefficients holds no evaluation yet.)
                 let mut evals = CircleEvaluation::new(
@@ -1005,15 +1419,21 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                     .filter(|&&stripe| stripe >= resident)
                     .map(|&stripe| (stripe, rows_of(log_size, stripe)))
                     .collect_vec();
-                let mut scratch = base_column_pool.take_or_alloc(log_size);
-                let values = B::evaluate_from_prefix(
-                    &poly.evals.values,
-                    log_size,
-                    poly.evals.domain,
-                    &targets,
-                    &mut scratch,
-                );
-                base_column_pool.give_back(log_size, scratch);
+                // SCREEN (f2 Q1660): `F2_STILE=2` reads the prefix tile by tile (no scratch).
+                let values = if crate::prover::m11_env("F2_STILE", 0) >= 2 {
+                    B::evaluate_from_prefix_stream(&poly.evals.values, log_size, poly.evals.domain, &targets)
+                } else {
+                    let mut scratch = base_column_pool.take_or_alloc(log_size);
+                    let values = B::evaluate_from_prefix(
+                        &poly.evals.values,
+                        log_size,
+                        poly.evals.domain,
+                        &targets,
+                        &mut scratch,
+                    );
+                    base_column_pool.give_back(log_size, scratch);
+                    values
+                };
                 if let Some(values) = values {
                     let len = 1usize << log_size;
                     let shift = stripe_log_size - log_size;
@@ -1031,6 +1451,56 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                             }
                         })
                         .collect();
+                }
+            }
+            // SCREEN (f2 Q1653): `F2_STILE=1` evaluates a sourced column's rows with TILE straight
+            // from its trace values (any circle domain of the column's size determines it), with
+            // no coefficients and no stripe FFTs.
+            if poly.is_sourced() && crate::prover::m11_env("F2_STILE", 0) != 0 {
+                let source = poly.source.as_ref().unwrap();
+                let log_size = source.log_size();
+                if log_size + log_blowup_factor == poly.evals.domain.log_size() {
+                    let targets = stripes
+                        .iter()
+                        .map(|&stripe| (stripe, rows_of(log_size, stripe)))
+                        .collect_vec();
+                    // SCREEN (f2 Q1658): `F2_STILE=2` streams the trace values tile by tile.
+                    let out = if crate::prover::m11_env("F2_STILE", 0) >= 2 {
+                        B::evaluate_from_fill(
+                            &|start, dst| source.write_range(start, dst),
+                            log_size,
+                            CanonicCoset::new(log_size).circle_domain(),
+                            poly.evals.domain,
+                            &targets,
+                        )
+                    } else {
+                        let values =
+                            crate::prover::air::component_prover::source_column::<B>(source.as_ref());
+                        let mut scratch = base_column_pool.take_or_alloc(log_size);
+                        let out = B::evaluate_from_source(
+                            &values,
+                            log_size,
+                            CanonicCoset::new(log_size).circle_domain(),
+                            poly.evals.domain,
+                            &targets,
+                            &mut scratch,
+                        );
+                        base_column_pool.give_back(log_size, scratch);
+                        out
+                    };
+                    if let Some(out) = out {
+                        let shift = stripe_log_size - log_size;
+                        return positions
+                            .iter()
+                            .map(|&position| {
+                                let stripe = position >> stripe_log_size;
+                                let local = position - (stripe << stripe_log_size);
+                                let row = (local >> (shift + 1) << 1) + (local & 1);
+                                let t = targets.iter().position(|(s, _)| *s == stripe).unwrap();
+                                out[t][targets[t].1.binary_search(&row).unwrap()]
+                            })
+                            .collect();
+                    }
                 }
             }
             let regrown = poly.coeffs.is_none().then(|| poly.regrown_coefficients());
@@ -1055,8 +1525,48 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             base_column_pool.give_back(coeffs.log_size(), column);
             rows
         };
+        // SCREEN (a8n Q1458): `A8N_PLAN1=1` reads first, in parallel, one prefix-path column of
+        // every (domain size, coset), so that each prefix plan is built once (rukafe0x
+        // rgr1_c5ae9f6b); the other columns then find their plan cached. Same rows, same order.
         #[cfg(feature = "parallel")]
-        let rows: Vec<Vec<BaseField>> = self.polynomials.par_iter().map(read_rows).collect();
+        let rows: Vec<Vec<BaseField>> = if crate::prover::m11_env("A8N_PLAN1", 0) != 0 {
+            // f2: under `F2_STILE`, a sourced column reads through a TILE plan too (Q1653).
+            let stile = crate::prover::m11_env("F2_STILE", 0) != 0;
+            let prefix_path = |poly: &Poly<B>| {
+                (poly.coeffs.is_none()
+                    && !poly.is_sourced()
+                    && poly.evals.values.len() < poly.evals.domain.size())
+                    || (stile && poly.is_sourced())
+            };
+            let mut seen = std::collections::HashSet::new();
+            let first = self
+                .polynomials
+                .iter()
+                .enumerate()
+                .filter(|(_, poly)| prefix_path(poly))
+                .filter(|(_, poly)| {
+                    let domain = poly.evals.domain;
+                    seen.insert((domain.log_size(), domain.half_coset.initial_index.0))
+                })
+                .map(|(i, _)| i)
+                .collect_vec();
+            let mut rows: Vec<Option<Vec<BaseField>>> = vec![None; self.polynomials.len()];
+            let first_rows: Vec<Vec<BaseField>> =
+                first.par_iter().map(|&i| read_rows(&self.polynomials[i])).collect();
+            for (&i, r) in first.iter().zip(first_rows) {
+                rows[i] = Some(r);
+            }
+            let rest: Vec<(usize, Vec<BaseField>)> = rayon::iter::IntoParallelIterator::into_par_iter(0..self.polynomials.len())
+                .filter(|i| rows[*i].is_none())
+                .map(|i| (i, read_rows(&self.polynomials[i])))
+                .collect();
+            for (i, r) in rest {
+                rows[i] = Some(r);
+            }
+            rows.into_iter().map(Option::unwrap).collect()
+        } else {
+            self.polynomials.par_iter().map(read_rows).collect()
+        };
         #[cfg(not(feature = "parallel"))]
         let rows: Vec<Vec<BaseField>> = self.polynomials.iter().map(read_rows).collect();
         base_column_pool.release_all_idle();
@@ -1095,6 +1605,9 @@ const SOURCED_BATCH: usize = 16;
 
 /// Whether a column of `domain` keeps only stripe 0 of its extension in a striped
 /// tree. Small columns keep it whole: some CPU paths read their whole extension.
+/// Log of the rows of one packed word: a block column below it is lifted to it (Q1409).
+const LOG_N_LANES_PCS: u32 = 4;
+
 fn keeps_prefix(domain: CircleDomain, log_blowup_factor: u32) -> bool {
     domain.log_size() >= log_blowup_factor + 10
 }
@@ -1133,4 +1646,38 @@ fn print_column_size_histogram<B: BackendForChannel<MC>, MC: MerkleChannel>(
     for (log_size, count) in log_size_histogram {
         info!("Log size {log_size}: {count}");
     }
+}
+
+/// SCREEN (m11, Q1405): gives every prefix column without a source whose values on its trace
+/// domain fit in 16 bits a [`PackedTrace`] source.
+fn pack_sources<B: crate::prover::backend::Backend>(
+    polynomials: &[CircleCoefficients<B>],
+    prefix: &[bool],
+    sources: &mut [Option<SharedTraceSource>],
+    twiddles: &TwiddleTree<B>,
+) {
+    let pack = |((poly, &prefix), source): ((&CircleCoefficients<B>, &bool), &mut Option<SharedTraceSource>)| {
+        if !prefix || source.is_some() {
+            return;
+        }
+        *source = pack_column(poly, twiddles);
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
+        polynomials.par_iter().zip(prefix.par_iter()).zip(sources.par_iter_mut()).for_each(pack);
+    }
+    #[cfg(not(feature = "parallel"))]
+    polynomials.iter().zip(prefix).zip(sources.iter_mut()).for_each(pack);
+}
+
+/// SCREEN (m11): a [`PackedTrace`] source of `poly`'s values on its trace domain, if they fit 16 bits.
+fn pack_column<B: crate::prover::backend::Backend>(
+    poly: &CircleCoefficients<B>,
+    twiddles: &TwiddleTree<B>,
+) -> Option<SharedTraceSource> {
+    let domain = CanonicCoset::new(poly.log_size()).circle_domain();
+    let values = poly.evaluate_with_twiddles(domain, twiddles).values.to_cpu();
+    crate::prover::air::component_prover::PackedTrace::pack(poly.log_size(), &values)
+        .map(|packed| std::sync::Arc::new(packed) as SharedTraceSource)
 }

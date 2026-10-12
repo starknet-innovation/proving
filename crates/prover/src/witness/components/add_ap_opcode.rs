@@ -300,7 +300,7 @@ fn write_trace_simd(
                 *row[15] = partial_limb_msb_col15;
 
                 *sub_component_inputs.memory_id_to_big[0] = op1_id_col8;
-                *lookup_data.memory_id_to_big_2 = [
+                *lookup_data.memory_id_to_big_2 = narrow_big([
                     M31_1662111297,
                     op1_id_col8,
                     op1_limb_0_col11,
@@ -331,7 +331,7 @@ fn write_trace_simd(
                     M31_0,
                     M31_0,
                     decode_small_sign_output_tmp_44683_12[5],
-                ];
+                ]);
                 let read_small_output_tmp_44683_16 = (
                     ((((((op1_limb_0_col11) + ((op1_limb_1_col12) * (M31_512)))
                         + ((op1_limb_2_col13) * (M31_262144)))
@@ -378,7 +378,7 @@ fn write_trace_simd(
 struct LookupData {
     verify_instruction_0: Vec<[PackedM31; 8]>,
     memory_address_to_id_1: Vec<[PackedM31; 3]>,
-    memory_id_to_big_2: Vec<[PackedM31; 30]>,
+    memory_id_to_big_2: Vec<[std::simd::u32x16; 11]>,
     range_check_18_3: Vec<[PackedM31; 2]>,
     range_check_11_4: Vec<[PackedM31; 2]>,
     opcodes_5: Vec<[PackedM31; 4]>,
@@ -417,14 +417,14 @@ impl InteractionClaimGenerator {
         let mut col_gen = logup_gen.new_col();
         (
             col_gen.par_iter_mut(),
-            &self.lookup_data.memory_id_to_big_2,
+            self.lookup_data.memory_id_to_big_2.par_iter().map(|&w| widen_big(w, 1662111297)),
             &self.lookup_data.range_check_18_3,
             &self.lookup_data.mults_0,
             &self.lookup_data.mults_0,
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1, mult0, mult1)| {
-                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom0: PackedQM31 = common_lookup_elements.combine(&values0);
                 let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 * *mult1 + denom1 * *mult0, denom0 * denom1);
             });

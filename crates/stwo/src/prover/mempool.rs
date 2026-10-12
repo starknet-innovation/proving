@@ -121,6 +121,11 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
 
     /// Drops every idle buffer: nothing of the finished proof stays resident while the next one
     /// builds its context; its columns are allocated afresh, on huge pages.
+    /// Z1 census: bytes held by idle buffers.
+    pub fn idle_bytes(&self) -> usize {
+        self.pools.iter().map(|e| e.value().iter().map(|c| c.len() * 4).sum::<usize>()).sum()
+    }
+
     pub fn release_all_idle(&self) {
         for mut entry in self.pools.iter_mut() {
             entry.value_mut().clear();

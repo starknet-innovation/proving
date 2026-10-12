@@ -27,6 +27,88 @@ use crate::prover::secure_column::SecureColumnByCoords;
 
 const FOLD_CHUNK_SIZE: usize = 128;
 
+/// The fused circle-to-line and line folds of [`FriOps::fold_circle_into_line_then_lines`] for the
+/// circle evaluation on `domain` whose rows `[start, start + src.len())` are `src`: writes the
+/// output rows those input rows fold to into `dst` (the whole folded evaluation) and returns the
+/// folded line domain. With `start = 0` and `src` the whole evaluation it is the whole fold.
+fn fold_rows_into(
+    src: &SecureColumnByCoords<SimdBackend>,
+    start: usize,
+    domain: crate::core::poly::circle::CircleDomain,
+    alpha: SecureField,
+    line_alphas: &[SecureField],
+    twiddles: &TwiddleTree<SimdBackend>,
+    dst: &mut SecureColumnByCoords<SimdBackend>,
+) -> LineDomain {
+    let fold_step = line_alphas.len() as u32;
+    let line_log_size = domain.log_size() - 1;
+    let line_domain = LineDomain::new(Coset::half_odds(line_log_size));
+    let circle_itwiddles = domain_line_twiddles_from_tree(domain, &twiddles.itwiddles)[0];
+    let line_itwiddles = domain_line_twiddles_from_tree(line_domain, &twiddles.itwiddles);
+    // Input packed rows `2 * v`, `2 * v + 1` for `v` in `(i << fold_step) + j`: an output row
+    // reads `2^(fold_step + 1)` input rows.
+    let src_start = start / N_LANES;
+    let out_start = src_start >> (fold_step + 1);
+    let n_out = (src.len() / N_LANES) >> (fold_step + 1);
+    assert_eq!(out_start << (fold_step + 1), src_start);
+    let src_packed = |row: usize| -> [PackedBaseField; 4] {
+        array::from_fn(|c| src.columns[c].data[row - src_start])
+    };
+    let fold_row = |i: usize| -> [PackedBaseField; 4] {
+        // The line rows this output row reads, folded from the circle.
+        let mut layer_values: Vec<[PackedBaseField; 4]> = (0..1usize << fold_step)
+            .map(|j| {
+                let v = (i << fold_step) + j;
+                let twiddle_dbl =
+                    u32x8::from_array(array::from_fn(|k| circle_itwiddles[v * 8 + k]));
+                let (t0, _) = compute_first_twiddles(twiddle_dbl);
+                let (val0, val1) = (src_packed(v * 2), src_packed(v * 2 + 1));
+                let pairs: [_; 4] = array::from_fn(|c| {
+                    let (a, b) = val0[c].deinterleave(val1[c]);
+                    simd_ibutterfly(a, b, t0)
+                });
+                let v0 = PackedSecureField::from_packed_m31s(array::from_fn(|c| pairs[c].0));
+                let v1 = PackedSecureField::from_packed_m31s(array::from_fn(|c| pairs[c].1));
+                (v0 + PackedSecureField::broadcast(alpha) * v1).into_packed_m31s()
+            })
+            .collect();
+        let mut next_layer_size = 1 << (fold_step - 1);
+        for layer in 0..fold_step as usize {
+            let itwiddles = line_itwiddles[layer];
+            let alpha = line_alphas[layer];
+            for j in 0..next_layer_size {
+                let packed_itwiddles = u32x16::from_array(array::from_fn(|k| {
+                    itwiddles[(i * next_layer_size + j) * 16 + k]
+                }));
+                let (val0, val1) = (layer_values[2 * j], layer_values[2 * j + 1]);
+                let pairs: [_; 4] = array::from_fn(|c| {
+                    let (a, b) = val0[c].deinterleave(val1[c]);
+                    simd_ibutterfly(a, b, packed_itwiddles)
+                });
+                let v0 = PackedSecureField::from_packed_m31s(array::from_fn(|c| pairs[c].0));
+                let v1 = PackedSecureField::from_packed_m31s(array::from_fn(|c| pairs[c].1));
+                layer_values[j] =
+                    (v0 + PackedSecureField::broadcast(alpha) * v1).into_packed_m31s();
+            }
+            next_layer_size >>= 1;
+        }
+        layer_values[0]
+    };
+    #[cfg(feature = "parallel")]
+    let rows: Vec<[PackedBaseField; 4]> = {
+        use rayon::iter::IntoParallelIterator;
+        (out_start..out_start + n_out).into_par_iter().map(fold_row).collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let rows: Vec<[PackedBaseField; 4]> = (out_start..out_start + n_out).map(fold_row).collect();
+    for (c, column) in dst.columns.iter_mut().enumerate() {
+        for (dst, row) in column.data[out_start..out_start + n_out].iter_mut().zip(&rows) {
+            *dst = row[c];
+        }
+    }
+    line_domain.repeated_double(fold_step)
+}
+
 // TODO(andrew) Is this optimized?
 impl FriOps for SimdBackend {
     fn fold_line(
@@ -163,6 +245,44 @@ impl FriOps for SimdBackend {
         });
 
         dst
+    }
+
+    /// Fuses the circle-to-line fold with the line folds that
+    /// follow it: each output row reads its `2^k` line rows, each computed from two circle rows,
+    /// so the line evaluation (the largest FRI transient) is never allocated. Same arithmetic,
+    /// in the same order, as the two separate folds.
+    fn fold_circle_into_line_then_lines(
+        src: &SecureEvaluation<Self, BitReversedOrder>,
+        alpha: SecureField,
+        line_alphas: &[SecureField],
+        twiddles: &TwiddleTree<Self>,
+    ) -> LineEvaluation<Self> {
+        let fold_step = line_alphas.len() as u32;
+        let line_log_size = src.domain.log_size() - 1;
+        if fold_step == 0
+            || line_log_size < LOG_N_LANES + fold_step
+        {
+            let line = Self::fold_circle_into_line(src, alpha, twiddles);
+            return if fold_step == 0 { line } else { Self::fold_line(&line, line_alphas, twiddles) };
+        }
+        let n_packed_out = 1usize << (line_log_size - fold_step - LOG_N_LANES);
+        let mut values = SecureColumnByCoords::<Self>::zeros(n_packed_out * N_LANES);
+        let domain = fold_rows_into(&src.values, 0, src.domain, alpha, line_alphas, twiddles, &mut values);
+        LineEvaluation::new(domain, values)
+    }
+
+    fn fold_circle_stripe_into_line_then_lines(
+        stripe: &SecureColumnByCoords<Self>,
+        start: usize,
+        domain: crate::core::poly::circle::CircleDomain,
+        alpha: SecureField,
+        line_alphas: &[SecureField],
+        twiddles: &TwiddleTree<Self>,
+        dst: &mut SecureColumnByCoords<Self>,
+    ) -> LineDomain {
+        let fold_step = line_alphas.len() as u32;
+        assert!(fold_step > 0 && domain.log_size() - 1 >= LOG_N_LANES + fold_step);
+        fold_rows_into(stripe, start, domain, alpha, line_alphas, twiddles, dst)
     }
 
     fn decompose(

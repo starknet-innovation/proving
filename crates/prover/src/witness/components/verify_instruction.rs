@@ -246,7 +246,7 @@ fn write_trace_simd(
                     [M31_1444891767, input_pc_col1, instruction_id_col16];
 
                 *sub_component_inputs.memory_id_to_big[0] = instruction_id_col16;
-                *lookup_data.memory_id_to_big_3 = [
+                *lookup_data.memory_id_to_big_3 = narrow_big([
                     M31_1662111297,
                     instruction_id_col16,
                     offset0_low_col8,
@@ -277,7 +277,7 @@ fn write_trace_simd(
                     M31_0,
                     M31_0,
                     M31_0,
-                ];
+                ]);
 
                 *lookup_data.verify_instruction_4 = [
                     M31_1719106205,
@@ -302,7 +302,7 @@ struct LookupData {
     range_check_7_2_5_0: Vec<[PackedM31; 4]>,
     range_check_4_3_1: Vec<[PackedM31; 3]>,
     memory_address_to_id_2: Vec<[PackedM31; 3]>,
-    memory_id_to_big_3: Vec<[PackedM31; 30]>,
+    memory_id_to_big_3: Vec<[std::simd::u32x16; 11]>,
     verify_instruction_4: Vec<[PackedM31; 8]>,
     mults_0: Vec<PackedM31>,
     mults_1: Vec<PackedM31>,
@@ -340,14 +340,14 @@ impl InteractionClaimGenerator {
         (
             col_gen.par_iter_mut(),
             &self.lookup_data.memory_address_to_id_2,
-            &self.lookup_data.memory_id_to_big_3,
+            self.lookup_data.memory_id_to_big_3.par_iter().map(|&w| widen_big(w, 1662111297)),
             &self.lookup_data.mults_0,
             &self.lookup_data.mults_0,
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1, mult0, mult1)| {
                 let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
+                let denom1: PackedQM31 = common_lookup_elements.combine(&values1);
                 writer.write_frac(denom0 * *mult1 + denom1 * *mult0, denom0 * denom1);
             });
         col_gen.finalize_col();

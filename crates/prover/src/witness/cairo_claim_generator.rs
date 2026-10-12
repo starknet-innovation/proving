@@ -3052,3 +3052,24 @@ pub fn get_sub_components(component_name: &str) -> Vec<&'static str> {
         _ => panic!("Unknown component: {component_name}"),
     }
 }
+
+/// SCREEN (a8n): a stand-in for `rayon::scope` that runs every spawned closure at once, in order.
+pub mod a8n_seq {
+
+    pub struct SeqScope;
+
+    impl SeqScope {
+        pub fn run<F: FnOnce(&SeqScope)>(&self, f: F) {
+            f(self)
+        }
+    }
+
+    pub fn seq_scope<R>(f: impl FnOnce(&SeqScope) -> R) -> R {
+        f(&SeqScope)
+    }
+
+    /// Whether bit `bit` of `A8N_KSEQ` is set.
+    pub fn enabled(bit: usize) -> bool {
+        stwo::prover::m11_env("A8N_KSEQ", 0) & bit != 0
+    }
+}

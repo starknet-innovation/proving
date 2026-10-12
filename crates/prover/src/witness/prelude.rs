@@ -47,3 +47,49 @@ pub use crate::witness::fast_deduction::poseidon::{
     PackedPoseidonRoundKeys,
 };
 pub use crate::witness::utils::{HashMap, InputToRow, *};
+
+// a8 (Q1017/Q1018): lookup tuples held from the trace to the interaction trace, narrowed to the bits their
+// values occupy (the AIR range-checks them: XOR operands below 2^16, felt252 limbs below 2^9).
+
+/// `[relation, a, b, a ^ b]` -> `a | b << 16`.
+pub fn narrow_xor4([_, a, b, c]: [PackedM31; 4]) -> std::simd::u32x16 {
+    let (a, b) = (a.into_simd(), b.into_simd());
+    debug_assert_eq!(a ^ b, c.into_simd());
+    a | (b << 16)
+}
+
+pub fn widen_xor4(w: std::simd::u32x16, relation: u32) -> [PackedM31; 4] {
+    let (a, b) = (w & std::simd::u32x16::splat(0xFFFF), w >> 16);
+    // a, b < 2^16 < P, so the reduction is the identity.
+    [
+        PackedM31::broadcast(M31::from(relation)),
+        PackedM31::reduce_simd(a),
+        PackedM31::reduce_simd(b),
+        PackedM31::reduce_simd(a ^ b),
+    ]
+}
+
+/// `[relation, id, 28 limbs of 9 bits]` -> `[id, 10 words of three limbs]`.
+pub fn narrow_big(t: [PackedM31; 30]) -> [std::simd::u32x16; 11] {
+    std::array::from_fn(|w| {
+        if w == 0 {
+            return t[1].into_simd();
+        }
+        let limb = |k: usize| if k < 28 { t[2 + k].into_simd() } else { std::simd::u32x16::splat(0) };
+        let k = 3 * (w - 1);
+        debug_assert!((0..3).all(|j| k + j >= 28 || limb(k + j) == (limb(k + j) & std::simd::u32x16::splat(0x1FF))));
+        limb(k) | (limb(k + 1) << 9) | (limb(k + 2) << 18)
+    })
+}
+
+pub fn widen_big(w: [std::simd::u32x16; 11], relation: u32) -> [PackedM31; 30] {
+    std::array::from_fn(|i| match i {
+        0 => PackedM31::broadcast(M31::from(relation)),
+        1 => PackedM31::reduce_simd(w[0]),
+        _ => {
+            let k = i - 2;
+            // A limb is below 2^9 < P, so the reduction is the identity.
+            PackedM31::reduce_simd((w[1 + k / 3] >> (9 * (k % 3) as u32)) & std::simd::u32x16::splat(0x1FF))
+        }
+    })
+}

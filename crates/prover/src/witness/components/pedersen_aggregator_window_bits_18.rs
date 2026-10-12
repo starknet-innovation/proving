@@ -278,7 +278,7 @@ fn write_trace_simd(
             *row[30] = value_limb_26_col30;let value_limb_27_col31 = memory_id_to_big_value_tmp_9e218_0.get_m31(27);
             *row[31] = value_limb_27_col31;*sub_component_inputs.memory_id_to_big[0] =
                 input_limb_0_col1;
-            *lookup_data.memory_id_to_big_0 = [M31_1662111297, input_limb_0_col1, value_limb_0_col4, value_limb_1_col5, value_limb_2_col6, value_limb_3_col7, value_limb_4_col8, value_limb_5_col9, value_limb_6_col10, value_limb_7_col11, value_limb_8_col12, value_limb_9_col13, value_limb_10_col14, value_limb_11_col15, value_limb_12_col16, value_limb_13_col17, value_limb_14_col18, value_limb_15_col19, value_limb_16_col20, value_limb_17_col21, value_limb_18_col22, value_limb_19_col23, value_limb_20_col24, value_limb_21_col25, value_limb_22_col26, value_limb_23_col27, value_limb_24_col28, value_limb_25_col29, value_limb_26_col30, value_limb_27_col31];let read_positive_known_id_num_bits_252_output_tmp_9e218_1 = PackedFelt252::from_limbs([value_limb_0_col4, value_limb_1_col5, value_limb_2_col6, value_limb_3_col7, value_limb_4_col8, value_limb_5_col9, value_limb_6_col10, value_limb_7_col11, value_limb_8_col12, value_limb_9_col13, value_limb_10_col14, value_limb_11_col15, value_limb_12_col16, value_limb_13_col17, value_limb_14_col18, value_limb_15_col19, value_limb_16_col20, value_limb_17_col21, value_limb_18_col22, value_limb_19_col23, value_limb_20_col24, value_limb_21_col25, value_limb_22_col26, value_limb_23_col27, value_limb_24_col28, value_limb_25_col29, value_limb_26_col30, value_limb_27_col31]);
+            *lookup_data.memory_id_to_big_0 = narrow_big([M31_1662111297, input_limb_0_col1, value_limb_0_col4, value_limb_1_col5, value_limb_2_col6, value_limb_3_col7, value_limb_4_col8, value_limb_5_col9, value_limb_6_col10, value_limb_7_col11, value_limb_8_col12, value_limb_9_col13, value_limb_10_col14, value_limb_11_col15, value_limb_12_col16, value_limb_13_col17, value_limb_14_col18, value_limb_15_col19, value_limb_16_col20, value_limb_17_col21, value_limb_18_col22, value_limb_19_col23, value_limb_20_col24, value_limb_21_col25, value_limb_22_col26, value_limb_23_col27, value_limb_24_col28, value_limb_25_col29, value_limb_26_col30, value_limb_27_col31]);let read_positive_known_id_num_bits_252_output_tmp_9e218_1 = PackedFelt252::from_limbs([value_limb_0_col4, value_limb_1_col5, value_limb_2_col6, value_limb_3_col7, value_limb_4_col8, value_limb_5_col9, value_limb_6_col10, value_limb_7_col11, value_limb_8_col12, value_limb_9_col13, value_limb_10_col14, value_limb_11_col15, value_limb_12_col16, value_limb_13_col17, value_limb_14_col18, value_limb_15_col19, value_limb_16_col20, value_limb_17_col21, value_limb_18_col22, value_limb_19_col23, value_limb_20_col24, value_limb_21_col25, value_limb_22_col26, value_limb_23_col27, value_limb_24_col28, value_limb_25_col29, value_limb_26_col30, value_limb_27_col31]);
 
             // Read Positive Known Id Num Bits 252.
 
@@ -312,7 +312,7 @@ fn write_trace_simd(
             *row[58] = value_limb_26_col58;let value_limb_27_col59 = memory_id_to_big_value_tmp_9e218_2.get_m31(27);
             *row[59] = value_limb_27_col59;*sub_component_inputs.memory_id_to_big[1] =
                 input_limb_1_col2;
-            *lookup_data.memory_id_to_big_1 = [M31_1662111297, input_limb_1_col2, value_limb_0_col32, value_limb_1_col33, value_limb_2_col34, value_limb_3_col35, value_limb_4_col36, value_limb_5_col37, value_limb_6_col38, value_limb_7_col39, value_limb_8_col40, value_limb_9_col41, value_limb_10_col42, value_limb_11_col43, value_limb_12_col44, value_limb_13_col45, value_limb_14_col46, value_limb_15_col47, value_limb_16_col48, value_limb_17_col49, value_limb_18_col50, value_limb_19_col51, value_limb_20_col52, value_limb_21_col53, value_limb_22_col54, value_limb_23_col55, value_limb_24_col56, value_limb_25_col57, value_limb_26_col58, value_limb_27_col59];let read_positive_known_id_num_bits_252_output_tmp_9e218_3 = PackedFelt252::from_limbs([value_limb_0_col32, value_limb_1_col33, value_limb_2_col34, value_limb_3_col35, value_limb_4_col36, value_limb_5_col37, value_limb_6_col38, value_limb_7_col39, value_limb_8_col40, value_limb_9_col41, value_limb_10_col42, value_limb_11_col43, value_limb_12_col44, value_limb_13_col45, value_limb_14_col46, value_limb_15_col47, value_limb_16_col48, value_limb_17_col49, value_limb_18_col50, value_limb_19_col51, value_limb_20_col52, value_limb_21_col53, value_limb_22_col54, value_limb_23_col55, value_limb_24_col56, value_limb_25_col57, value_limb_26_col58, value_limb_27_col59]);
+            *lookup_data.memory_id_to_big_1 = narrow_big([M31_1662111297, input_limb_1_col2, value_limb_0_col32, value_limb_1_col33, value_limb_2_col34, value_limb_3_col35, value_limb_4_col36, value_limb_5_col37, value_limb_6_col38, value_limb_7_col39, value_limb_8_col40, value_limb_9_col41, value_limb_10_col42, value_limb_11_col43, value_limb_12_col44, value_limb_13_col45, value_limb_14_col46, value_limb_15_col47, value_limb_16_col48, value_limb_17_col49, value_limb_18_col50, value_limb_19_col51, value_limb_20_col52, value_limb_21_col53, value_limb_22_col54, value_limb_23_col55, value_limb_24_col56, value_limb_25_col57, value_limb_26_col58, value_limb_27_col59]);let read_positive_known_id_num_bits_252_output_tmp_9e218_3 = PackedFelt252::from_limbs([value_limb_0_col32, value_limb_1_col33, value_limb_2_col34, value_limb_3_col35, value_limb_4_col36, value_limb_5_col37, value_limb_6_col38, value_limb_7_col39, value_limb_8_col40, value_limb_9_col41, value_limb_10_col42, value_limb_11_col43, value_limb_12_col44, value_limb_13_col45, value_limb_14_col46, value_limb_15_col47, value_limb_16_col48, value_limb_17_col49, value_limb_18_col50, value_limb_19_col51, value_limb_20_col52, value_limb_21_col53, value_limb_22_col54, value_limb_23_col55, value_limb_24_col56, value_limb_25_col57, value_limb_26_col58, value_limb_27_col59]);
 
             // Verify Reduced 252.
 
@@ -534,7 +534,7 @@ fn write_trace_simd(
             *row[204] = partial_ec_mul_window_bits_18_output_limb_68_col204;let partial_ec_mul_window_bits_18_output_limb_69_col205 = partial_ec_mul_window_bits_18_output_round_27_tmp_9e218_37.2.1[1].get_m31(27);
             *row[205] = partial_ec_mul_window_bits_18_output_limb_69_col205;*lookup_data.partial_ec_mul_window_bits_18_9 = [M31_1621226978, partial_ec_mul_window_bits_18_chain_id_tmp_9e218_23, M31_28, partial_ec_mul_window_bits_18_output_limb_0_col136, partial_ec_mul_window_bits_18_output_limb_1_col137, partial_ec_mul_window_bits_18_output_limb_2_col138, partial_ec_mul_window_bits_18_output_limb_3_col139, partial_ec_mul_window_bits_18_output_limb_4_col140, partial_ec_mul_window_bits_18_output_limb_5_col141, partial_ec_mul_window_bits_18_output_limb_6_col142, partial_ec_mul_window_bits_18_output_limb_7_col143, partial_ec_mul_window_bits_18_output_limb_8_col144, partial_ec_mul_window_bits_18_output_limb_9_col145, partial_ec_mul_window_bits_18_output_limb_10_col146, partial_ec_mul_window_bits_18_output_limb_11_col147, partial_ec_mul_window_bits_18_output_limb_12_col148, partial_ec_mul_window_bits_18_output_limb_13_col149, partial_ec_mul_window_bits_18_output_limb_14_col150, partial_ec_mul_window_bits_18_output_limb_15_col151, partial_ec_mul_window_bits_18_output_limb_16_col152, partial_ec_mul_window_bits_18_output_limb_17_col153, partial_ec_mul_window_bits_18_output_limb_18_col154, partial_ec_mul_window_bits_18_output_limb_19_col155, partial_ec_mul_window_bits_18_output_limb_20_col156, partial_ec_mul_window_bits_18_output_limb_21_col157, partial_ec_mul_window_bits_18_output_limb_22_col158, partial_ec_mul_window_bits_18_output_limb_23_col159, partial_ec_mul_window_bits_18_output_limb_24_col160, partial_ec_mul_window_bits_18_output_limb_25_col161, partial_ec_mul_window_bits_18_output_limb_26_col162, partial_ec_mul_window_bits_18_output_limb_27_col163, partial_ec_mul_window_bits_18_output_limb_28_col164, partial_ec_mul_window_bits_18_output_limb_29_col165, partial_ec_mul_window_bits_18_output_limb_30_col166, partial_ec_mul_window_bits_18_output_limb_31_col167, partial_ec_mul_window_bits_18_output_limb_32_col168, partial_ec_mul_window_bits_18_output_limb_33_col169, partial_ec_mul_window_bits_18_output_limb_34_col170, partial_ec_mul_window_bits_18_output_limb_35_col171, partial_ec_mul_window_bits_18_output_limb_36_col172, partial_ec_mul_window_bits_18_output_limb_37_col173, partial_ec_mul_window_bits_18_output_limb_38_col174, partial_ec_mul_window_bits_18_output_limb_39_col175, partial_ec_mul_window_bits_18_output_limb_40_col176, partial_ec_mul_window_bits_18_output_limb_41_col177, partial_ec_mul_window_bits_18_output_limb_42_col178, partial_ec_mul_window_bits_18_output_limb_43_col179, partial_ec_mul_window_bits_18_output_limb_44_col180, partial_ec_mul_window_bits_18_output_limb_45_col181, partial_ec_mul_window_bits_18_output_limb_46_col182, partial_ec_mul_window_bits_18_output_limb_47_col183, partial_ec_mul_window_bits_18_output_limb_48_col184, partial_ec_mul_window_bits_18_output_limb_49_col185, partial_ec_mul_window_bits_18_output_limb_50_col186, partial_ec_mul_window_bits_18_output_limb_51_col187, partial_ec_mul_window_bits_18_output_limb_52_col188, partial_ec_mul_window_bits_18_output_limb_53_col189, partial_ec_mul_window_bits_18_output_limb_54_col190, partial_ec_mul_window_bits_18_output_limb_55_col191, partial_ec_mul_window_bits_18_output_limb_56_col192, partial_ec_mul_window_bits_18_output_limb_57_col193, partial_ec_mul_window_bits_18_output_limb_58_col194, partial_ec_mul_window_bits_18_output_limb_59_col195, partial_ec_mul_window_bits_18_output_limb_60_col196, partial_ec_mul_window_bits_18_output_limb_61_col197, partial_ec_mul_window_bits_18_output_limb_62_col198, partial_ec_mul_window_bits_18_output_limb_63_col199, partial_ec_mul_window_bits_18_output_limb_64_col200, partial_ec_mul_window_bits_18_output_limb_65_col201, partial_ec_mul_window_bits_18_output_limb_66_col202, partial_ec_mul_window_bits_18_output_limb_67_col203, partial_ec_mul_window_bits_18_output_limb_68_col204, partial_ec_mul_window_bits_18_output_limb_69_col205];*sub_component_inputs.memory_id_to_big[2] =
                 input_limb_2_col3;
-            *lookup_data.memory_id_to_big_10 = [M31_1662111297, input_limb_2_col3, partial_ec_mul_window_bits_18_output_limb_14_col150, partial_ec_mul_window_bits_18_output_limb_15_col151, partial_ec_mul_window_bits_18_output_limb_16_col152, partial_ec_mul_window_bits_18_output_limb_17_col153, partial_ec_mul_window_bits_18_output_limb_18_col154, partial_ec_mul_window_bits_18_output_limb_19_col155, partial_ec_mul_window_bits_18_output_limb_20_col156, partial_ec_mul_window_bits_18_output_limb_21_col157, partial_ec_mul_window_bits_18_output_limb_22_col158, partial_ec_mul_window_bits_18_output_limb_23_col159, partial_ec_mul_window_bits_18_output_limb_24_col160, partial_ec_mul_window_bits_18_output_limb_25_col161, partial_ec_mul_window_bits_18_output_limb_26_col162, partial_ec_mul_window_bits_18_output_limb_27_col163, partial_ec_mul_window_bits_18_output_limb_28_col164, partial_ec_mul_window_bits_18_output_limb_29_col165, partial_ec_mul_window_bits_18_output_limb_30_col166, partial_ec_mul_window_bits_18_output_limb_31_col167, partial_ec_mul_window_bits_18_output_limb_32_col168, partial_ec_mul_window_bits_18_output_limb_33_col169, partial_ec_mul_window_bits_18_output_limb_34_col170, partial_ec_mul_window_bits_18_output_limb_35_col171, partial_ec_mul_window_bits_18_output_limb_36_col172, partial_ec_mul_window_bits_18_output_limb_37_col173, partial_ec_mul_window_bits_18_output_limb_38_col174, partial_ec_mul_window_bits_18_output_limb_39_col175, partial_ec_mul_window_bits_18_output_limb_40_col176, partial_ec_mul_window_bits_18_output_limb_41_col177];*lookup_data.pedersen_aggregator_window_bits_18_11 = [M31_520578465, input_limb_0_col1, input_limb_1_col2, input_limb_2_col3];*lookup_data.mults_0 = M31_1;*lookup_data.mults_1 = multiplicity_0_col0;
+            *lookup_data.memory_id_to_big_10 = narrow_big([M31_1662111297, input_limb_2_col3, partial_ec_mul_window_bits_18_output_limb_14_col150, partial_ec_mul_window_bits_18_output_limb_15_col151, partial_ec_mul_window_bits_18_output_limb_16_col152, partial_ec_mul_window_bits_18_output_limb_17_col153, partial_ec_mul_window_bits_18_output_limb_18_col154, partial_ec_mul_window_bits_18_output_limb_19_col155, partial_ec_mul_window_bits_18_output_limb_20_col156, partial_ec_mul_window_bits_18_output_limb_21_col157, partial_ec_mul_window_bits_18_output_limb_22_col158, partial_ec_mul_window_bits_18_output_limb_23_col159, partial_ec_mul_window_bits_18_output_limb_24_col160, partial_ec_mul_window_bits_18_output_limb_25_col161, partial_ec_mul_window_bits_18_output_limb_26_col162, partial_ec_mul_window_bits_18_output_limb_27_col163, partial_ec_mul_window_bits_18_output_limb_28_col164, partial_ec_mul_window_bits_18_output_limb_29_col165, partial_ec_mul_window_bits_18_output_limb_30_col166, partial_ec_mul_window_bits_18_output_limb_31_col167, partial_ec_mul_window_bits_18_output_limb_32_col168, partial_ec_mul_window_bits_18_output_limb_33_col169, partial_ec_mul_window_bits_18_output_limb_34_col170, partial_ec_mul_window_bits_18_output_limb_35_col171, partial_ec_mul_window_bits_18_output_limb_36_col172, partial_ec_mul_window_bits_18_output_limb_37_col173, partial_ec_mul_window_bits_18_output_limb_38_col174, partial_ec_mul_window_bits_18_output_limb_39_col175, partial_ec_mul_window_bits_18_output_limb_40_col176, partial_ec_mul_window_bits_18_output_limb_41_col177]);*lookup_data.pedersen_aggregator_window_bits_18_11 = [M31_520578465, input_limb_0_col1, input_limb_1_col2, input_limb_2_col3];*lookup_data.mults_0 = M31_1;*lookup_data.mults_1 = multiplicity_0_col0;
         });
 
     (trace, lookup_data, sub_component_inputs)
@@ -542,8 +542,8 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 struct LookupData {
-    memory_id_to_big_0: Vec<[PackedM31; 30]>,
-    memory_id_to_big_1: Vec<[PackedM31; 30]>,
+    memory_id_to_big_0: Vec<[std::simd::u32x16; 11]>,
+    memory_id_to_big_1: Vec<[std::simd::u32x16; 11]>,
     range_check_8_2: Vec<[PackedM31; 2]>,
     range_check_8_3: Vec<[PackedM31; 2]>,
     range_check_8_4: Vec<[PackedM31; 2]>,
@@ -552,7 +552,7 @@ struct LookupData {
     partial_ec_mul_window_bits_18_7: Vec<[PackedM31; 73]>,
     partial_ec_mul_window_bits_18_8: Vec<[PackedM31; 73]>,
     partial_ec_mul_window_bits_18_9: Vec<[PackedM31; 73]>,
-    memory_id_to_big_10: Vec<[PackedM31; 30]>,
+    memory_id_to_big_10: Vec<[std::simd::u32x16; 11]>,
     pedersen_aggregator_window_bits_18_11: Vec<[PackedM31; 4]>,
     mults_0: Vec<PackedM31>,
     mults_1: Vec<PackedM31>,
@@ -573,15 +573,15 @@ impl InteractionClaimGenerator {
         let mut col_gen = logup_gen.new_col();
         (
             col_gen.par_iter_mut(),
-            &self.lookup_data.memory_id_to_big_0,
-            &self.lookup_data.memory_id_to_big_1,
+            self.lookup_data.memory_id_to_big_0.par_iter().map(|&w| widen_big(w, 1662111297)),
+            self.lookup_data.memory_id_to_big_1.par_iter().map(|&w| widen_big(w, 1662111297)),
             &self.lookup_data.mults_0,
             &self.lookup_data.mults_0,
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1, mult0, mult1)| {
-                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(&values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(&values1);
                 writer.write_frac(denom0 * *mult1 + denom1 * *mult0, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -653,14 +653,14 @@ impl InteractionClaimGenerator {
         let mut col_gen = logup_gen.new_col();
         (
             col_gen.par_iter_mut(),
-            &self.lookup_data.memory_id_to_big_10,
+            self.lookup_data.memory_id_to_big_10.par_iter().map(|&w| widen_big(w, 1662111297)),
             &self.lookup_data.pedersen_aggregator_window_bits_18_11,
             &self.lookup_data.mults_0,
             &self.lookup_data.mults_1,
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1, mult0, mult1)| {
-                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom0: PackedQM31 = common_lookup_elements.combine(&values0);
                 let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom1 * *mult0 - denom0 * *mult1, denom0 * denom1);
             });

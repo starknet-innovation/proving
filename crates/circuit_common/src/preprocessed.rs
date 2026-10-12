@@ -462,6 +462,9 @@ enum CompactColumn {
     /// Every value is 0 or 1. `words` packs the rows LSB-first, 64 rows per word; `len` is the
     /// row count (the last word's bits past `len` are zero).
     Bits { len: usize, words: Vec<u64> },
+    /// Frame of reference per 64-row block (a8n Q1460): the block's minimum `bases[b]`, then each
+    /// row's offset from it in `widths[b]` bits, LSB-first in `bits` from bit `offsets[b]`.
+    Packed { len: usize, bases: Vec<u32>, widths: Vec<u8>, offsets: Vec<u32>, bits: Vec<u64> },
     /// A fixed lookup-table column, expanded from its value formula instead of being stored.
     Fixed { log_size: u32, kind: FixedColumnKind },
 }
@@ -480,8 +483,55 @@ impl CompactColumn {
         let narrow: Result<Vec<u32>, _> =
             column.iter().map(|&value| u32::try_from(value)).collect();
         match narrow {
+            // SCREEN (a8n Q1460): `A8N_FOR=1` keeps a u32 column frame-of-reference packed when
+            // that is smaller.
+            Ok(narrow) if stwo::prover::m11_env("A8N_FOR", 0) != 0 => {
+                let packed = Self::pack(&narrow);
+                if packed.n_bytes() < 4 * narrow.len() { packed } else { Self::Narrow(narrow) }
+            }
             Ok(narrow) => Self::Narrow(narrow),
             Err(_) => Self::Wide(column),
+        }
+    }
+
+    /// Packs `values` frame-of-reference per 64-row block (see [`Self::Packed`]).
+    fn pack(values: &[u32]) -> Self {
+        let n_blocks = values.len().div_ceil(64);
+        let mut bases = Vec::with_capacity(n_blocks);
+        let mut widths = Vec::with_capacity(n_blocks);
+        let mut offsets = Vec::with_capacity(n_blocks);
+        let mut bits: Vec<u64> = vec![];
+        let mut pos: u64 = 0;
+        for block in values.chunks(64) {
+            let min = *block.iter().min().unwrap();
+            let max = *block.iter().max().unwrap();
+            let width = 32 - (max - min).leading_zeros();
+            bases.push(min);
+            widths.push(width as u8);
+            offsets.push(u32::try_from(pos).expect("bit offset fits u32"));
+            for &value in block {
+                if width > 0 {
+                    let (i, o) = ((pos / 64) as usize, pos % 64);
+                    bits.resize(bits.len().max(i + 2), 0);
+                    let v = u64::from(value - min);
+                    bits[i] |= v << o;
+                    if o + u64::from(width) > 64 {
+                        bits[i + 1] |= v >> (64 - o);
+                    }
+                }
+                pos += u64::from(width);
+            }
+        }
+        bits.shrink_to_fit();
+        Self::Packed { len: values.len(), bases, widths, offsets, bits }
+    }
+
+    fn n_bytes(&self) -> usize {
+        match self {
+            Self::Packed { bases, widths, offsets, bits, .. } => {
+                4 * bases.len() + widths.len() + 4 * offsets.len() + 8 * bits.len()
+            }
+            _ => usize::MAX,
         }
     }
 
@@ -491,6 +541,7 @@ impl CompactColumn {
             Self::Narrow(values) => values.len(),
             Self::Wide(values) => values.len(),
             Self::Bits { len, .. } => *len,
+            Self::Packed { len, .. } => *len,
             Self::Fixed { log_size, .. } => 1_usize << log_size,
         }
     }
@@ -501,6 +552,20 @@ impl CompactColumn {
             Self::Narrow(values) => usize::try_from(values[row]).expect("value originally fit usize"),
             Self::Wide(values) => values[row],
             Self::Bits { words, .. } => ((words[row / 64] >> (row % 64)) & 1) as usize,
+            Self::Packed { bases, widths, offsets, bits, .. } => {
+                let block = row / 64;
+                let width = u64::from(widths[block]);
+                if width == 0 {
+                    return bases[block] as usize;
+                }
+                let pos = u64::from(offsets[block]) + (row % 64) as u64 * width;
+                let (i, o) = ((pos / 64) as usize, pos % 64);
+                let mut v = bits[i] >> o;
+                if o + width > 64 {
+                    v |= bits[i + 1] << (64 - o);
+                }
+                (u64::from(bases[block]) + (v & ((1u64 << width) - 1))) as usize
+            }
             Self::Fixed { log_size, kind } => kind.at(*log_size, row),
         }
     }
@@ -694,9 +759,81 @@ impl stwo::prover::TraceSource for PreprocessedColumnSource {
                     *value = BaseField::from(wide);
                 }
             }
+            // a8n Q1470: a frame-of-reference column decodes its 64-row blocks in parallel, each
+            // block's bits read in sequence (the same values as `at`).
+            CompactColumn::Packed { bases, widths, offsets, bits, .. } => {
+                use rayon::prelude::*;
+                dst.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
+                    let width = u64::from(widths[block]);
+                    let base = u64::from(bases[block]);
+                    let mask = if width == 0 { 0 } else { (1u64 << width) - 1 };
+                    let mut pos = u64::from(offsets[block]);
+                    for value in dst.iter_mut() {
+                        let v = if width == 0 {
+                            0
+                        } else {
+                            let (i, o) = ((pos / 64) as usize, pos % 64);
+                            let mut v = bits[i] >> o;
+                            if o + width > 64 {
+                                v |= bits[i + 1] << (64 - o);
+                            }
+                            v & mask
+                        };
+                        *value = BaseField::from((base + v) as usize);
+                        pos += width;
+                    }
+                });
+            }
             _ => {
                 for (row, value) in dst.iter_mut().enumerate() {
                     *value = BaseField::from(column.at(row));
+                }
+            }
+        }
+    }
+
+    /// SCREEN (f2 Q1658): rows `start..start + dst.len()` only, decoded in sequence.
+    fn write_range(&self, start: usize, dst: &mut [BaseField]) {
+        let column = self.column();
+        match column {
+            CompactColumn::Narrow(values) => {
+                for (value, &narrow) in dst.iter_mut().zip(&values[start..]) {
+                    *value = BaseField::from(
+                        usize::try_from(narrow).expect("value originally fit usize"),
+                    );
+                }
+            }
+            CompactColumn::Wide(values) => {
+                for (value, &wide) in dst.iter_mut().zip(&values[start..]) {
+                    *value = BaseField::from(wide);
+                }
+            }
+            CompactColumn::Packed { bases, widths, offsets, bits, .. } if start % 64 == 0 => {
+                for (k, dst) in dst.chunks_mut(64).enumerate() {
+                    let block = start / 64 + k;
+                    let width = u64::from(widths[block]);
+                    let base = u64::from(bases[block]);
+                    let mask = if width == 0 { 0 } else { (1u64 << width) - 1 };
+                    let mut pos = u64::from(offsets[block]);
+                    for value in dst.iter_mut() {
+                        let v = if width == 0 {
+                            0
+                        } else {
+                            let (i, o) = ((pos / 64) as usize, pos % 64);
+                            let mut v = bits[i] >> o;
+                            if o + width > 64 {
+                                v |= bits[i + 1] << (64 - o);
+                            }
+                            v & mask
+                        };
+                        *value = BaseField::from((base + v) as usize);
+                        pos += width;
+                    }
+                }
+            }
+            _ => {
+                for (i, value) in dst.iter_mut().enumerate() {
+                    *value = BaseField::from(column.at(start + i));
                 }
             }
         }

@@ -80,8 +80,95 @@ impl QuotientOps for SimdBackend {
         }
     }
 
+    fn accumulate_numerators_into(
+        columns: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+        sample_batch: &ColumnSampleBatch,
+        dst: &mut AccumulatedNumerators<Self>,
+        log_blowup_factor: u32,
+    ) -> bool {
+        let (subdomain, _) = columns[0].domain.split(log_blowup_factor);
+        if subdomain.log_size() < LOG_N_LANES
+            || dst.sample_point != sample_batch.point
+            || dst.partial_numerators_acc.len() != subdomain.size()
+        {
+            return false;
+        }
+        let coeffs = quotient_constants(std::slice::from_ref(sample_batch)).line_coeffs;
+        accumulate_numerators_on_subdomain_into(
+            subdomain,
+            sample_batch,
+            columns,
+            &coeffs[0],
+            &mut dst.partial_numerators_acc,
+            true,
+        );
+        dst.first_linear_term_acc += coeffs[0].iter().map(|(a, ..)| a).sum::<SecureField>();
+        true
+    }
+
     // TODO(Leo): Consider receiving the denominator inverses from the call site and
     // having them computed in parallel to other task.
+    fn compute_quotients_per_point(
+        n_points: usize,
+        point_acc: &(dyn Fn(usize) -> AccumulatedNumerators<Self> + Sync),
+        lifting_log_size: u32,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<Self>,
+    ) -> SecureEvaluation<Self, BitReversedOrder> {
+        let eval_domain = CanonicCoset::new(lifting_log_size).circle_domain();
+        let (eval_subdomain, _) = eval_domain.split(log_blowup_factor);
+        if n_points == 0 || eval_subdomain.log_size() < LOG_N_LANES {
+            let accs = (0..n_points).map(point_acc).collect();
+            return Self::compute_quotients_and_combine(
+                accs,
+                lifting_log_size,
+                log_blowup_factor,
+                twiddles,
+            );
+        }
+        let mut quotients: SecureColumnByCoords<SimdBackend> =
+            SecureColumnByCoords::zeros(1 << eval_subdomain.log_size());
+        for i in 0..n_points {
+            let acc = point_acc(i);
+            combine_point_into(&mut quotients, &acc, eval_subdomain, i > 0);
+        }
+        let subdomain_twiddles = TwiddleTree {
+            root_coset: eval_subdomain.half_coset,
+            // Only itwiddles are needed for interpolation.
+            twiddles: TwiddleBuffer::empty(),
+            itwiddles: twiddles
+                .itwiddles
+                .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
+        };
+        if crate::prover::m11_env("W5_QPOLY", 0) != 0 {
+            return quotient_coefficients(quotients, eval_subdomain, &subdomain_twiddles);
+        }
+        // The four coordinate columns are interpolated and evaluated concurrently: each FFT is
+        // parallel on its own, but one column at a time leaves most threads idle.
+        let extend = |eval: BaseColumn| {
+            let poly = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                eval_subdomain,
+                eval,
+            )
+            .interpolate_with_twiddles(&subdomain_twiddles);
+            poly.evaluate_with_twiddles(eval_domain, twiddles).values
+        };
+        #[cfg(not(feature = "parallel"))]
+        let columns: Vec<BaseColumn> = quotients.columns.into_iter().map(extend).collect();
+        // SCREEN (a8n Q1451): `A8N_QSER=1` extends the coordinates one at a time.
+        #[cfg(feature = "parallel")]
+        let columns: Vec<BaseColumn> = if crate::prover::m11_env("A8N_QSER", 0) != 0 {
+            quotients.columns.into_iter().map(extend).collect()
+        } else {
+            quotients.columns.into_par_iter().map(extend).collect()
+        };
+        let evals = SecureColumnByCoords {
+            columns: columns.try_into().unwrap_or_else(|_| unreachable!("four coordinates")),
+        };
+
+        SecureEvaluation::new(eval_domain, evals)
+    }
+
     fn compute_quotients_and_combine(
         accumulations: Vec<AccumulatedNumerators<Self>>,
         lifting_log_size: u32,
@@ -115,6 +202,18 @@ impl QuotientOps for SimdBackend {
                 cpu_result.domain,
                 SecureColumnByCoords::from_cpu(cpu_result.values),
             );
+        }
+        // SCREEN (p12 Q1550): `P12_QIN=1` writes the quotients over a full-size accumulation,
+        // which is read row by row before its row is written, instead of a fresh column.
+        if crate::prover::m11_env("P12_QIN", 0) != 0 {
+            if let Some(t) = accumulations
+                .iter()
+                .position(|acc| acc.partial_numerators_acc.len() == eval_subdomain.size())
+            {
+                let mut accumulations = accumulations;
+                let own = accumulations.remove(t);
+                return combine_in_place(own, accumulations, eval_subdomain, eval_domain, twiddles);
+            }
         }
         let subdomain_points: Vec<CirclePoint<PackedBaseField>> =
             CircleDomainBitRevIterator::new(eval_subdomain).collect();
@@ -219,6 +318,9 @@ impl QuotientOps for SimdBackend {
                 .itwiddles
                 .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
         };
+        if crate::prover::m11_env("W5_QPOLY", 0) != 0 {
+            return quotient_coefficients(quotients, eval_subdomain, &subdomain_twiddles);
+        }
         // The four coordinate columns are interpolated and evaluated concurrently: each FFT is
         // parallel on its own, but one column at a time leaves most threads idle.
         let extend = |eval: BaseColumn| {
@@ -231,14 +333,42 @@ impl QuotientOps for SimdBackend {
         };
         #[cfg(not(feature = "parallel"))]
         let columns: Vec<BaseColumn> = quotients.columns.into_iter().map(extend).collect();
+        // SCREEN (a8n Q1451): `A8N_QSER=1` extends the coordinates one at a time.
         #[cfg(feature = "parallel")]
-        let columns: Vec<BaseColumn> = quotients.columns.into_par_iter().map(extend).collect();
+        let columns: Vec<BaseColumn> = if crate::prover::m11_env("A8N_QSER", 0) != 0 {
+            quotients.columns.into_iter().map(extend).collect()
+        } else {
+            quotients.columns.into_par_iter().map(extend).collect()
+        };
         let evals = SecureColumnByCoords {
             columns: columns.try_into().unwrap_or_else(|_| unreachable!("four coordinates")),
         };
 
         SecureEvaluation::new(eval_domain, evals)
     }
+}
+
+/// SCREEN (w5 Q1603): `W5_QPOLY=1` returns the quotient as its polynomial: the four coordinate
+/// coefficient columns (in a `SecureEvaluation` on the subdomain, of the subdomain's size), for
+/// `FriProver::commit_striped`, without the extension to the whole lifting domain.
+fn quotient_coefficients(
+    quotients: SecureColumnByCoords<SimdBackend>,
+    eval_subdomain: CircleDomain,
+    subdomain_twiddles: &TwiddleTree<SimdBackend>,
+) -> SecureEvaluation<SimdBackend, BitReversedOrder> {
+    let interpolate = |eval: BaseColumn| {
+        CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(eval_subdomain, eval)
+            .interpolate_with_twiddles(subdomain_twiddles)
+            .coeffs
+    };
+    #[cfg(feature = "parallel")]
+    let columns: Vec<BaseColumn> = quotients.columns.into_par_iter().map(interpolate).collect();
+    #[cfg(not(feature = "parallel"))]
+    let columns: Vec<BaseColumn> = quotients.columns.into_iter().map(interpolate).collect();
+    let coeffs = SecureColumnByCoords {
+        columns: columns.try_into().unwrap_or_else(|_| unreachable!("four coordinates")),
+    };
+    SecureEvaluation::new(eval_subdomain, coeffs)
 }
 
 /// Performs the pointwise accumulation of the numerators on `subdomain`.
@@ -260,6 +390,30 @@ fn accumulate_numerators_on_subdomain(
     columns: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
     quotient_coeffs: &[(SecureField, SecureField, SecureField)],
 ) -> SecureColumnByCoords<SimdBackend> {
+    let mut values =
+        unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(subdomain.size()) };
+    accumulate_numerators_on_subdomain_into(
+        subdomain,
+        sample_batch,
+        columns,
+        quotient_coeffs,
+        &mut values,
+        false,
+    );
+    values
+}
+
+/// [`accumulate_numerators_on_subdomain`] into `values`, adding to its rows when `add` is set
+/// (SCREEN p12 Q1552): field addition is exact, so the sum equals a separate accumulation added
+/// afterwards.
+fn accumulate_numerators_on_subdomain_into(
+    subdomain: CircleDomain,
+    sample_batch: &ColumnSampleBatch,
+    columns: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
+    quotient_coeffs: &[(SecureField, SecureField, SecureField)],
+    values: &mut SecureColumnByCoords<SimdBackend>,
+    add: bool,
+) {
     // This constant is chosen empirically by benchmarking.
     const NUMERATORS_CHUNK_SIZE: usize = 1 << 6;
     // Number of packed rows accumulated together in a pass over all the terms.
@@ -294,8 +448,7 @@ fn accumulate_numerators_on_subdomain(
         }
     }
 
-    let mut values =
-        unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(subdomain.size()) };
+    debug_assert_eq!(values.len(), subdomain.size());
 
     // Per-term data, shared by all chunks.
     let terms: Vec<(&[PackedBaseField], [u32; 4])> =
@@ -372,14 +525,215 @@ fn accumulate_numerators_on_subdomain(
                     let lanes = bytemuck::cast::<[u64; 8], PackedBaseField>(packed.to_array());
                     PackedBaseField::reduce_simd(lanes.into_simd()) + neg_b[k]
                 });
+                let mut value = PackedSecureField::from_packed_m31s(coords);
+                if add {
+                    value += PackedSecureField::from_packed_m31s(std::array::from_fn(|j| {
+                        values_dst.0[j].0[block_start + r]
+                    }));
+                }
                 unsafe {
-                    values_dst
-                        .set_packed(block_start + r, PackedSecureField::from_packed_m31s(coords));
+                    values_dst.set_packed(block_start + r, value);
                 }
             }
         }
     });
-    values
+}
+
+/// Adds (or with `add` false, writes) the quotient of one sample point's accumulated numerators
+/// into `quotients` on `eval_subdomain`: the same field values, summed in the same point order, as
+/// [`QuotientOps::compute_quotients_and_combine`]. The subdomain points and the denominator
+/// inverses are made a chunk at a time (SCREEN a8n Q1454).
+fn combine_point_into(
+    quotients: &mut SecureColumnByCoords<SimdBackend>,
+    acc: &AccumulatedNumerators<SimdBackend>,
+    eval_subdomain: CircleDomain,
+    add: bool,
+) {
+    const COMBINE_CHUNK_SIZE: usize = 16;
+    let subdomain_log_size = eval_subdomain.log_size();
+    let point = acc.sample_point;
+    let prx = PackedCM31::broadcast(point.x.0);
+    let pry = PackedCM31::broadcast(point.y.0);
+    let pix = PackedCM31::broadcast(point.x.1);
+    let piy = PackedCM31::broadcast(point.y.1);
+    let log_ratio = subdomain_log_size - acc.partial_numerators_acc.len().ilog2();
+    let first_linear_term = PackedSecureField::broadcast(acc.first_linear_term_acc);
+    let point_iter = CircleDomainBitRevIterator::new(eval_subdomain);
+
+    #[cfg(not(feature = "parallel"))]
+    let iter = quotients.chunks_mut(COMBINE_CHUNK_SIZE).enumerate();
+    #[cfg(feature = "parallel")]
+    let iter = quotients.par_chunks_mut(COMBINE_CHUNK_SIZE).enumerate();
+
+    iter.for_each(|(chunk_idx, value_dst)| {
+        let chunk_start = chunk_idx * COMBINE_CHUNK_SIZE;
+        let packed_chunk_len = value_dst.0[0].0.len();
+        let points: Vec<CirclePoint<PackedBaseField>> =
+            point_iter.start_at(chunk_start).take(packed_chunk_len).collect();
+        let denominators: Vec<PackedCM31> =
+            points.iter().map(|q| (prx - q.x) * piy - (pry - q.y) * pix).collect();
+        let den_inv = PackedCM31::batch_inverse(&denominators);
+        for i in 0..packed_chunk_len {
+            let domain_idx = chunk_start + i;
+            let lifted_partial_numerator =
+                PackedSecureField::from_packed_m31s(std::array::from_fn(|j| {
+                    let lifted_simd = to_lifted_simd(
+                        acc.partial_numerators_acc.columns[j].data[domain_idx >> log_ratio]
+                            .into_simd(),
+                        log_ratio,
+                        domain_idx,
+                    );
+                    // The lifted values are field elements (below P): the reduction is the identity.
+                    PackedBaseField::reduce_simd(lifted_simd)
+                }));
+            let numerator = lifted_partial_numerator - first_linear_term * points[i].y;
+            let value = numerator * den_inv[i];
+            let value = if add {
+                let current = std::array::from_fn(|j| value_dst.0[j].0[i]);
+                PackedSecureField::from_packed_m31s(current) + value
+            } else {
+                value
+            };
+            for (j, coordinate) in value.into_packed_m31s().into_iter().enumerate() {
+                value_dst.0[j].0[i] = coordinate;
+            }
+        }
+    });
+}
+
+/// Interpolates the quotients on `eval_subdomain` and evaluates them on `eval_domain`, the four
+/// coordinates concurrently.
+fn extend_quotients(
+    quotients: SecureColumnByCoords<SimdBackend>,
+    eval_subdomain: CircleDomain,
+    eval_domain: CircleDomain,
+    twiddles: &TwiddleTree<SimdBackend>,
+) -> SecureEvaluation<SimdBackend, BitReversedOrder> {
+    let subdomain_twiddles = TwiddleTree {
+        root_coset: eval_subdomain.half_coset,
+        twiddles: TwiddleBuffer::empty(),
+        itwiddles: twiddles
+            .itwiddles
+            .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
+    };
+    if crate::prover::m11_env("W5_QPOLY", 0) != 0 {
+        return quotient_coefficients(quotients, eval_subdomain, &subdomain_twiddles);
+    }
+    let extend = |eval: BaseColumn| {
+        CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(eval_subdomain, eval)
+            .interpolate_with_twiddles(&subdomain_twiddles)
+            .evaluate_with_twiddles(eval_domain, twiddles)
+            .values
+    };
+    #[cfg(not(feature = "parallel"))]
+    let columns: Vec<BaseColumn> = quotients.columns.into_iter().map(extend).collect();
+    // SCREEN (p12 Q1558): `A8N_QSER=1` extends one coordinate at a time, each subdomain column
+    // freed once its extension is made.
+    #[cfg(feature = "parallel")]
+    let columns: Vec<BaseColumn> = if crate::prover::m11_env("A8N_QSER", 0) != 0 {
+        quotients.columns.into_iter().map(extend).collect()
+    } else {
+        quotients.columns.into_par_iter().map(extend).collect()
+    };
+    SecureEvaluation::new(
+        eval_domain,
+        SecureColumnByCoords {
+            columns: columns.try_into().unwrap_or_else(|_| unreachable!("four coordinates")),
+        },
+    )
+}
+
+/// [`QuotientOps::compute_quotients_and_combine`] whose quotients overwrite `own`, a full-size
+/// accumulation: each row of `own` is read, combined with the other points' accumulations and
+/// written back. The quotient sums the same field terms (in another order; addition is exact).
+fn combine_in_place(
+    own: AccumulatedNumerators<SimdBackend>,
+    rest: Vec<AccumulatedNumerators<SimdBackend>>,
+    eval_subdomain: CircleDomain,
+    eval_domain: CircleDomain,
+    twiddles: &TwiddleTree<SimdBackend>,
+) -> SecureEvaluation<SimdBackend, BitReversedOrder> {
+    const COMBINE_CHUNK_SIZE: usize = 16;
+    let subdomain_log_size = eval_subdomain.log_size();
+    let AccumulatedNumerators { sample_point, partial_numerators_acc: mut quotients, first_linear_term_acc } =
+        own;
+    let sample_coords: Vec<[PackedCM31; 4]> = std::iter::once(sample_point)
+        .chain(rest.iter().map(|acc| acc.sample_point))
+        .map(|point| {
+            [
+                PackedCM31::broadcast(point.x.0),
+                PackedCM31::broadcast(point.y.0),
+                PackedCM31::broadcast(point.x.1),
+                PackedCM31::broadcast(point.y.1),
+            ]
+        })
+        .collect();
+    let own_first_linear_term = PackedSecureField::broadcast(first_linear_term_acc);
+    let log_ratios: Vec<u32> = rest
+        .iter()
+        .map(|acc| subdomain_log_size - acc.partial_numerators_acc.len().ilog2())
+        .collect();
+    let first_linear_terms: Vec<PackedSecureField> =
+        rest.iter().map(|acc| PackedSecureField::broadcast(acc.first_linear_term_acc)).collect();
+    let point_iter = CircleDomainBitRevIterator::new(eval_subdomain);
+
+    #[cfg(not(feature = "parallel"))]
+    let iter = quotients.chunks_mut(COMBINE_CHUNK_SIZE).enumerate();
+    #[cfg(feature = "parallel")]
+    let iter = quotients.par_chunks_mut(COMBINE_CHUNK_SIZE).enumerate();
+
+    iter.for_each(|(chunk_idx, value_dst)| {
+        let chunk_start = chunk_idx * COMBINE_CHUNK_SIZE;
+        let packed_chunk_len = value_dst.0[0].0.len();
+        let points: Vec<CirclePoint<PackedBaseField>> =
+            point_iter.start_at(chunk_start).take(packed_chunk_len).collect();
+        let mut denominators = Vec::with_capacity(sample_coords.len() * packed_chunk_len);
+        for [prx, pry, pix, piy] in &sample_coords {
+            for q in &points {
+                denominators.push((*prx - q.x) * *piy - (*pry - q.y) * *pix);
+            }
+        }
+        let inverses = PackedCM31::batch_inverse(&denominators);
+        let mut inverse_chunks = inverses.chunks(packed_chunk_len);
+        let own_inv = inverse_chunks.next().unwrap();
+        let mut chunk_acc: Vec<PackedSecureField> = (0..packed_chunk_len)
+            .map(|i| {
+                let own_numerator = PackedSecureField::from_packed_m31s(std::array::from_fn(|j| {
+                    value_dst.0[j].0[i]
+                }));
+                (own_numerator - own_first_linear_term * points[i].y) * own_inv[i]
+            })
+            .collect();
+        for (((acc, den_inv), log_ratio), first_linear_term) in rest
+            .iter()
+            .zip_eq(inverse_chunks)
+            .zip_eq(log_ratios.iter())
+            .zip_eq(first_linear_terms.iter())
+        {
+            for (i, accumulator) in chunk_acc.iter_mut().enumerate() {
+                let domain_idx = chunk_start + i;
+                let lifted_partial_numerator =
+                    PackedSecureField::from_packed_m31s(std::array::from_fn(|j| {
+                        let lifted_simd = to_lifted_simd(
+                            acc.partial_numerators_acc.columns[j].data[domain_idx >> log_ratio]
+                                .into_simd(),
+                            *log_ratio,
+                            domain_idx,
+                        );
+                        PackedBaseField::reduce_simd(lifted_simd)
+                    }));
+                let numerator = lifted_partial_numerator - *first_linear_term * points[i].y;
+                *accumulator += numerator * den_inv[i];
+            }
+        }
+        for (i, value) in chunk_acc.into_iter().enumerate() {
+            for (j, coordinate) in value.into_packed_m31s().into_iter().enumerate() {
+                value_dst.0[j].0[i] = coordinate;
+            }
+        }
+    });
+    drop(rest);
+    extend_quotients(quotients, eval_subdomain, eval_domain, twiddles)
 }
 
 #[cfg(test)]

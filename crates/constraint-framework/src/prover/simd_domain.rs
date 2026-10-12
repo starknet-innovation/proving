@@ -39,6 +39,10 @@ pub struct SimdDomainEvaluator<'a> {
     /// bit-reversed order being evaluated. A column of the whole domain is read at
     /// `block + vec_row`, a column of the block's size at `vec_row`.
     pub block: usize,
+    /// SCREEN (w5 Q1608): `Some((log_block, log_n_blocks))` when the columns read at an offset
+    /// hold a sliding window of four blocks (`4 << log_block` rows): block `b` sits in slot
+    /// `reverse(b) % 4` (`reverse` over `log_n_blocks` bits).
+    pub shift_window: Option<(u32, u32)>,
     pub logup: LogupAtRow<Self>,
 }
 impl<'a> SimdDomainEvaluator<'a> {
@@ -65,6 +69,7 @@ impl<'a> SimdDomainEvaluator<'a> {
             eval_domain_log_size: eval_log_size,
             window: None,
             block: 0,
+            shift_window: None,
             logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size),
         }
     }
@@ -88,6 +93,7 @@ impl<'a> SimdDomainEvaluator<'a> {
             eval_domain_log_size: eval_log_size,
             window: None,
             block: 0,
+            shift_window: None,
             logup,
         }
     }
@@ -132,6 +138,15 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
                     let col =
                         &self.trace_eval.get_unchecked(interaction).get_unchecked(col_index).values;
                     let very_packed_col = VeryPackedBaseColumn::transform_under_ref(col);
+                    if let Some((log_block, log_n_blocks)) = self.shift_window
+                        && col.len() == 4 << log_block
+                    {
+                        let shift = LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS;
+                        let row = (self.vec_row + self.block) << shift;
+                        let slot = window_slot(row >> log_block, log_n_blocks);
+                        let local = ((slot << log_block) >> shift) + self.vec_row;
+                        return *very_packed_col.data.get_unchecked(local);
+                    }
                     let vec_row = match self.window {
                         Some((first, _)) => self.vec_row + first,
                         None if self.block != 0
@@ -160,6 +175,16 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
                         self.eval_domain_log_size,
                         off,
                     );
+                    if let Some((log_block, log_n_blocks)) = self.shift_window
+                        && col.values.len() == 4 << log_block
+                    {
+                        let mask = (1usize << log_block) - 1;
+                        return VeryPackedBaseField::from_array(std::array::from_fn(|i| {
+                            let row = rows[i] as usize;
+                            let slot = window_slot(row >> log_block, log_n_blocks);
+                            col.values.at((slot << log_block) | (row & mask))
+                        }));
+                    }
                     VeryPackedBaseField::from_array(std::array::from_fn(|i| col.at(rows[i] as usize)))
                 }
             }
@@ -239,6 +264,12 @@ fn mul_numerator(d: VeryPackedSecureField, n: &VeryPackedSecureField) -> VeryPac
         Some(n) => d * n,
         None => d * *n,
     }
+}
+
+/// SCREEN (w5 Q1608): the slot of block `block` in a four-block sliding window.
+#[inline(always)]
+pub fn window_slot(block: usize, log_n_blocks: u32) -> usize {
+    (block.reverse_bits() >> (usize::BITS - log_n_blocks)) & 3
 }
 
 #[inline(always)]

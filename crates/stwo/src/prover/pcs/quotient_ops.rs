@@ -52,6 +52,35 @@ pub trait QuotientOps: PolyOps {
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
     ) -> SecureEvaluation<Self, BitReversedOrder>;
+
+    /// Adds the numerators of `sample_batch` over `columns` into `dst` when the backend can do
+    /// so in place (same point and size); returns false, leaving `dst` unchanged, otherwise
+    /// (SCREEN p12 Q1552).
+    fn accumulate_numerators_into(
+        _columns: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+        _sample_batch: &ColumnSampleBatch,
+        _dst: &mut AccumulatedNumerators<Self>,
+        _log_blowup_factor: u32,
+    ) -> bool {
+        false
+    }
+
+    /// [`Self::compute_quotients_and_combine`] over `n_points` sample points whose accumulations
+    /// `point_acc` builds one at a time: a backend may combine each into the quotients before the
+    /// next is built, so that only one is resident (SCREEN a8n Q1454).
+    fn compute_quotients_per_point(
+        n_points: usize,
+        point_acc: &(dyn Fn(usize) -> AccumulatedNumerators<Self> + Sync),
+        lifting_log_size: u32,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<Self>,
+    ) -> SecureEvaluation<Self, BitReversedOrder>
+    where
+        Self: Sized,
+    {
+        let accs = (0..n_points).map(point_acc).collect();
+        Self::compute_quotients_and_combine(accs, lifting_log_size, log_blowup_factor, twiddles)
+    }
 }
 
 /// Helper struct that keeps track of the accumulation of the numerators involved in the FRI
@@ -152,7 +181,7 @@ pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
         regrow.is_some() && column.values.len() == 0
     };
     let mut regrown_groups = vec![];
-    let groups: Vec<(Vec<_>, Vec<ColumnSampleBatch>)> = zip(
+    let groups: Vec<(Vec<&CircleEvaluation<B, BaseField, BitReversedOrder>>, Vec<ColumnSampleBatch>)> = zip(
         zip(columns.iter().flatten(), samples_with_randomness.iter().flatten()),
         &positions,
     )
@@ -181,6 +210,157 @@ pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
         B::accumulate_numerators(columns, std::slice::from_ref(batch), &mut acc, log_blowup_factor);
         acc
     };
+    // SCREEN (a8n Q1454): `A8N_QPT=1` builds and combines the accumulations one sample point at
+    // a time (sorted as below); a point's accumulation is dropped before the next is built.
+    if crate::prover::m11_env("A8N_QPT", 0) != 0 {
+        let regrow_batch = crate::prover::m11_env("M11_REGROW", REGROWN_BATCH);
+        let mut points = groups
+            .iter()
+            .flat_map(|(_, batches)| batches.iter().map(|batch| batch.point))
+            .collect_vec();
+        for group in &regrown_groups {
+            let samples = group.iter().map(|((_, s), _)| *s).collect_vec();
+            points.extend(ColumnSampleBatch::new_vec(&samples).iter().map(|batch| batch.point));
+        }
+        let points = points.into_iter().sorted_by_key(|p| (p.x, p.y)).dedup().collect_vec();
+        let point_acc = |i: usize| -> AccumulatedNumerators<B> {
+            let point = points[i];
+            let mut accs: Vec<AccumulatedNumerators<B>> = vec![];
+            #[cfg(feature = "parallel")]
+            let stored: Vec<Vec<AccumulatedNumerators<B>>> = groups
+                .par_iter()
+                .flat_map(|(columns, batches)| {
+                    batches
+                        .par_iter()
+                        .filter(|batch| batch.point == point)
+                        .map(|batch| accumulate_batch(columns, batch))
+                })
+                .collect();
+            #[cfg(not(feature = "parallel"))]
+            let stored: Vec<Vec<AccumulatedNumerators<B>>> = groups
+                .iter()
+                .flat_map(|(columns, batches)| {
+                    batches
+                        .iter()
+                        .filter(|batch| batch.point == point)
+                        .map(|batch| accumulate_batch(columns, batch))
+                })
+                .collect();
+            for acc in stored.into_iter().flatten() {
+                add_accumulation(&mut accs, acc);
+            }
+            for group in &regrown_groups {
+                for batch in group.chunks(regrow_batch) {
+                    let samples = batch.iter().map(|((_, s), _)| *s).collect_vec();
+                    let sample_batches = ColumnSampleBatch::new_vec(&samples)
+                        .into_iter()
+                        .filter(|sample_batch| sample_batch.point == point)
+                        .collect_vec();
+                    if sample_batches.is_empty() {
+                        continue;
+                    }
+                    let regrow = regrow.unwrap();
+                    #[cfg(feature = "parallel")]
+                    let stripes: Vec<_> =
+                        batch.par_iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
+                    #[cfg(not(feature = "parallel"))]
+                    let stripes: Vec<_> =
+                        batch.iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
+                    let stripes = stripes.iter().collect_vec();
+                    for sample_batch in &sample_batches {
+                        for acc in accumulate_batch(&stripes, sample_batch) {
+                            add_accumulation(&mut accs, acc);
+                        }
+                    }
+                }
+            }
+            let first_linear_term_acc: SecureField =
+                accs.iter().map(|x| x.first_linear_term_acc).sum();
+            let partial_numerators_acc = B::lift_and_accumulate(
+                accs.into_iter().map(|x| x.partial_numerators_acc).collect_vec(),
+            )
+            .unwrap();
+            AccumulatedNumerators { sample_point: point, partial_numerators_acc, first_linear_term_acc }
+        };
+        return B::compute_quotients_per_point(
+            points.len(),
+            &point_acc,
+            lifting_log_size,
+            log_blowup_factor,
+            twiddles,
+        );
+    }
+    let add_into = crate::prover::m11_env("P12_ADDINTO", 0) != 0;
+    // Accumulates a regrown batch's sample batches: into a matching accumulation of `accs` in
+    // place when `P12_ADDINTO=1` and the backend can, else as new accumulations merged by `merge`.
+    let accumulate_regrown = |accs: &mut Vec<AccumulatedNumerators<B>>,
+                              stripes: &[&CircleEvaluation<B, BaseField, BitReversedOrder>],
+                              sample_batches: &[ColumnSampleBatch],
+                              merge: &dyn Fn(&mut Vec<AccumulatedNumerators<B>>, AccumulatedNumerators<B>)| {
+        let mut rest = vec![];
+        for batch in sample_batches {
+            let done = add_into
+                && accs.iter_mut().any(|acc| {
+                    acc.sample_point == batch.point
+                        && B::accumulate_numerators_into(stripes, batch, acc, log_blowup_factor)
+                });
+            if !done {
+                rest.push(batch);
+            }
+        }
+        #[cfg(feature = "parallel")]
+        let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+            rest.par_iter().map(|batch| accumulate_batch(stripes, *batch)).collect();
+        #[cfg(not(feature = "parallel"))]
+        let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+            rest.iter().map(|batch| accumulate_batch(stripes, *batch)).collect();
+        for accumulation in accumulations.into_iter().flatten() {
+            merge(accs, accumulation);
+        }
+    };
+    let regrow_batch = crate::prover::m11_env("M11_REGROW", REGROWN_BATCH);
+    // SCREEN (p12 Q1551): `P12_EAGER=1` keeps one accumulation per sample point and lifts each
+    // (log size, point) accumulation into it as soon as it is made, the largest log size first,
+    // so the smaller sizes are never resident together. Lifting composes and field addition is
+    // exact, so the per-point accumulations equal those lifted and summed below.
+    if crate::prover::m11_env("P12_EAGER", 0) != 0 {
+        let mut per_point: Vec<AccumulatedNumerators<B>> = vec![];
+        for (columns, batches) in groups.iter().rev() {
+            #[cfg(feature = "parallel")]
+            let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+                batches.par_iter().map(|batch| accumulate_batch(columns, batch)).collect();
+            #[cfg(not(feature = "parallel"))]
+            let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+                batches.iter().map(|batch| accumulate_batch(columns, batch)).collect();
+            for accumulation in accumulations.into_iter().flatten() {
+                merge_lifted(&mut per_point, accumulation);
+            }
+        }
+        drop(groups);
+        for group in regrown_groups.iter().rev() {
+            let regrow = regrow.unwrap();
+            for batch in group.chunks(regrow_batch) {
+                #[cfg(feature = "parallel")]
+                let stripes: Vec<_> =
+                    batch.par_iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
+                #[cfg(not(feature = "parallel"))]
+                let stripes: Vec<_> =
+                    batch.iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
+                let stripes = stripes.iter().collect_vec();
+                let samples_with_randomness = batch.iter().map(|((_, s), _)| *s).collect_vec();
+                let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
+                accumulate_regrown(&mut per_point, &stripes, &sample_batches, &merge_lifted::<B>);
+            }
+        }
+        let per_point =
+            per_point.into_iter().sorted_by_key(|c| (c.sample_point.x, c.sample_point.y)).collect_vec();
+        return B::compute_quotients_and_combine(
+            per_point,
+            lifting_log_size,
+            log_blowup_factor,
+            twiddles,
+        );
+    }
     #[cfg(feature = "parallel")]
     let accumulations: Vec<Vec<AccumulatedNumerators<B>>> = groups
         .par_iter()
@@ -198,7 +378,7 @@ pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
     // The columns that store no values, a bounded batch of regrown stripes at a time.
     for group in regrown_groups {
         let regrow = regrow.unwrap();
-        for batch in group.chunks(REGROWN_BATCH) {
+        for batch in group.chunks(regrow_batch) {
             #[cfg(feature = "parallel")]
             let stripes: Vec<_> =
                 batch.par_iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
@@ -208,15 +388,12 @@ pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
             let stripes = stripes.iter().collect_vec();
             let samples_with_randomness = batch.iter().map(|((_, s), _)| *s).collect_vec();
             let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
-            #[cfg(feature = "parallel")]
-            let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
-                sample_batches.par_iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
-            #[cfg(not(feature = "parallel"))]
-            let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
-                sample_batches.iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
-            for accumulation in accumulations.into_iter().flatten() {
-                add_accumulation(&mut accumulated_numerators_vec, accumulation);
-            }
+            accumulate_regrown(
+                &mut accumulated_numerators_vec,
+                &stripes,
+                &sample_batches,
+                &add_accumulation::<B>,
+            );
         }
     }
 
@@ -256,6 +433,39 @@ pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
         log_blowup_factor,
         twiddles,
     )
+}
+
+/// Adds `accumulation` into the one accumulation of its sample point in `per_point`, lifting the
+/// smaller of the two to the larger's size, or appends it (SCREEN p12 Q1551).
+fn merge_lifted<B: AccumulationOps>(
+    per_point: &mut Vec<AccumulatedNumerators<B>>,
+    accumulation: AccumulatedNumerators<B>,
+) {
+    let Some(index) =
+        per_point.iter().position(|existing| existing.sample_point == accumulation.sample_point)
+    else {
+        per_point.push(accumulation);
+        return;
+    };
+    let existing = &mut per_point[index];
+    existing.first_linear_term_acc += accumulation.first_linear_term_acc;
+    let (len, other_len) =
+        (existing.partial_numerators_acc.len(), accumulation.partial_numerators_acc.len());
+    if len == other_len {
+        B::accumulate(&mut existing.partial_numerators_acc, &accumulation.partial_numerators_acc);
+        return;
+    }
+    let existing = per_point.swap_remove(index);
+    let (smaller, larger) = if len < other_len {
+        (existing.partial_numerators_acc, accumulation.partial_numerators_acc)
+    } else {
+        (accumulation.partial_numerators_acc, existing.partial_numerators_acc)
+    };
+    per_point.push(AccumulatedNumerators {
+        sample_point: existing.sample_point,
+        partial_numerators_acc: B::lift_and_accumulate(vec![smaller, larger]).unwrap(),
+        first_linear_term_acc: existing.first_linear_term_acc,
+    });
 }
 
 /// Adds `accumulation` to the accumulation in `accumulations` of the same sample point and size,

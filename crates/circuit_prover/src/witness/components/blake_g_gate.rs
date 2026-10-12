@@ -2,6 +2,8 @@
 #![allow(clippy::too_many_arguments)]
 use crate::circuit_air::components::blake_g_gate::{Claim, InteractionClaim, N_TRACE_COLUMNS};
 use crate::witness::components::prelude::*;
+use std::simd::cmp::SimdPartialOrd;
+use rayon::slice::ParallelSlice;
 use crate::witness::components::{
     verify_bitwise_xor_4, verify_bitwise_xor_7, verify_bitwise_xor_8, verify_bitwise_xor_9,
     verify_bitwise_xor_12,
@@ -150,9 +152,8 @@ pub fn write_trace(
     let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
     let log_size = size.ilog2();
 
-    let packed_inputs = pack_values(&inputs);
-    drop(inputs);
-
+    // The `usize` address columns are converted (and freed) before the inputs are packed, so the
+    // two copies of the inputs never overlap them (a8n Q1463).
     let preprocessed_columns = [
         input_addr_a,
         input_addr_b,
@@ -169,26 +170,64 @@ pub fn write_trace(
     .into_iter()
     .map(|col| Col::<SimdBackend, M31>::from_iter(col.iter().map(|&x| M31::from(x))).data)
     .collect_vec();
+    let packed_inputs = pack_values(&inputs);
+    drop(inputs);
 
     let (trace, lookup_data) = write_trace_simd(packed_inputs, preprocessed_columns);
-    verify_bitwise_xor_8_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_8_0, 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_8_1, 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_8_2, 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_8_3, 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_8_4, 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_8_5, 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_8_b_0, 1);
-    verify_bitwise_xor_8_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_8_b_1, 1);
-    verify_bitwise_xor_12_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_12_0, 0);
-    verify_bitwise_xor_12_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_12_1, 0);
-    verify_bitwise_xor_4_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_4_0, 0);
-    verify_bitwise_xor_4_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_4_1, 0);
-    verify_bitwise_xor_9_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_9_0, 0);
-    verify_bitwise_xor_9_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_9_1, 0);
-    verify_bitwise_xor_7_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_7_0, 0);
-    verify_bitwise_xor_7_state.add_packed_inputs(&lookup_data.verify_bitwise_xor_7_1, 0);
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_8_0, |wide| verify_bitwise_xor_8_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_8_1, |wide| verify_bitwise_xor_8_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_8_2, |wide| verify_bitwise_xor_8_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_8_3, |wide| verify_bitwise_xor_8_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_8_4, |wide| verify_bitwise_xor_8_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_8_5, |wide| verify_bitwise_xor_8_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_8_b_0, |wide| verify_bitwise_xor_8_state.add_packed_inputs(wide, 1));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_8_b_1, |wide| verify_bitwise_xor_8_state.add_packed_inputs(wide, 1));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_12_0, |wide| verify_bitwise_xor_12_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_12_1, |wide| verify_bitwise_xor_12_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_4_0, |wide| verify_bitwise_xor_4_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_4_1, |wide| verify_bitwise_xor_4_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_9_0, |wide| verify_bitwise_xor_9_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_9_1, |wide| verify_bitwise_xor_9_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_7_0, |wide| verify_bitwise_xor_7_state.add_packed_inputs(wide, 0));
+    add_narrow_inputs(&lookup_data.verify_bitwise_xor_7_1, |wide| verify_bitwise_xor_7_state.add_packed_inputs(wide, 0));
 
     (trace, Claim { log_size }, InteractionClaimGenerator { log_size, lookup_data })
+}
+
+/// An XOR lookup tuple `[a, b, a ^ b]` (a, b < 2^16) as one word per lane, `a | b << 16`: a third of
+/// the bytes the interaction generator holds from the trace until the interaction trace (Q1010).
+fn narrow_tuple([a, b, c]: [PackedM31; 3]) -> u32x16 {
+    let (a, b) = (a.into_simd(), b.into_simd());
+    debug_assert!(a.simd_lt(u32x16::splat(1 << 16)).all() && b.simd_lt(u32x16::splat(1 << 16)).all());
+    debug_assert_eq!(a ^ b, c.into_simd());
+    a | (b << 16)
+}
+
+/// A gate tuple `[address, low limb, high limb]` kept as the address and one word of the two
+/// 16-bit limbs (8 bytes per row, not 12); [`widen_gate`] rebuilds it exactly (a8n Q1459, after
+/// rukafe0x rgr1_60812844).
+fn narrow_gate([address, low, high]: [PackedM31; 3]) -> [u32x16; 2] {
+    let (low, high) = (low.into_simd(), high.into_simd());
+    assert!(low.simd_lt(u32x16::splat(1 << 16)).all() && high.simd_lt(u32x16::splat(1 << 16)).all());
+    [address.into_simd(), low | (high << 16)]
+}
+
+fn widen_gate([address, word]: [u32x16; 2]) -> [PackedM31; 3] {
+    // Every lane is below 2^31 - 1 = P, so the reduction is the identity.
+    [address, word & u32x16::splat(0xFFFF), word >> 16].map(PackedM31::reduce_simd)
+}
+
+/// Counts narrowed tuples in the lookup's multiplicities, widening a chunk at a time.
+fn add_narrow_inputs(words: &[u32x16], add: impl Fn(&[[PackedM31; 3]]) + Sync) {
+    words.par_chunks(1 << 10).for_each(|chunk| {
+        add(&chunk.iter().map(|&w| widen_xor(w)).collect_vec());
+    });
+}
+
+fn widen_xor(w: u32x16) -> [PackedM31; 3] {
+    let (a, b) = (w & u32x16::splat(0xFFFF), w >> 16);
+    // a, b < 2^16 < P, so the reduction is the identity.
+    [a, b, a ^ b].map(PackedM31::reduce_simd)
 }
 
 #[allow(clippy::useless_conversion)]
@@ -343,11 +382,11 @@ fn write_trace_simd(
                     ^ (PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_754f3_9[0])));
             let xor_col26 = xor_tmp_754f3_12.as_m31();
             *row[26] = xor_col26;
-            *lookup_data.verify_bitwise_xor_8_0 = [
+            *lookup_data.verify_bitwise_xor_8_0 = narrow_tuple([
                 split_16_low_part_size_8_output_tmp_754f3_5[0],
                 split_16_low_part_size_8_output_tmp_754f3_9[0],
                 xor_col26,
-            ];
+            ]);
 
             // Bitwise Xor Num Bits 8.
 
@@ -355,7 +394,7 @@ fn write_trace_simd(
                 ^ (PackedUInt16::from_m31(ms_8_bits_col24)));
             let xor_col27 = xor_tmp_754f3_14.as_m31();
             *row[27] = xor_col27;
-            *lookup_data.verify_bitwise_xor_8_1 = [ms_8_bits_col22, ms_8_bits_col24, xor_col27];
+            *lookup_data.verify_bitwise_xor_8_1 = narrow_tuple([ms_8_bits_col22, ms_8_bits_col24, xor_col27]);
 
             // Bitwise Xor Num Bits 8 B.
 
@@ -364,11 +403,11 @@ fn write_trace_simd(
                     ^ (PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_754f3_11[0])));
             let xor_col28 = xor_tmp_754f3_16.as_m31();
             *row[28] = xor_col28;
-            *lookup_data.verify_bitwise_xor_8_b_0 = [
+            *lookup_data.verify_bitwise_xor_8_b_0 = narrow_tuple([
                 split_16_low_part_size_8_output_tmp_754f3_7[0],
                 split_16_low_part_size_8_output_tmp_754f3_11[0],
                 xor_col28,
-            ];
+            ]);
 
             // Bitwise Xor Num Bits 8 B.
 
@@ -376,7 +415,7 @@ fn write_trace_simd(
                 ^ (PackedUInt16::from_m31(ms_8_bits_col25)));
             let xor_col29 = xor_tmp_754f3_18.as_m31();
             *row[29] = xor_col29;
-            *lookup_data.verify_bitwise_xor_8_b_1 = [ms_8_bits_col23, ms_8_bits_col25, xor_col29];
+            *lookup_data.verify_bitwise_xor_8_b_1 = narrow_tuple([ms_8_bits_col23, ms_8_bits_col25, xor_col29]);
 
             let xor_rot_16_output_tmp_754f3_20 = PackedUInt32::from_limbs([
                 ((xor_col28) + ((xor_col29) * (M31_256))),
@@ -440,11 +479,11 @@ fn write_trace_simd(
                     ^ (PackedUInt16::from_m31(split_16_low_part_size_12_output_tmp_754f3_31[0])));
             let xor_col36 = xor_tmp_754f3_34.as_m31();
             *row[36] = xor_col36;
-            *lookup_data.verify_bitwise_xor_12_0 = [
+            *lookup_data.verify_bitwise_xor_12_0 = narrow_tuple([
                 split_16_low_part_size_12_output_tmp_754f3_27[0],
                 split_16_low_part_size_12_output_tmp_754f3_31[0],
                 xor_col36,
-            ];
+            ]);
 
             // Bitwise Xor Num Bits 4.
 
@@ -452,7 +491,7 @@ fn write_trace_simd(
                 ^ (PackedUInt16::from_m31(ms_4_bits_col34)));
             let xor_col37 = xor_tmp_754f3_36.as_m31();
             *row[37] = xor_col37;
-            *lookup_data.verify_bitwise_xor_4_0 = [ms_4_bits_col32, ms_4_bits_col34, xor_col37];
+            *lookup_data.verify_bitwise_xor_4_0 = narrow_tuple([ms_4_bits_col32, ms_4_bits_col34, xor_col37]);
 
             // Bitwise Xor Num Bits 12.
 
@@ -461,11 +500,11 @@ fn write_trace_simd(
                     ^ (PackedUInt16::from_m31(split_16_low_part_size_12_output_tmp_754f3_33[0])));
             let xor_col38 = xor_tmp_754f3_38.as_m31();
             *row[38] = xor_col38;
-            *lookup_data.verify_bitwise_xor_12_1 = [
+            *lookup_data.verify_bitwise_xor_12_1 = narrow_tuple([
                 split_16_low_part_size_12_output_tmp_754f3_29[0],
                 split_16_low_part_size_12_output_tmp_754f3_33[0],
                 xor_col38,
-            ];
+            ]);
 
             // Bitwise Xor Num Bits 4.
 
@@ -473,7 +512,7 @@ fn write_trace_simd(
                 ^ (PackedUInt16::from_m31(ms_4_bits_col35)));
             let xor_col39 = xor_tmp_754f3_40.as_m31();
             *row[39] = xor_col39;
-            *lookup_data.verify_bitwise_xor_4_1 = [ms_4_bits_col33, ms_4_bits_col35, xor_col39];
+            *lookup_data.verify_bitwise_xor_4_1 = narrow_tuple([ms_4_bits_col33, ms_4_bits_col35, xor_col39]);
 
             let xor_rot_12_output_tmp_754f3_42 = PackedUInt32::from_limbs([
                 ((xor_col37) + ((xor_col38) * (M31_16))),
@@ -538,19 +577,19 @@ fn write_trace_simd(
             let split_16_low_part_size_8_output_tmp_754f3_57 =
                 [((input_d_tag_limb_1_col19) - ((ms_8_bits_col45) * (M31_256))), ms_8_bits_col45];
             *lookup_data.verify_bitwise_xor_8_2 =
-                [ms_8_bits_col40, ms_8_bits_col42, split_16_low_part_size_8_output_tmp_754f3_55[0]];
-            *lookup_data.verify_bitwise_xor_8_3 = [
+                narrow_tuple([ms_8_bits_col40, ms_8_bits_col42, split_16_low_part_size_8_output_tmp_754f3_55[0]]);
+            *lookup_data.verify_bitwise_xor_8_3 = narrow_tuple([
                 split_16_low_part_size_8_output_tmp_754f3_49[0],
                 split_16_low_part_size_8_output_tmp_754f3_53[0],
                 ms_8_bits_col44,
-            ];
+            ]);
             *lookup_data.verify_bitwise_xor_8_4 =
-                [ms_8_bits_col41, ms_8_bits_col43, split_16_low_part_size_8_output_tmp_754f3_57[0]];
-            *lookup_data.verify_bitwise_xor_8_5 = [
+                narrow_tuple([ms_8_bits_col41, ms_8_bits_col43, split_16_low_part_size_8_output_tmp_754f3_57[0]]);
+            *lookup_data.verify_bitwise_xor_8_5 = narrow_tuple([
                 split_16_low_part_size_8_output_tmp_754f3_47[0],
                 split_16_low_part_size_8_output_tmp_754f3_51[0],
                 ms_8_bits_col45,
-            ];
+            ]);
 
             // Verify Xor Rot 32 R 7.
 
@@ -609,40 +648,40 @@ fn write_trace_simd(
             let split_16_low_part_size_9_output_tmp_754f3_71 =
                 [((input_b_tag_limb_1_col15) - ((ms_7_bits_col51) * (M31_512))), ms_7_bits_col51];
             *lookup_data.verify_bitwise_xor_9_0 =
-                [ms_9_bits_col46, ms_9_bits_col48, split_16_low_part_size_9_output_tmp_754f3_69[0]];
-            *lookup_data.verify_bitwise_xor_7_0 = [
+                narrow_tuple([ms_9_bits_col46, ms_9_bits_col48, split_16_low_part_size_9_output_tmp_754f3_69[0]]);
+            *lookup_data.verify_bitwise_xor_7_0 = narrow_tuple([
                 split_16_low_part_size_7_output_tmp_754f3_63[0],
                 split_16_low_part_size_7_output_tmp_754f3_67[0],
                 ms_7_bits_col50,
-            ];
+            ]);
             *lookup_data.verify_bitwise_xor_9_1 =
-                [ms_9_bits_col47, ms_9_bits_col49, split_16_low_part_size_9_output_tmp_754f3_71[0]];
-            *lookup_data.verify_bitwise_xor_7_1 = [
+                narrow_tuple([ms_9_bits_col47, ms_9_bits_col49, split_16_low_part_size_9_output_tmp_754f3_71[0]]);
+            *lookup_data.verify_bitwise_xor_7_1 = narrow_tuple([
                 split_16_low_part_size_7_output_tmp_754f3_61[0],
                 split_16_low_part_size_7_output_tmp_754f3_65[0],
                 ms_7_bits_col51,
-            ];
+            ]);
 
             *lookup_data.gate_0 =
-                [blake_g_gate_input_addr_a, input_a_limb_0_col0, input_a_limb_1_col1];
+                narrow_gate([blake_g_gate_input_addr_a, input_a_limb_0_col0, input_a_limb_1_col1]);
             *lookup_data.gate_1 =
-                [blake_g_gate_input_addr_b, input_b_limb_0_col2, input_b_limb_1_col3];
+                narrow_gate([blake_g_gate_input_addr_b, input_b_limb_0_col2, input_b_limb_1_col3]);
             *lookup_data.gate_2 =
-                [blake_g_gate_input_addr_c, input_c_limb_0_col4, input_c_limb_1_col5];
+                narrow_gate([blake_g_gate_input_addr_c, input_c_limb_0_col4, input_c_limb_1_col5]);
             *lookup_data.gate_3 =
-                [blake_g_gate_input_addr_d, input_d_limb_0_col6, input_d_limb_1_col7];
+                narrow_gate([blake_g_gate_input_addr_d, input_d_limb_0_col6, input_d_limb_1_col7]);
             *lookup_data.gate_4 =
-                [blake_g_gate_input_addr_f0, input_f0_limb_0_col8, input_f0_limb_1_col9];
+                narrow_gate([blake_g_gate_input_addr_f0, input_f0_limb_0_col8, input_f0_limb_1_col9]);
             *lookup_data.gate_5 =
-                [blake_g_gate_input_addr_f1, input_f1_limb_0_col10, input_f1_limb_1_col11];
+                narrow_gate([blake_g_gate_input_addr_f1, input_f1_limb_0_col10, input_f1_limb_1_col11]);
             *lookup_data.gate_6 =
-                [blake_g_gate_output_addr_a, input_a_tag_limb_0_col12, input_a_tag_limb_1_col13];
+                narrow_gate([blake_g_gate_output_addr_a, input_a_tag_limb_0_col12, input_a_tag_limb_1_col13]);
             *lookup_data.gate_7 =
-                [blake_g_gate_output_addr_b, input_b_tag_limb_0_col14, input_b_tag_limb_1_col15];
+                narrow_gate([blake_g_gate_output_addr_b, input_b_tag_limb_0_col14, input_b_tag_limb_1_col15]);
             *lookup_data.gate_8 =
-                [blake_g_gate_output_addr_c, input_c_tag_limb_0_col16, input_c_tag_limb_1_col17];
+                narrow_gate([blake_g_gate_output_addr_c, input_c_tag_limb_0_col16, input_c_tag_limb_1_col17]);
             *lookup_data.gate_9 =
-                [blake_g_gate_output_addr_d, input_d_tag_limb_0_col18, input_d_tag_limb_1_col19];
+                narrow_gate([blake_g_gate_output_addr_d, input_d_tag_limb_0_col18, input_d_tag_limb_1_col19]);
             *lookup_data.mults_0 = blake_g_gate_multiplicity;
         });
 
@@ -651,32 +690,32 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 struct LookupData {
-    gate_0: Vec<[PackedM31; 3]>,
-    gate_1: Vec<[PackedM31; 3]>,
-    gate_2: Vec<[PackedM31; 3]>,
-    gate_3: Vec<[PackedM31; 3]>,
-    gate_4: Vec<[PackedM31; 3]>,
-    gate_5: Vec<[PackedM31; 3]>,
-    gate_6: Vec<[PackedM31; 3]>,
-    gate_7: Vec<[PackedM31; 3]>,
-    gate_8: Vec<[PackedM31; 3]>,
-    gate_9: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_12_0: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_12_1: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_4_0: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_4_1: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_7_0: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_7_1: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_8_0: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_8_1: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_8_2: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_8_3: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_8_4: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_8_5: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_8_b_0: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_8_b_1: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_9_0: Vec<[PackedM31; 3]>,
-    verify_bitwise_xor_9_1: Vec<[PackedM31; 3]>,
+    gate_0: Vec<[u32x16; 2]>,
+    gate_1: Vec<[u32x16; 2]>,
+    gate_2: Vec<[u32x16; 2]>,
+    gate_3: Vec<[u32x16; 2]>,
+    gate_4: Vec<[u32x16; 2]>,
+    gate_5: Vec<[u32x16; 2]>,
+    gate_6: Vec<[u32x16; 2]>,
+    gate_7: Vec<[u32x16; 2]>,
+    gate_8: Vec<[u32x16; 2]>,
+    gate_9: Vec<[u32x16; 2]>,
+    verify_bitwise_xor_12_0: Vec<u32x16>,
+    verify_bitwise_xor_12_1: Vec<u32x16>,
+    verify_bitwise_xor_4_0: Vec<u32x16>,
+    verify_bitwise_xor_4_1: Vec<u32x16>,
+    verify_bitwise_xor_7_0: Vec<u32x16>,
+    verify_bitwise_xor_7_1: Vec<u32x16>,
+    verify_bitwise_xor_8_0: Vec<u32x16>,
+    verify_bitwise_xor_8_1: Vec<u32x16>,
+    verify_bitwise_xor_8_2: Vec<u32x16>,
+    verify_bitwise_xor_8_3: Vec<u32x16>,
+    verify_bitwise_xor_8_4: Vec<u32x16>,
+    verify_bitwise_xor_8_5: Vec<u32x16>,
+    verify_bitwise_xor_8_b_0: Vec<u32x16>,
+    verify_bitwise_xor_8_b_1: Vec<u32x16>,
+    verify_bitwise_xor_9_0: Vec<u32x16>,
+    verify_bitwise_xor_9_1: Vec<u32x16>,
     mults_0: Vec<PackedM31>,
 }
 
@@ -695,80 +734,80 @@ impl InteractionClaimGenerator {
         logup_gen.write_frac_cols(13, |column, row| {
             let (values0, values1, tag0, tag1) = match column {
                 0 => (
-                    &self.lookup_data.verify_bitwise_xor_8_0[row],
-                    &self.lookup_data.verify_bitwise_xor_8_1[row],
+                    widen_xor(self.lookup_data.verify_bitwise_xor_8_0[row]),
+                    widen_xor(self.lookup_data.verify_bitwise_xor_8_1[row]),
                     relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
                     relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
                 ),
                 1 => (
-                    &self.lookup_data.verify_bitwise_xor_8_b_0[row],
-                    &self.lookup_data.verify_bitwise_xor_8_b_1[row],
+                    widen_xor(self.lookup_data.verify_bitwise_xor_8_b_0[row]),
+                    widen_xor(self.lookup_data.verify_bitwise_xor_8_b_1[row]),
                     relations::VERIFY_BITWISE_XOR_8_B_RELATION_ID,
                     relations::VERIFY_BITWISE_XOR_8_B_RELATION_ID,
                 ),
                 2 => (
-                    &self.lookup_data.verify_bitwise_xor_12_0[row],
-                    &self.lookup_data.verify_bitwise_xor_4_0[row],
+                    widen_xor(self.lookup_data.verify_bitwise_xor_12_0[row]),
+                    widen_xor(self.lookup_data.verify_bitwise_xor_4_0[row]),
                     relations::VERIFY_BITWISE_XOR_12_RELATION_ID,
                     relations::VERIFY_BITWISE_XOR_4_RELATION_ID,
                 ),
                 3 => (
-                    &self.lookup_data.verify_bitwise_xor_12_1[row],
-                    &self.lookup_data.verify_bitwise_xor_4_1[row],
+                    widen_xor(self.lookup_data.verify_bitwise_xor_12_1[row]),
+                    widen_xor(self.lookup_data.verify_bitwise_xor_4_1[row]),
                     relations::VERIFY_BITWISE_XOR_12_RELATION_ID,
                     relations::VERIFY_BITWISE_XOR_4_RELATION_ID,
                 ),
                 4 => (
-                    &self.lookup_data.verify_bitwise_xor_8_2[row],
-                    &self.lookup_data.verify_bitwise_xor_8_3[row],
+                    widen_xor(self.lookup_data.verify_bitwise_xor_8_2[row]),
+                    widen_xor(self.lookup_data.verify_bitwise_xor_8_3[row]),
                     relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
                     relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
                 ),
                 5 => (
-                    &self.lookup_data.verify_bitwise_xor_8_4[row],
-                    &self.lookup_data.verify_bitwise_xor_8_5[row],
+                    widen_xor(self.lookup_data.verify_bitwise_xor_8_4[row]),
+                    widen_xor(self.lookup_data.verify_bitwise_xor_8_5[row]),
                     relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
                     relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
                 ),
                 6 => (
-                    &self.lookup_data.verify_bitwise_xor_9_0[row],
-                    &self.lookup_data.verify_bitwise_xor_7_0[row],
+                    widen_xor(self.lookup_data.verify_bitwise_xor_9_0[row]),
+                    widen_xor(self.lookup_data.verify_bitwise_xor_7_0[row]),
                     relations::VERIFY_BITWISE_XOR_9_RELATION_ID,
                     relations::VERIFY_BITWISE_XOR_7_RELATION_ID,
                 ),
                 7 => (
-                    &self.lookup_data.verify_bitwise_xor_9_1[row],
-                    &self.lookup_data.verify_bitwise_xor_7_1[row],
+                    widen_xor(self.lookup_data.verify_bitwise_xor_9_1[row]),
+                    widen_xor(self.lookup_data.verify_bitwise_xor_7_1[row]),
                     relations::VERIFY_BITWISE_XOR_9_RELATION_ID,
                     relations::VERIFY_BITWISE_XOR_7_RELATION_ID,
                 ),
                 8 => (
-                    &self.lookup_data.gate_0[row],
-                    &self.lookup_data.gate_1[row],
+                    widen_gate(self.lookup_data.gate_0[row]),
+                    widen_gate(self.lookup_data.gate_1[row]),
                     relations::GATE_RELATION_ID,
                     relations::GATE_RELATION_ID,
                 ),
                 9 => (
-                    &self.lookup_data.gate_2[row],
-                    &self.lookup_data.gate_3[row],
+                    widen_gate(self.lookup_data.gate_2[row]),
+                    widen_gate(self.lookup_data.gate_3[row]),
                     relations::GATE_RELATION_ID,
                     relations::GATE_RELATION_ID,
                 ),
                 10 => (
-                    &self.lookup_data.gate_4[row],
-                    &self.lookup_data.gate_5[row],
+                    widen_gate(self.lookup_data.gate_4[row]),
+                    widen_gate(self.lookup_data.gate_5[row]),
                     relations::GATE_RELATION_ID,
                     relations::GATE_RELATION_ID,
                 ),
                 11 => (
-                    &self.lookup_data.gate_6[row],
-                    &self.lookup_data.gate_7[row],
+                    widen_gate(self.lookup_data.gate_6[row]),
+                    widen_gate(self.lookup_data.gate_7[row]),
                     relations::GATE_RELATION_ID,
                     relations::GATE_RELATION_ID,
                 ),
                 12 => (
-                    &self.lookup_data.gate_8[row],
-                    &self.lookup_data.gate_9[row],
+                    widen_gate(self.lookup_data.gate_8[row]),
+                    widen_gate(self.lookup_data.gate_9[row]),
                     relations::GATE_RELATION_ID,
                     relations::GATE_RELATION_ID,
                 ),
