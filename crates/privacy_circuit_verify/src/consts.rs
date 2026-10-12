@@ -2,10 +2,10 @@ use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 
 /// Uncompressed size in bytes of the serialized cairo proof (including public claim prefix).
-pub const CAIRO_PROOF_UNCOMPRESSED_BYTES: usize = 627_280;
+pub const CAIRO_PROOF_UNCOMPRESSED_BYTES: usize = 2_204_192;
 
 /// Uncompressed size in bytes of the serialized recursive circuit proof.
-pub const RECURSIVE_PROOF_UNCOMPRESSED_BYTES: usize = 263_796;
+pub const RECURSIVE_PROOF_UNCOMPRESSED_BYTES: usize = 889_416;
 
 /// Multiplicative safety factor applied to the proof size constants to derive decompression limits
 /// used in `verify_cairo` and `verify_recursive_circuit` as zip-bomb protection.
@@ -29,18 +29,25 @@ pub const PRIVACY_BOOTLOADER_JSON: &[u8] = include_bytes!(
 );
 pub const CIRCUIT_OUTPUT_ADDRESSES: [usize; 9] = [3, 4, 5, 6, 7, 8, 9, 10, 2];
 pub const PRIVACY_RECURSION_CIRCUIT_PREPROCESSED_ROOT: [u32; 8] = [
-    2494562375, 3772725602, 2295983387, 4265055971, 2941924325, 1473327272, 3310095663, 2157173037,
+    3626914247,
+    3321582018,
+    3188250037,
+    331961884,
+    4202082079,
+    1706998192,
+    1166238458,
+    33418141,
 ];
 pub const CAIRO_LOG_BLOWUP_FACTOR: u32 = 3;
 pub const CAIRO_TRACE_LOG_SIZE: u32 = 20;
 pub const CIRCUIT_LOG_BLOWUP_FACTOR: u32 = 2;
-pub const CIRCUIT_TRACE_LOG_SIZE: u32 = 21;
+pub const CIRCUIT_TRACE_LOG_SIZE: u32 = 23;
 
 pub const CAIRO_FRI_CONFIG: FriConfig = FriConfig {
     pow_bits: 27,
     log_blowup_factor: CAIRO_LOG_BLOWUP_FACTOR,
     log_last_layer_degree_bound: 0,
-    n_queries: 23,
+    n_queries: 90,
     fold_step: 4,
 };
 
@@ -51,7 +58,7 @@ pub const CIRCUIT_FRI_CONFIG: FriConfig = FriConfig {
     pow_bits: 26,
     log_blowup_factor: CIRCUIT_LOG_BLOWUP_FACTOR,
     log_last_layer_degree_bound: 0,
-    n_queries: 35,
+    n_queries: 110,
     fold_step: 4,
 };
 
@@ -124,16 +131,51 @@ pub const PRIVACY_TRANSACTION_COMPONENTS: [&str; 57] = [
 /// preprocessed columns in the recursive circuit. Each entry is the `ilog2` of the number of
 /// rows in the corresponding column.
 pub const PRIVACY_CIRCUIT_PREPROCESSED_LOG_SIZES: [u32; 45] = [
-    8, 8, 8, // bitwise_xor_4_{0,1,2}: 2^(2*4) = 2^8
-    14, 14, 14, //  bitwise_xor_7_{0,1,2}: 2^(2*7) = 2^14
-    16, 16, 16, 16, // bitwise_xor_8_{0,1,2}: 2^(2*8) = 2^16
-    17, 17, // eq
-    17, 17, 17, 17, 17, // triple_xor
-    18, 18, 18, // m31_to_u32
-    18, 18, 18, // bitwise_xor_9_{0,1,2}: 2^(2*9) = 2^18
-    20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, // blake_g_gate
-    20, 20, 20, // bitwise_xor_10_{0,1,2}: 2^(2*10) = 2^20
-    21, 21, 21, 21, 21, 21, 21, 21, // qm31 ops
+    8,
+    8,
+    8,
+    14,
+    14,
+    14,
+    16,
+    16,
+    16,
+    16,
+    18,
+    18,
+    18,
+    19,
+    19,
+    19,
+    19,
+    19,
+    19,
+    19,
+    20,
+    20,
+    20,
+    20,
+    20,
+    20,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    22,
+    23,
+    23,
+    23,
+    23,
+    23,
+    23,
+    23,
+    23,
 ];
 
 pub const PRIVACY_CIRCUIT_PREPROCESSED_IDS: [&str; 45] = [
@@ -147,6 +189,9 @@ pub const PRIVACY_CIRCUIT_PREPROCESSED_IDS: [&str; 45] = [
     "bitwise_xor_8_0",
     "bitwise_xor_8_1",
     "bitwise_xor_8_2",
+    "bitwise_xor_9_0",
+    "bitwise_xor_9_1",
+    "bitwise_xor_9_2",
     "eq_in0_address",
     "eq_in1_address",
     "triple_xor_input_addr_0",
@@ -157,9 +202,9 @@ pub const PRIVACY_CIRCUIT_PREPROCESSED_IDS: [&str; 45] = [
     "m31_to_u32_input_addr",
     "m31_to_u32_output_addr",
     "m31_to_u32_multiplicity",
-    "bitwise_xor_9_0",
-    "bitwise_xor_9_1",
-    "bitwise_xor_9_2",
+    "bitwise_xor_10_0",
+    "bitwise_xor_10_1",
+    "bitwise_xor_10_2",
     "blake_g_gate_input_addr_a",
     "blake_g_gate_input_addr_b",
     "blake_g_gate_input_addr_c",
@@ -171,9 +216,6 @@ pub const PRIVACY_CIRCUIT_PREPROCESSED_IDS: [&str; 45] = [
     "blake_g_gate_output_addr_c",
     "blake_g_gate_output_addr_d",
     "blake_g_gate_multiplicity",
-    "bitwise_xor_10_0",
-    "bitwise_xor_10_1",
-    "bitwise_xor_10_2",
     "qm31_ops_add_flag",
     "qm31_ops_sub_flag",
     "qm31_ops_mul_flag",
