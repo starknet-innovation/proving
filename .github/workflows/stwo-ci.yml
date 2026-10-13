@@ -1,5 +1,8 @@
 name: stwo CI
 
+# Every job here runs only in starkware-libs/proving: they need StarkWare's runners (and GCS
+# credentials), which forks do not have, so forks skip them.
+
 env:
   STABLE_VERSION: "1.94.0"
   NIGHTLY_VERSION: "nightly-2026-01-15"
@@ -10,6 +13,7 @@ on:
 
 jobs:
   wasm32-wasip1-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -27,6 +31,7 @@ jobs:
           RUSTFLAGS: -C target-feature=+simd128
 
   wasm32-unknown-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -43,6 +48,7 @@ jobs:
           RUSTFLAGS: -C target-feature=+simd128
 
   neon-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: macos-latest-xlarge
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -55,6 +61,7 @@ jobs:
           RUSTFLAGS: -C target-feature=+neon
 
   avx-tests:
+    if: github.repository == 'starkware-libs/proving'
     strategy:
       matrix:
         target-feature: [avx512f, avx2]
@@ -70,6 +77,7 @@ jobs:
           RUSTFLAGS: -C target-cpu=native -C target-feature=+${{ matrix.target-feature }}
 
   tests-no-prover:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -80,6 +88,7 @@ jobs:
       - run: cargo test --no-default-features -p stwo
 
   tests-prover-no-parallel:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -90,6 +99,7 @@ jobs:
       - run: cargo test --features prover -p stwo
 
   framework-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -100,6 +110,7 @@ jobs:
       - run: cargo test --no-default-features -p stwo-constraint-framework
 
   examples-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -113,6 +124,7 @@ jobs:
   # build. The poseidon tests stay ignored by design (constraint degree >= 2 is unsupported
   # in the lifted protocol).
   examples-slow-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -123,6 +135,7 @@ jobs:
       - run: cargo test -p stwo-examples --release --features="slow-tests"
 
   air-utils-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -133,6 +146,7 @@ jobs:
       - run: cargo test -p stwo-air-utils
 
   tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -143,6 +157,7 @@ jobs:
       - run: cargo test -p stwo --features="tracing, prover"
 
   slow-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -153,6 +168,7 @@ jobs:
       - run: cargo test -p stwo --release --features="slow-tests, prover"
 
   tests-parallel:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -163,6 +179,7 @@ jobs:
       - run: cargo test -p stwo --features="parallel, prover"
 
   ensure-no-std-core:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6

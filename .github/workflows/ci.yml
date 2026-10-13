@@ -1,5 +1,8 @@
 name: CI
 
+# Every job here runs only in starkware-libs/proving: they need StarkWare's runners (and GCS
+# credentials), which forks do not have, so forks skip them.
+
 env:
   NIGHTLY_VERSION: "nightly-2026-01-15"
   STABLE_VERSION: "1.94.0"
@@ -20,6 +23,7 @@ concurrency:
 
 jobs:
   format:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -31,6 +35,7 @@ jobs:
       - run: cargo fmt --check
 
   clippy:
+    if: github.repository == 'starkware-libs/proving'
     name: clippy
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
@@ -45,6 +50,7 @@ jobs:
           -D future-incompatible -D nonstandard-style -D rust-2018-idioms -D unused
 
   docs:
+    if: github.repository == 'starkware-libs/proving'
     name: docs
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
@@ -58,6 +64,7 @@ jobs:
       - run: cargo doc --no-deps
 
   typos:
+    if: github.repository == 'starkware-libs/proving'
     name: typos
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
@@ -68,6 +75,7 @@ jobs:
       - run: typos
 
   machete:
+    if: github.repository == 'starkware-libs/proving'
     name: machete
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
@@ -82,6 +90,7 @@ jobs:
         run: cargo machete crates
 
   dispatcher:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     outputs:
       # Booleans for whether to run or skip individual workflows.
@@ -116,13 +125,13 @@ jobs:
 
   stwo:
     needs: dispatcher
-    if: needs.dispatcher.outputs.run_stwo == 'true'
+    if: github.repository == 'starkware-libs/proving' && needs.dispatcher.outputs.run_stwo == 'true'
     uses: ./.github/workflows/stwo-ci.yml
     secrets: inherit
 
   stwo-cairo-prover:
     needs: dispatcher
-    if: needs.dispatcher.outputs.run_stwo_cairo_prover == 'true'
+    if: github.repository == 'starkware-libs/proving' && needs.dispatcher.outputs.run_stwo_cairo_prover == 'true'
     uses: ./.github/workflows/stwo-cairo-prover-ci.yml
     with:
       crate_group: ${{ needs.dispatcher.outputs.stwo_cairo_prover_packages }}
@@ -130,13 +139,13 @@ jobs:
 
   stwo-cairo-verifier:
     needs: dispatcher
-    if: needs.dispatcher.outputs.run_stwo_cairo_verifier == 'true'
+    if: github.repository == 'starkware-libs/proving' && needs.dispatcher.outputs.run_stwo_cairo_verifier == 'true'
     uses: ./.github/workflows/stwo-cairo-verifier-ci.yml
     secrets: inherit
 
   stwo-circuits:
     needs: dispatcher
-    if: needs.dispatcher.outputs.run_stwo_circuits == 'true'
+    if: github.repository == 'starkware-libs/proving' && needs.dispatcher.outputs.run_stwo_circuits == 'true'
     uses: ./.github/workflows/stwo-circuits-ci.yml
     with:
       crate_group: ${{ needs.dispatcher.outputs.stwo_circuits_packages }}
@@ -144,7 +153,7 @@ jobs:
 
   proving-utils:
     needs: dispatcher
-    if: needs.dispatcher.outputs.run_proving_utils == 'true'
+    if: github.repository == 'starkware-libs/proving' && needs.dispatcher.outputs.run_proving_utils == 'true'
     uses: ./.github/workflows/proving-utils-ci.yml
     with:
       crate_group: ${{ needs.dispatcher.outputs.proving_utils_packages }}
@@ -152,13 +161,14 @@ jobs:
 
   stwo-air-infra:
     needs: dispatcher
-    if: needs.dispatcher.outputs.run_stwo_air_infra == 'true'
+    if: github.repository == 'starkware-libs/proving' && needs.dispatcher.outputs.run_stwo_air_infra == 'true'
     uses: ./.github/workflows/stwo-air-infra-ci.yml
     with:
       crate_group: ${{ needs.dispatcher.outputs.stwo_air_infra_packages }}
     secrets: inherit
   
   stable-crates:
+    if: github.repository == 'starkware-libs/proving'
     needs: dispatcher
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
@@ -173,6 +183,7 @@ jobs:
         run: cargo check ${{ needs.dispatcher.outputs.stable_crates }}
 
   cargo-lock:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -186,7 +197,7 @@ jobs:
 
   # Skipped jobs are treated as success.
   gatekeeper:
-    if: always()
+    if: always() && github.repository == 'starkware-libs/proving'
     needs:
       - format
       - clippy

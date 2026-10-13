@@ -1,11 +1,15 @@
 name: stwo-cairo-verifier CI
 
+# Every job here runs only in starkware-libs/proving: they need StarkWare's runners (and GCS
+# credentials), which forks do not have, so forks skip them.
+
 on:
   workflow_call:
   workflow_dispatch:
 
 jobs:
   scarb-fmt:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-medium-ubuntu-24-04-amd64
     defaults:
       run:
@@ -18,6 +22,7 @@ jobs:
       - run: scarb fmt --check
 
   scarb-lint:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-medium-ubuntu-24-04-amd64
     defaults:
       run:
@@ -30,6 +35,7 @@ jobs:
       - run: scarb lint --features=qm31_opcode --deny-warnings
 
   scarb-test:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     defaults:
       run:
@@ -48,6 +54,7 @@ jobs:
       - run: scarb test --features=${{ matrix.feature }} -p ${{ matrix.package }}
 
   scarb-test-circuit:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-medium-ubuntu-24-04-amd64
     defaults:
       run:

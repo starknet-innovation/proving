@@ -1,0 +1,431 @@
+name: release
+
+# Publishes a release of this fork from one of its port branches (e.g. starknet-0.14.4/<sha>):
+# `stwo-run-and-prove` binaries, SHA256SUMS, manifest.json and build provenance, plus a tag that
+# consumers can point a Cargo [patch] at (see "Consuming releases" in the README).
+#
+# Nothing is published unless the release gate (.github/release-gate) passes: for upstream's
+# reference PIE, the release's privacy-prove must produce proofs byte-identical to upstream
+# privacy-prove at UPSTREAM_BASE_REV, and upstream's unpatched privacy-circuit-verify must accept
+# them.
+#
+# Builds use no caches: a release must not depend on state written by other workflow runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch, tag or commit to release (e.g. starknet-0.14.4/b24c7d1d)"
+        required: true
+        type: string
+      tag:
+        description: "Tag to create at source_ref's commit (e.g. starknet-v0.14.4-pf.1)"
+        required: true
+        type: string
+
+env:
+  # The upstream rev every release branch is ported onto: the one the sequencer (main-v0.14.4)
+  # pins for privacy-prove and privacy-circuit-verify-v2. .github/release-gate/Cargo.toml pins it
+  # too, and the gate checks that the two agree.
+  UPSTREAM_BASE_REV: 2b495a36d57a4bd754cdfa1c2b5bda8d92b37ec3
+  UPSTREAM_REPO: https://github.com/starkware-libs/proving
+  NIGHTLY_VERSION: nightly-2026-01-15
+  BINARY: stwo-run-and-prove
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # Pins the release to one commit (source_ref could move while the jobs below run) and rejects
+  # inputs that cannot make a valid release before anything is built.
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: resolve
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          sha="$(git rev-parse HEAD)"
+
+          [[ "$TAG" =~ ^starknet-v([0-9]+\.[0-9]+\.[0-9]+)-pf\.[0-9]+$ ]] ||
+            fail "tag $TAG does not look like starknet-v<sequencer version>-pf.<n>"
+          tag_version="${BASH_REMATCH[1]}"
+          if [[ "$SOURCE_REF" =~ ^starknet-([0-9]+\.[0-9]+\.[0-9]+)/ ]] &&
+            [ "${BASH_REMATCH[1]}" != "$tag_version" ]; then
+            fail "tag $TAG is for $tag_version but $SOURCE_REF is a ${BASH_REMATCH[1]} branch"
+          fi
+
+          [ -n "$(git branch -r --contains "$sha")" ] ||
+            fail "$sha is not on any branch of $GITHUB_REPOSITORY"
+          git merge-base --is-ancestor "$UPSTREAM_BASE_REV" "$sha" ||
+            fail "$sha does not descend from upstream $UPSTREAM_BASE_REV"
+          grep -qx "channel = \"$NIGHTLY_VERSION\"" rust-toolchain.toml ||
+            fail "rust-toolchain.toml at $sha does not pin $NIGHTLY_VERSION"
+          if existing="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}")" &&
+            [ "$existing" != "$sha" ]; then
+            fail "tag $TAG already exists at $existing"
+          fi
+
+          echo "Releasing $SOURCE_REF at $sha as $TAG"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  # Builds .github/release-gate as the reference (upstream) and the candidate (this fork through
+  # the consumer [patch]) and proves upstream's reference PIE with each. The two builds share
+  # nothing, so they run side by side; gate-check compares them.
+  gate:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: true
+      matrix:
+        flavor: [reference, candidate]
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      FORK_GIT_URL: ${{ github.server_url }}/${{ github.repository }}
+    steps:
+      # The gate's own sources come from the workflow's commit, not from the release branch.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: ci
+          sparse-checkout: .github/release-gate
+          persist-credentials: false
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Upstream's recursive prover peaks at about 11 GiB with 4 threads (the fork's at about
+      # 2.5 GiB), close to the 16 GiB these runners have, so add up to 16 GiB of swap as headroom.
+      # It goes on the disk-backed filesystem with the most free space, leaving 8 GiB for the
+      # build (about 5 GiB measured), and is skipped rather than failing the job when space is
+      # short.
+      - name: Add swap
+        run: |
+          dir=""
+          avail=0
+          for candidate in /mnt /; do
+            [ -d "$candidate" ] || continue
+            read -r fstype free_gib <<< "$(df --output=fstype,avail -BG "$candidate" | tail -1 | tr -d G)"
+            case "$fstype" in tmpfs | ramfs) continue ;; esac
+            if [ "$free_gib" -gt "$avail" ]; then dir="$candidate"; avail="$free_gib"; fi
+          done
+          size=$((avail - 8))
+          [ "$size" -le 16 ] || size=16
+          if [ -z "$dir" ] || [ "$size" -lt 2 ]; then
+            echo "::warning::not enough disk for extra swap (${avail} GiB free); proving without it"
+          else
+            swapfile="${dir%/}/gate.swap"
+            sudo fallocate -l "${size}G" "$swapfile"
+            sudo chmod 600 "$swapfile"
+            sudo mkswap "$swapfile"
+            sudo swapon "$swapfile"
+          fi
+          df -h / /mnt 2>/dev/null || true
+          free -h
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ env.NIGHTLY_VERSION }}
+
+      - name: Build and prove (${{ matrix.flavor }})
+        run: ci/.github/release-gate/gate.sh build "${{ matrix.flavor }}" source gate
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-${{ matrix.flavor }}
+          if-no-files-found: error
+          path: |
+            gate/${{ matrix.flavor }}/*.txt
+            gate/${{ matrix.flavor }}/pie.zip
+            gate/${{ matrix.flavor }}/*/proof.bin
+            gate/${{ matrix.flavor }}/*/output_preimage.json
+            gate/${{ matrix.flavor }}/crate/Cargo.lock
+            gate/${{ matrix.flavor }}/crate/target/release/release-gate
+
+  # Verifies every proof with the reference build (no fork code linked in) and requires the
+  # candidate's proofs to be byte-identical to upstream's.
+  gate-check:
+    needs: [resolve, gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: ci
+          sparse-checkout: .github/release-gate
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gate-reference
+          path: gate/reference
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gate-candidate
+          path: gate/candidate
+
+      - name: Verify and compare
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+        run: ci/.github/release-gate/gate.sh check gate
+
+      # Published with the release so the gate's claims can be rechecked: both flavors' proofs,
+      # output preimages, lockfiles and compilers, and the PIE they proved.
+      - name: Package the evidence
+        run: |
+          tar -czf release-gate-evidence.tar.gz -C gate \
+            gate.json \
+            reference/pie.zip reference/rustc.txt reference/crate/Cargo.lock \
+            reference/recursive reference/cairo \
+            candidate/rustc.txt candidate/crate/Cargo.lock \
+            candidate/recursive candidate/cairo
+          cp gate/gate.json .
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-result
+          if-no-files-found: error
+          path: |
+            gate.json
+            release-gate-evidence.tar.gz
+
+  build:
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux builds pin the runner image, which sets the glibc the binaries need (2.39 on
+          # 24.04); ubuntu-latest would raise it silently when it moves.
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          # CPU-specific x86 builds, as in .github/actions/build-arch-binary. The runners may lack
+          # these CPUs' instructions, so these binaries are built but not run.
+          - platform: linux-x86_64-znver4
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            target_cpu: znver4
+          - platform: linux-x86_64-sapphirerapids
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            target_cpu: sapphirerapids
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: darwin-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      TARGET: ${{ matrix.target }}
+      TARGET_CPU: ${{ matrix.target_cpu }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ env.NIGHTLY_VERSION }}
+
+      - name: Build ${{ env.BINARY }}
+        run: |
+          # With an explicit --target these flags reach only the target's artifacts, never build
+          # scripts or proc macros, which run on this runner's CPU.
+          if [ -n "$TARGET_CPU" ]; then
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=$TARGET_CPU"
+          fi
+          cargo build --release --locked --target "$TARGET" --bin "$BINARY"
+
+      # Proves and verifies the crate's array_sum example. The production defaults peak at ~9 GiB,
+      # more than the macOS runners have, so this uses the crate's lighter test parameters;
+      # those predate FriConfig's fold_step, hence the jq.
+      - name: Smoke test
+        if: matrix.target_cpu == ''
+        run: |
+          resources="$PWD/crates/stwo_run_and_prove/resources"
+          jq '.fri_config.fold_step = 1' "$resources/prover_params.json" > "$RUNNER_TEMP/prover_params.json"
+          "target/$TARGET/release/$BINARY" \
+            --program "$resources/array_sum.json" \
+            --prover_params_json "$RUNNER_TEMP/prover_params.json" \
+            --proof_path "$RUNNER_TEMP/array_sum_proof" \
+            --program_output "$RUNNER_TEMP/array_sum_output.json" \
+            --verify
+          jq -e '. == ["0x32"]' "$RUNNER_TEMP/array_sum_output.json"
+
+      - name: Package
+        env:
+          COPYFILE_DISABLE: "1" # keep macOS metadata out of the tarball
+        run: |
+          asset="$BINARY-$PLATFORM.tar.gz"
+          mkdir pkg
+          cp "target/$TARGET/release/$BINARY" LICENSE pkg/
+          tar -czf "$asset" -C pkg "$BINARY" LICENSE
+          jq -n \
+            --arg platform "$PLATFORM" --arg file "$asset" --arg target "$TARGET" \
+            --arg target_cpu "$TARGET_CPU" --arg rustc "$(rustc -V)" \
+            '{platform: $platform, file: $file, target: $target,
+              target_cpu: (if $target_cpu == "" then null else $target_cpu end), rustc: $rustc}' \
+            > "$asset.meta.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            ${{ env.BINARY }}-${{ matrix.platform }}.tar.gz
+            ${{ env.BINARY }}-${{ matrix.platform }}.tar.gz.meta.json
+
+  release:
+    needs: [resolve, gate-check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and the release
+      id-token: write # sign the build provenance attestation
+      attestations: write # store it
+    env:
+      SOURCE_REF: ${{ inputs.source_ref }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gate-result
+          path: gate
+
+      - name: Write manifest.json, SHA256SUMS and release notes
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          mkdir meta
+          mv dist/*.meta.json meta/
+          cp gate/release-gate-evidence.tar.gz dist/
+
+          binaries="$(for m in meta/*.meta.json; do
+            sha256="$(sha256sum "dist/$(jq -r .file "$m")" | cut -d' ' -f1)"
+            jq --arg sha256 "$sha256" '{(.platform): (del(.platform) + {sha256: $sha256})}' "$m"
+          done | jq -s add)"
+          jq -n \
+            --arg tag "$TAG" --arg repo "$REPO_URL" --arg source_ref "$SOURCE_REF" \
+            --arg source_sha "$SOURCE_SHA" --arg upstream "$UPSTREAM_REPO" \
+            --arg base "$UPSTREAM_BASE_REV" --arg toolchain "$NIGHTLY_VERSION" --arg run "$RUN_URL" \
+            --argjson binaries "$binaries" --slurpfile gate gate/gate.json \
+            '{tag: $tag, repository: $repo, source_ref: $source_ref, source_sha: $source_sha,
+              upstream: {repository: $upstream, base_rev: $base}, toolchain: $toolchain,
+              workflow_run: $run, binaries: $binaries, release_gate: $gate[0]}' \
+            > dist/manifest.json
+          cat dist/manifest.json
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+          RECURSIVE_PROOF_SHA256="$(jq -r .modes.recursive.proof_sha256 gate/gate.json)" \
+          CAIRO_PROOF_SHA256="$(jq -r .modes.cairo.proof_sha256 gate/gate.json)" \
+          ASSETS="$(for f in dist/"$BINARY"-*.tar.gz; do printf -- "- \`%s\`\n" "${f#dist/}"; done)" \
+            envsubst > notes.md <<'EOF'
+          `${SOURCE_REF}` (`${SOURCE_SHA}`), ported onto [starkware-libs/proving@${UPSTREAM_BASE_REV}](${UPSTREAM_REPO}/commit/${UPSTREAM_BASE_REV}), the rev the sequencer pins for `privacy-prove` and `privacy-circuit-verify-v2`. Built with `${NIGHTLY_VERSION}`.
+
+          **Release gate passed.** On upstream's reference PIE, this release's `privacy-prove` produced proofs byte-identical to upstream `privacy-prove` at the base rev, and upstream's unpatched `privacy-circuit-verify` accepted them:
+
+          | mode | proof sha256 |
+          | --- | --- |
+          | `privacy_recursive_prove` / `verify_recursive_circuit` | `${RECURSIVE_PROOF_SHA256}` |
+          | `privacy_prove` / `verify_cairo` | `${CAIRO_PROOF_SHA256}` |
+
+          Details in `manifest.json`; the proofs, lockfiles and PIE are in `release-gate-evidence.tar.gz`.
+
+          ### Cargo
+
+          ```toml
+          [patch."https://github.com/starkware-libs/proving"]
+          privacy-prove = { git = "${REPO_URL}", tag = "${TAG}" }
+          ```
+
+          ### `stwo-run-and-prove`
+
+          ${ASSETS}
+
+          ```bash
+          curl -fsSLO ${REPO_URL}/releases/download/${TAG}/stwo-run-and-prove-linux-x86_64.tar.gz
+          curl -fsSLO ${REPO_URL}/releases/download/${TAG}/SHA256SUMS
+          sha256sum -c --ignore-missing SHA256SUMS
+          gh attestation verify stwo-run-and-prove-linux-x86_64.tar.gz --repo ${GITHUB_REPOSITORY}
+          gh attestation verify stwo-run-and-prove-linux-x86_64.tar.gz --repo ${GITHUB_REPOSITORY} \
+            --predicate-type ${REPO_URL}/release-manifest/v1
+          ```
+
+          [Workflow run](${RUN_URL})
+          EOF
+          cat notes.md
+
+      # Attesting here rather than in the build jobs keeps the signing token away from the jobs
+      # that run third-party build scripts. The SLSA provenance names this workflow run as the
+      # builder, but its source is the workflow's commit, not the released one; the second
+      # attestation signs each asset together with manifest.json, which records the resolved
+      # source commit and the gate's results.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+          predicate-type: ${{ github.server_url }}/${{ github.repository }}/release-manifest/v1
+          predicate-path: dist/manifest.json
+
+      # Created through the API so the job needs no checkout. An existing tag, lightweight or
+      # annotated, is accepted only if it already points at this commit (a re-run, as in the
+      # resolve job); tags are never moved.
+      - name: Create the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+            --jq '.object.type + " " + .object.sha' 2>/dev/null)"; then
+            read -r type commit <<< "$ref"
+            if [ "$type" = tag ]; then
+              commit="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$commit" \
+                --jq 'select(.object.type == "commit") | .object.sha')"
+            fi
+            [ "$commit" = "$SOURCE_SHA" ] ||
+              { echo "::error::tag $TAG exists ($ref), not at $SOURCE_SHA"; exit 1; }
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SOURCE_SHA"
+          fi
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          body_path: notes.md
+          files: dist/*
+          fail_on_unmatched_files: true

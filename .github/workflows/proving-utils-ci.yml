@@ -1,5 +1,8 @@
 name: proving-utils CI
 
+# Every job here runs only in starkware-libs/proving: they need StarkWare's runners (and GCS
+# credentials), which forks do not have, so forks skip them.
+
 env:
   STABLE_VERSION: "1.94.0"
   NIGHTLY_VERSION: "nightly-2026-01-15"
@@ -17,6 +20,7 @@ on:
 
 jobs:
   tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-large-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -45,6 +49,7 @@ jobs:
           cargo run -p cairo-program-runner-lib --example run_pie_object_with_simple_bl
 
   slow-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-xlarge-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -72,6 +77,7 @@ jobs:
           RUST_LOG: info
 
   privacy-slow-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-xlarge-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
