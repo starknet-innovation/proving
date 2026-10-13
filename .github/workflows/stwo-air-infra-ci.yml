@@ -1,5 +1,8 @@
 name: stwo-air-infra CI
 
+# Every job here runs only in starkware-libs/proving: they need StarkWare's runners (and GCS
+# credentials), which forks do not have, so forks skip them.
+
 on:
   workflow_call:
     inputs: &crate_group_input
@@ -17,6 +20,7 @@ env:
 
 jobs:
   js-typecheck:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -26,6 +30,7 @@ jobs:
       - run: scripts/js_typecheck.sh
 
   visualizer-webapp-test:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -35,6 +40,7 @@ jobs:
       - run: scripts/visualizer_webapp_test.sh
 
   tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -50,6 +56,7 @@ jobs:
       - run: cargo +${{ env.STABLE_VERSION }} test --release ${{ inputs.crate_group }}
 
   codegen-tests:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6

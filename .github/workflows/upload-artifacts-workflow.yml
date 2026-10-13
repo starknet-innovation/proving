@@ -1,5 +1,8 @@
 name: upload artifacts
 
+# Every job here runs only in starkware-libs/proving: they need StarkWare's runners (and GCS
+# credentials), which forks do not have, so forks skip them.
+
 on:
   workflow_dispatch:
   push:
@@ -17,6 +20,7 @@ jobs:
   # A re-publish overwrites the commit's artifacts, so its stale marker must come down before any
   # upload starts (and is rewritten only when all of them succeed).
   clear-published-marker:
+    if: github.repository == 'starkware-libs/proving'
     runs-on: namespace-profile-starkware-libs-proving-dev-small-ubuntu-24-04-amd64
     steps:
       - name: Authenticate with GCS
@@ -38,6 +42,7 @@ jobs:
   # Publishes the supported-circuits trust anchors: one `circuit_params --registry` JSON per
   # circuit registry, at supported_circuits_registry/<commit>/<name>/registry.json.
   supported-circuits-registry-push:
+    if: github.repository == 'starkware-libs/proving'
     needs: clear-published-marker
     # Generating the largest production circuit needs more memory than the standard profiles have.
     runs-on: namespace-profile-starkware-libs-proving-dev-32-128-ubuntu-24-04-amd64
@@ -73,6 +78,7 @@ jobs:
           parent: false
 
   cairo-verifiers-push:
+    if: github.repository == 'starkware-libs/proving'
     needs: clear-published-marker
     runs-on: namespace-profile-starkware-libs-proving-dev-medium-ubuntu-24-04-amd64
     strategy:
@@ -109,6 +115,7 @@ jobs:
           out: ${{ matrix.out }}
 
   generic-binaries-push:
+    if: github.repository == 'starkware-libs/proving'
     needs: clear-published-marker
     runs-on: namespace-profile-starkware-libs-proving-dev-medium-ubuntu-24-04-amd64
     steps:
@@ -184,6 +191,7 @@ jobs:
   # neighbours; one job per (binary, arch) pair costs the same compute and cuts the wall clock to a
   # single build.
   arch-binaries-push:
+    if: github.repository == 'starkware-libs/proving'
     needs: clear-published-marker
     runs-on: namespace-profile-starkware-libs-proving-dev-medium-ubuntu-24-04-amd64
     strategy:
@@ -225,6 +233,7 @@ jobs:
   # cannot tell a fully published commit from one whose upload is still running or partly failed;
   # pin only commits that have this marker.
   published-marker-push:
+    if: github.repository == 'starkware-libs/proving'
     needs:
       - supported-circuits-registry-push
       - cairo-verifiers-push
