@@ -34,6 +34,23 @@ pub fn setup() -> Result<()> {
 /// Prove mode. `input` is the whole prepared input; `input[witness_start..]` is the
 /// `stwo_cairo_adapter::ProverInput` JSON. Writes the version-prefixed compressed proof to `out`.
 pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out: &mut impl Write) -> Result<()> {
+    // The proof runs on a worker of rayon's pool, so that its parallel steps start from inside
+    // the pool instead of each being injected into it from this thread (the sequential steps,
+    // the interaction writers among them, waited on every injection).
+    // Freed large blocks wait for reuse while the live memory and the idle blocks take at most
+    // 4500 MiB: every phase below the proof's peak (about 5 GiB locally, where the live memory alone
+    // fills the budget) reuses the blocks the last one freed instead of faulting in fresh pages,
+    // which took about 39 of the run's 307 CPU-seconds.
+    #[cfg(unix)]
+    stwo::prover::backend::simd::column::LargeBlockCache::set_idle_budget(4500 << 20);
+    let (version, compressed) = rayon::scope(|_| prove_to_bytes(input, witness_start, output_preimage))?;
+    out.write_all(&version)?;
+    out.write_all(&compressed)?;
+    Ok(())
+}
+
+/// The version prefix and the compressed recursive proof.
+fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]) -> Result<(Vec<u8>, Vec<u8>)> {
     let precomputes = prepare_recursive_prover_precomputes().map_err(|e| anyhow!("{e}"))?;
     let prover_input: ProverInput = serde_json::from_slice(&input[witness_start..])?;
     drop(input);
@@ -52,13 +69,14 @@ pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out
     // Everything the circuit proof needs from the Cairo proof is in `proof`, `aux` and the seed.
     drop(cairo_proof);
     let output_hash = compute_privacy_bootloader_output_hash(output_preimage);
-    // The circuit's preprocessing (built on first use, see `LazyPreprocessedCircuit`) is built
-    // while the verifier circuit is filled: the two are independent, and the fill is mostly
-    // sequential.
+    // The circuit's preprocessing and its committed tree (both built on first use, see
+    // `LazyPreprocessedCircuit`) are built while the verifier circuit is filled: they are
+    // independent of it, and the fill is mostly sequential, so the tree's commitment runs on the
+    // workers the fill leaves idle.
     let (mut context, ()) = rayon::join(
         || build_and_fill_cairo_verifier_circuit(&precomputes.cairo_verifier_config, proof, aux, output_hash),
         || {
-            let _ = &**precomputes.preprocessed_circuit;
+            let _ = &**precomputes.circuit_preprocessed_tree;
         },
     );
     ensure!(context.is_circuit_valid(), "Circuit is not valid");
@@ -92,7 +110,5 @@ pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out
     let mut proof_bytes: Vec<u8> = vec![];
     proof_qm31s.serialize(&mut proof_bytes);
     let compressed = zstd::encode_all(&proof_bytes[..], 3)?;
-    out.write_all(&Version::current().serialize())?;
-    out.write_all(&compressed)?;
-    Ok(())
+    Ok((Version::current().serialize().to_vec(), compressed))
 }

@@ -1055,10 +1055,46 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             base_column_pool.give_back(coeffs.log_size(), column);
             rows
         };
+        // The first column of each size that reads its rows from its prefix is read first: it
+        // builds that size's prefix plan, once, before the other columns of the size look it up
+        // (workers reaching an unbuilt plan together each built it, and the duplicates' vectors
+        // stayed in glibc's arenas: at 2^23 circuit rows the base tree's decommitment left 1.4 GB
+        // resident). Mechanism: rukafe0x's lead rgr1_c5ae9f6b.
+        let reads_prefix = |poly: &Poly<B>| {
+            poly.coeffs.is_none()
+                && !poly.is_sourced()
+                && poly.evals.values.len() < poly.evals.domain.size()
+        };
+        let first_of_size = self
+            .polynomials
+            .iter()
+            .enumerate()
+            .filter(|(_, poly)| reads_prefix(poly))
+            .unique_by(|(_, poly)| {
+                (poly.evals.domain.log_size(), poly.evals.domain.half_coset.initial_index.0)
+            })
+            .map(|(i, _)| i)
+            .collect_vec();
         #[cfg(feature = "parallel")]
-        let rows: Vec<Vec<BaseField>> = self.polynomials.par_iter().map(read_rows).collect();
+        let rows: Vec<Vec<BaseField>> = {
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator};
+            let read =
+                first_of_size.par_iter().map(|&i| read_rows(&self.polynomials[i])).collect::<Vec<_>>();
+            let mut first_rows = vec![None; self.polynomials.len()];
+            for (&i, rows) in first_of_size.iter().zip(read) {
+                first_rows[i] = Some(rows);
+            }
+            self.polynomials
+                .par_iter()
+                .zip(first_rows.par_iter_mut())
+                .map(|(poly, first)| first.take().unwrap_or_else(|| read_rows(poly)))
+                .collect()
+        };
         #[cfg(not(feature = "parallel"))]
-        let rows: Vec<Vec<BaseField>> = self.polynomials.iter().map(read_rows).collect();
+        let rows: Vec<Vec<BaseField>> = {
+            let _ = first_of_size;
+            self.polynomials.iter().map(read_rows).collect()
+        };
         base_column_pool.release_all_idle();
 
         let queried_values = rows.iter().map(|rows| rows[..queries.len()].to_vec()).collect_vec();

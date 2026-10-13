@@ -1,6 +1,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::iter::zip;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::{array, mem};
 
 use bytemuck::allocation::cast_vec;
@@ -909,11 +909,13 @@ impl VeryPackedSecureColumnByCoords {
 /// Blocks of 1 MiB and up are mapped here instead, rounded up to a quarter of a power of two, which
 /// is exact for the power-of-two sizes of most columns and layers. A freed block waits in its class
 /// for the next request of that class, from any thread, which takes it without a system call. Idle
-/// blocks stay bounded: past [`LARGE_IDLE_CAP`] a freed block is unmapped, and a request that finds
-/// its class empty first unmaps idle blocks of other classes, down to [`LARGE_LOW_WATER`], so that
-/// a new phase's blocks replace the idle ones instead of adding to them. Smaller blocks, and blocks
-/// aligned past a page, go to the system allocator as before. Proof bytes do not depend on where
-/// buffers come from.
+/// blocks stay within a budget on the whole live memory ([`LargeBlockCache::set_idle_budget`], none
+/// by default): a freed block is kept only while the live blocks, large and small, and the idle
+/// ones fit in it, and a request that finds its class empty first unmaps idle blocks of other
+/// classes until the new block fits beside them, so that a new phase's blocks replace the idle
+/// ones instead of adding to them. Near the proof's peak, where the live memory alone fills the
+/// budget, no block waits idle. Smaller blocks, and blocks aligned past a page, go to the system
+/// allocator as before. Proof bytes do not depend on where buffers come from.
 #[cfg(unix)]
 pub struct LargeBlockCache;
 
@@ -922,11 +924,54 @@ const LARGE_MAX_LOG: u32 = 40;
 const LARGE_CLASSES: usize = ((LARGE_MAX_LOG - LARGE_MIN_LOG) * 4) as usize + 1;
 /// Idle blocks a class can hold.
 const LARGE_SLOTS: usize = 128;
-/// The most idle memory the cache holds.
-const LARGE_IDLE_CAP: usize = 0;
-/// Idle memory a request with an empty class leaves alone: enough to absorb the churn between
-/// classes within a phase without a system call.
-const LARGE_LOW_WATER: usize = 0;
+/// The most the live blocks and the idle ones take together while a block is kept idle.
+static LARGE_IDLE_BUDGET: AtomicUsize = AtomicUsize::new(0);
+/// The bytes of the live blocks of the cache's classes.
+static LARGE_LIVE: AtomicUsize = AtomicUsize::new(0);
+/// The bytes of the live smaller blocks, as the threads have flushed their balances.
+static SMALL_LIVE: AtomicIsize = AtomicIsize::new(0);
+/// A thread flushes its balance of smaller blocks once it moves this far, so that the count costs
+/// no shared write per allocation.
+const SMALL_FLUSH: usize = 1 << 20;
+
+thread_local! {
+    /// The thread's balance of smaller blocks not yet added to [`SMALL_LIVE`].
+    static SMALL_PENDING: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `delta` bytes of smaller blocks allocated (or freed, if negative).
+fn count_small(delta: isize) {
+    let flush = SMALL_PENDING
+        .try_with(|pending| {
+            let balance = pending.get() + delta;
+            if balance.unsigned_abs() < SMALL_FLUSH {
+                pending.set(balance);
+                0
+            } else {
+                pending.set(0);
+                balance
+            }
+        })
+        .unwrap_or(delta);
+    if flush != 0 {
+        SMALL_LIVE.fetch_add(flush, Ordering::Relaxed);
+    }
+}
+
+/// The live memory: the cache's live blocks and the smaller ones (to within the threads' unflushed
+/// balances).
+fn live_bytes() -> usize {
+    LARGE_LIVE.load(Ordering::Relaxed) + SMALL_LIVE.load(Ordering::Relaxed).max(0) as usize
+}
+
+#[cfg(unix)]
+impl LargeBlockCache {
+    /// Keeps freed blocks for reuse while the live memory and the idle blocks take at most
+    /// `bytes` together (0, the default, unmaps every freed block).
+    pub fn set_idle_budget(bytes: usize) {
+        LARGE_IDLE_BUDGET.store(bytes, Ordering::Relaxed);
+    }
+}
 /// Blocks of 2 MiB and up start on a 2 MiB boundary, so transparent huge pages can back all of
 /// them.
 const HUGE_PAGE: usize = 1 << 21;
@@ -1015,11 +1060,14 @@ impl LargeBlocks {
         None
     }
 
-    /// Keeps a freed block of the class, unless the cache is full; the counters go up before the
-    /// block is visible, so they never fall below what the slots hold.
+    /// Keeps a freed block of the class, unless it does not fit in the budget beside the live
+    /// memory and the other idle blocks; the counters go up before the block is visible, so they
+    /// never fall below what the slots hold.
     fn keep(&self, class: usize, block: usize) -> bool {
         let size = large_class_size(class);
-        if self.idle.fetch_add(size, Ordering::Relaxed) + size > LARGE_IDLE_CAP {
+        if self.idle.fetch_add(size, Ordering::Relaxed) + size + live_bytes()
+            > LARGE_IDLE_BUDGET.load(Ordering::Relaxed)
+        {
             self.idle.fetch_sub(size, Ordering::Relaxed);
             return false;
         }
@@ -1034,10 +1082,9 @@ impl LargeBlocks {
         false
     }
 
-    /// An idle block of the largest class that has one, with its size, while the idle memory is
-    /// above the low-water mark.
+    /// An idle block of the largest class that has one, with its size.
     fn evict(&self) -> Option<(usize, usize)> {
-        if self.idle.load(Ordering::Relaxed) <= LARGE_LOW_WATER {
+        if self.idle.load(Ordering::Relaxed) == 0 {
             return None;
         }
         (0..LARGE_CLASSES).rev().find_map(|class| Some((self.take(class)?, large_class_size(class))))
@@ -1069,20 +1116,21 @@ fn large_class_size(class: usize) -> usize {
 unsafe impl GlobalAlloc for LargeBlockCache {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let Some(class) = large_class(layout) else {
+            count_small(layout.size() as isize);
             return System.alloc(layout);
         };
+        let size = large_class_size(class);
         if let Some(block) = LARGE_BLOCKS.take(class) {
+            LARGE_LIVE.fetch_add(size, Ordering::Relaxed);
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             LIVE_ANONYMOUS_BLOCKS.register(block);
             return block as *mut u8;
         }
-        let size = large_class_size(class);
-        let mut freed = 0;
-        while freed < size
+        while live_bytes() + LARGE_BLOCKS.idle.load(Ordering::Relaxed) + size
+            > LARGE_IDLE_BUDGET.load(Ordering::Relaxed)
             && let Some((block, block_size)) = LARGE_BLOCKS.evict()
         {
             munmap(block as *mut core::ffi::c_void, block_size);
-            freed += block_size;
         }
         let align = if size >= HUGE_PAGE { HUGE_PAGE } else { 1 };
         let len = size + align - 1;
@@ -1097,6 +1145,7 @@ unsafe impl GlobalAlloc for LargeBlockCache {
         if mapped as isize == -1 {
             return std::ptr::null_mut();
         }
+        LARGE_LIVE.fetch_add(size, Ordering::Relaxed);
         // Trim the mapping to the aligned block; the trimmed ends were never touched.
         let start = mapped as usize;
         let block = (start + align - 1) & !(align - 1);
@@ -1119,10 +1168,12 @@ unsafe impl GlobalAlloc for LargeBlockCache {
 
     unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
         let Some(class) = large_class(layout) else {
+            count_small(-(layout.size() as isize));
             return System.dealloc(block, layout);
         };
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         LIVE_ANONYMOUS_BLOCKS.unregister(block as usize);
+        LARGE_LIVE.fetch_sub(large_class_size(class), Ordering::Relaxed);
         if !LARGE_BLOCKS.keep(class, block as usize) {
             munmap(block.cast(), large_class_size(class));
         }
