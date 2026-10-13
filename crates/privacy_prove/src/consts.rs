@@ -27,6 +27,7 @@ pub const CAIRO_PROVER_PARAMS: ProverParameters = ProverParameters {
     include_all_preprocessed_columns: true,
     opt_n_id_to_big_components: Some(1),
     lifting_size_policy: LiftingSizePolicy::Fixed(CAIRO_PCS_CONFIG.trace_lifting_log_size),
+    grinding: CAIRO_PCS_CONFIG.grinding,
 };
 
 pub const CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS: bool = false;

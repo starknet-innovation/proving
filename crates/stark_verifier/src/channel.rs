@@ -6,7 +6,7 @@ use circuits::context::{Context, Var};
 use circuits::eval;
 use circuits::extract_bits::extract_bits;
 use circuits::ivalue::{IValue, qm31_from_u32s};
-use circuits::ops::{eq, inv, pointwise_mul};
+use circuits::ops::{Guess, eq, inv, pointwise_mul};
 use circuits::simd::Simd;
 use circuits::wrappers::U32Wrapper;
 use stwo::core::circle::CirclePoint;
@@ -147,6 +147,18 @@ impl Channel {
         let x = eval!(context, ((1) - (t2)) * (denom_inv));
         let y = eval!(context, ((2) * (t)) * (denom_inv));
         CirclePoint { x, y }
+    }
+
+    /// The proof of work no proof carries (`stwo::core::proof_of_work::grind_smallest`): the
+    /// smallest nonce for the current digest, guessed from the values and then checked and mixed
+    /// as [`Self::pow`] checks and mixes a sent one. Nothing when `n_bits` is zero.
+    pub fn grind_smallest<Value: IValue>(&mut self, context: &mut Context<Value>, n_bits: u32) {
+        if n_bits == 0 {
+            return;
+        }
+        let digest = [context.get(self.digest.0), context.get(self.digest.1)];
+        let nonce = Value::smallest_pow_nonce(digest, Self::POW_PREFIX, n_bits).guess(context);
+        self.pow(context, n_bits, nonce);
     }
 
     pub fn pow(&mut self, context: &mut Context<impl IValue>, n_bits: u32, nonce: Var) {

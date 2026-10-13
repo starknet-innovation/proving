@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use stwo::core::fri::FriConfig;
+use stwo::core::proof_of_work::Grinding;
 
 use crate::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
@@ -35,6 +36,11 @@ pub struct ProverParameters {
     /// Policy for choosing the heights the committed trees are lifted to. The right choice
     /// depends on the downstream verifier; see the [`LiftingSizePolicy`] variants.
     pub lifting_size_policy: LiftingSizePolicy,
+
+    /// Proof of work before the DEEP and batching challenges; none unless a statement pins it
+    /// (the privacy statement's, `privacy_circuit_verify::consts::CAIRO_GRINDING`).
+    #[serde(default)]
+    pub grinding: Grinding,
 }
 
 /// The hash function used for commitments, for the prover-verifier channel,

@@ -294,6 +294,7 @@ mod tests {
     use crate::core::pcs::quotients::PointSample;
     use crate::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
     use crate::core::poly::circle::CanonicCoset;
+    use crate::core::proof_of_work::Grinding;
     use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
     use crate::core::verifier::VerificationError;
     use crate::prover::backend::cpu::{CpuCircleEvaluation, CpuCirclePoly};
@@ -363,12 +364,23 @@ mod tests {
         B: BackendForChannel<Blake2sMerkleChannel>,
         const STORE_COEFFS: bool,
     >() -> Result<(), VerificationError> {
+        prove_and_verify_pcs_grinding::<B, STORE_COEFFS>(Grinding::NONE, Grinding::NONE)
+    }
+
+    fn prove_and_verify_pcs_grinding<
+        B: BackendForChannel<Blake2sMerkleChannel>,
+        const STORE_COEFFS: bool,
+    >(
+        prover_grinding: Grinding,
+        verifier_grinding: Grinding,
+    ) -> Result<(), VerificationError> {
         const N_COLS: usize = 10;
         const LIFTING_LOG_SIZE: u32 = 8;
 
         // Setup the prover side of the pcs.
         let mut channel = Blake2sChannel::default();
-        let config = PcsConfig::from_fri_and_trace_size(FriConfig::default(), LIFTING_LOG_SIZE);
+        let base = PcsConfig::from_fri_and_trace_size(FriConfig::default(), LIFTING_LOG_SIZE);
+        let config = base.with_grinding(prover_grinding);
         let twiddles = B::precompute_twiddles(
             CanonicCoset::new(LIFTING_LOG_SIZE + config.fri_config.log_blowup_factor).half_coset(),
         );
@@ -401,7 +413,8 @@ mod tests {
 
         // Verifier side of the pcs.
         let mut channel = Blake2sChannel::default();
-        let mut verifier = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+        let verifier_config = base.with_grinding(verifier_grinding);
+        let mut verifier = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(verifier_config);
         verifier.commit(proof.proof.commitments[0], &sizes, &mut channel);
         verifier.verify_values(TreeVec(sampled_points), proof.proof, &mut channel)
     }
@@ -417,6 +430,17 @@ mod tests {
     #[test]
     fn test_pcs_prove_and_verify_simd_with_barycentric() {
         assert!(prove_and_verify_pcs::<SimdBackend, false>().is_ok());
+    }
+
+    /// Proof of work before the batching challenge: no proof carries its nonce, so the verifier
+    /// must grind exactly as the prover did, or every later challenge differs.
+    #[test]
+    fn test_pcs_batching_grinding_must_match() {
+        let grinding = Grinding { deep_bits: 0, batching_bits: 12 };
+        let none = Grinding::NONE;
+        assert!(prove_and_verify_pcs_grinding::<SimdBackend, true>(grinding, grinding).is_ok());
+        assert!(prove_and_verify_pcs_grinding::<SimdBackend, true>(grinding, none).is_err());
+        assert!(prove_and_verify_pcs_grinding::<SimdBackend, true>(none, grinding).is_err());
     }
 
     /// Tests that SIMD quotient computation produces low-degree quotients even when the trace

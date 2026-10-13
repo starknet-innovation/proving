@@ -118,6 +118,28 @@ fn test_mix_u32s_matches_stwo() {
     context.validate_circuit();
 }
 
+/// The proof of work no proof carries: the circuit guesses the smallest nonce from the digest's
+/// values, and must land on the digest stwo's native channel reaches after `grind_smallest`.
+#[test]
+fn test_grind_smallest_matches_stwo() {
+    let data: [u32; 3] = [7, 0x8000_0001, 12345];
+    let mut context = TraceContext::default();
+    let mut channel = Channel::new(&mut context);
+    let mut stwo_channel = Blake2sM31Channel::default();
+    let words = data.map(|word| U32Wrapper::new_unsafe(context.new_var(QM31::pack_u32(word))));
+    channel.mix_u32s(&mut context, words.into_iter());
+    stwo_channel.mix_u32s(&data);
+
+    for n_bits in [0, 12] {
+        channel.grind_smallest(&mut context, n_bits);
+        stwo::core::proof_of_work::grind_smallest(&mut stwo_channel, n_bits);
+        let expected = ReducedHashValue::<QM31>::from(stwo_channel.digest());
+        assert_eq!(context.get(channel.digest().0), expected.0);
+        assert_eq!(context.get(channel.digest().1), expected.1);
+    }
+    context.validate_circuit();
+}
+
 #[test]
 fn test_draw_qm31_regression() {
     let mut context = TraceContext::default();

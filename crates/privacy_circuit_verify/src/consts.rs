@@ -1,5 +1,6 @@
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
+use stwo::core::proof_of_work::Grinding;
 
 /// Uncompressed size in bytes of the serialized cairo proof (including public claim prefix).
 pub const CAIRO_PROOF_UNCOMPRESSED_BYTES: usize = 2_204_192;
@@ -29,14 +30,14 @@ pub const PRIVACY_BOOTLOADER_JSON: &[u8] = include_bytes!(
 );
 pub const CIRCUIT_OUTPUT_ADDRESSES: [usize; 9] = [3, 4, 5, 6, 7, 8, 9, 10, 2];
 pub const PRIVACY_RECURSION_CIRCUIT_PREPROCESSED_ROOT: [u32; 8] = [
-    3626914247,
-    3321582018,
-    3188250037,
-    331961884,
-    4202082079,
-    1706998192,
-    1166238458,
-    33418141,
+    2963981429,
+    800404100,
+    496908833,
+    2667826480,
+    3824343139,
+    770623182,
+    1341602328,
+    473625320,
 ];
 pub const CAIRO_LOG_BLOWUP_FACTOR: u32 = 3;
 pub const CAIRO_TRACE_LOG_SIZE: u32 = 20;
@@ -51,8 +52,16 @@ pub const CAIRO_FRI_CONFIG: FriConfig = FriConfig {
     fold_step: 4,
 };
 
+/// Proof of work before the DEEP and batching challenges of each leg. With 90 and 110 queries,
+/// these lift the batching and DEEP terms past the query phase's, so each leg reaches 100
+/// provable bits in ethereum/soundcalc's unique decoding regime (Cairo leg 101, circuit leg
+/// 100; the lookups already grind 24 and 20 bits).
+pub const CAIRO_GRINDING: Grinding = Grinding { deep_bits: 12, batching_bits: 12 };
+pub const CIRCUIT_GRINDING: Grinding = Grinding { deep_bits: 12, batching_bits: 12 };
+
 pub const CAIRO_PCS_CONFIG: PcsConfig =
-    PcsConfig::from_fri_and_trace_size(CAIRO_FRI_CONFIG, CAIRO_TRACE_LOG_SIZE);
+    PcsConfig::from_fri_and_trace_size(CAIRO_FRI_CONFIG, CAIRO_TRACE_LOG_SIZE)
+        .with_grinding(CAIRO_GRINDING);
 
 pub const CIRCUIT_FRI_CONFIG: FriConfig = FriConfig {
     pow_bits: 26,
@@ -63,7 +72,8 @@ pub const CIRCUIT_FRI_CONFIG: FriConfig = FriConfig {
 };
 
 pub const CIRCUIT_PCS_CONFIG: PcsConfig =
-    PcsConfig::from_fri_and_trace_size(CIRCUIT_FRI_CONFIG, CIRCUIT_TRACE_LOG_SIZE);
+    PcsConfig::from_fri_and_trace_size(CIRCUIT_FRI_CONFIG, CIRCUIT_TRACE_LOG_SIZE)
+        .with_grinding(CIRCUIT_GRINDING);
 
 // The set of components that are used to verify the privacy transaction.
 // The order of the components is determend by the order in circuit_cairo_air::all_components()

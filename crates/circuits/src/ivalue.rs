@@ -67,6 +67,12 @@ pub trait IValue:
     /// Unpacks a QM31 limb representation `(low_u16, high_u16, 0, 0)` back into a `u32`.
     fn unpack_u32(&self) -> u32;
 
+    /// The smallest proof-of-work nonce for a channel whose (reduced) digest is `digest`, as the
+    /// native Blake2s M31 channel's `verify_pow_nonce` checks it: the first word of
+    /// `H(H(prefix, [0; 12], digest, n_bits), nonce)`, reduced modulo `M31::P`, ends in `n_bits`
+    /// zero bits. Packed as `(nonce, 0, 0, 0)`. A hint: the caller must constrain it.
+    fn smallest_pow_nonce(digest: [Self; 2], prefix: u32, n_bits: u32) -> Self;
+
     /// Takes the values of a context released at padding (see
     /// [`FinalizedContext::release_on_padding`](crate::context::FinalizedContext::release_on_padding)).
     /// Only [QM31] values are proved; other values are dropped.
@@ -143,6 +149,33 @@ impl IValue for QM31 {
         qm31_from_u32s(value & 0xFFFF, value >> 16, 0, 0)
     }
 
+    fn smallest_pow_nonce(digest: [Self; 2], prefix: u32, n_bits: u32) -> Self {
+        let reduced = |hash: HashValue<Self>| -> [Self; 2] {
+            let words = hash.map(|word| M31::from(word.get().unpack_u32()));
+            [
+                QM31::from_m31_array([words[0], words[1], words[2], words[3]]),
+                QM31::from_m31_array([words[4], words[5], words[6], words[7]]),
+            ]
+        };
+        let prefixed = reduced(Self::blake2s(
+            &[
+                qm31_from_u32s(prefix, 0, 0, 0),
+                digest[0],
+                digest[1],
+                qm31_from_u32s(n_bits, 0, 0, 0),
+            ],
+            52,
+        ));
+        let mask = (1u32 << n_bits) - 1;
+        (0u32..)
+            .map(|nonce| qm31_from_u32s(nonce, 0, 0, 0))
+            .find(|&nonce| {
+                let [first, _] = reduced(Self::blake2s(&[prefixed[0], prefixed[1], nonce], 40));
+                first.to_m31_array()[0].0 & mask == 0
+            })
+            .unwrap()
+    }
+
     fn unpack_u32(&self) -> u32 {
         let [low, high, 0, 0] = self.to_m31_array().map(|m| m.0) else {
             panic!("value does not have zeroes in the last two coordinates as expected");
@@ -190,6 +223,10 @@ impl IValue for NoValue {
 
     fn unpack_u32(&self) -> u32 {
         0
+    }
+
+    fn smallest_pow_nonce(_: [Self; 2], _: u32, _: u32) -> Self {
+        Self
     }
 
     fn blake2s(_: &[Self], _: usize) -> HashValue<Self> {

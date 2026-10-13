@@ -17,6 +17,7 @@ use crate::core::pcs::quotients::{
 use crate::core::pcs::utils::prepare_preprocessed_query_positions;
 use crate::core::pcs::{PcsConfig, TreeSubspan, TreeVec};
 use crate::core::poly::circle::{CanonicCoset, CircleDomain};
+use crate::core::proof_of_work::grind_smallest;
 use crate::core::utils::MaybeOwned;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::ExtendedMerkleDecommitmentLifted;
@@ -471,12 +472,15 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             polynomials[tree][column].stripe0(quotient_twiddles).into_owned()
         };
         print_column_size_histogram::<B, MC>(&columns);
+        // Proof of work before the coefficient that batches the quotients.
+        grind_smallest(channel, self.config.grinding.batching_bits);
+        let batching_coeff = channel.draw_secure_felt();
         // Compute oods quotients for boundary constraints on the sampled points.
         let quotients = compute_fri_quotients_with_regrowth(
             &columns,
             Some(&regrow),
             &samples,
-            channel.draw_secure_felt(),
+            batching_coeff,
             lifting_log_size,
             self.twiddles,
             self.config.fri_config.log_blowup_factor,

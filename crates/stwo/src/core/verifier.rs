@@ -8,6 +8,7 @@ use crate::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use crate::core::fri::FriVerificationError;
 use crate::core::pcs::CommitmentSchemeVerifier;
 use crate::core::proof::StarkProof;
+use crate::core::proof_of_work::grind_smallest;
 use crate::core::vcs_lifted::verifier::MerkleVerificationError;
 pub const PREPROCESSED_TRACE_IDX: usize = 0;
 
@@ -76,7 +77,8 @@ pub fn verify_ex<MC: MerkleChannel>(
         channel,
     );
 
-    // Draw OODS point.
+    // Proof of work before the OODS point, then draw it.
+    grind_smallest(channel, commitment_scheme.config.grinding.deep_bits);
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
     // Get mask sample points relative to oods point.
     let mut sample_points =

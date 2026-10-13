@@ -13,6 +13,7 @@ use crate::core::ColumnVec;
 use crate::core::channel::{Channel, MerkleChannel};
 use crate::core::pcs::quotients::CommitmentSchemeProof;
 use crate::core::pcs::utils::prepare_preprocessed_query_positions;
+use crate::core::proof_of_work::grind_smallest;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::MerkleVerifierLifted;
 use crate::core::verifier::VerificationError;
@@ -60,6 +61,7 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
         channel: &mut MC::C,
     ) -> Result<(), VerificationError> {
         channel.mix_felts(&proof.sampled_values.clone().flatten_cols());
+        grind_smallest(channel, self.config.grinding.batching_bits);
         let random_coeff = channel.draw_secure_felt();
         let lifting_log_size = self.trees.last().unwrap().height;
         let bound =

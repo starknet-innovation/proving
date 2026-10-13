@@ -111,6 +111,7 @@ where
         include_all_preprocessed_columns: _,
         opt_n_id_to_big_components,
         lifting_size_policy,
+        grinding: _,
     } = prover_params;
 
     let span = span!(Level::INFO, "Write Preprocessed trace").entered();
@@ -160,8 +161,12 @@ where
         }
     }
 
-    let pcs_config =
-        PcsConfig { fri_config, trace_lifting_log_size, preprocessed_lifting_log_size };
+    let pcs_config = PcsConfig {
+        fri_config,
+        trace_lifting_log_size,
+        preprocessed_lifting_log_size,
+        grinding: prover_params.grinding,
+    };
     // The twiddles must cover the tallest tree, whichever of the two it is.
     let max_lifting_log_size = trace_lifting_log_size.max(preprocessed_lifting_log_size);
 
@@ -219,7 +224,8 @@ where
         panic!("Only LiftingSizePolicy::Fixed is supported with a precomputed preprocessed tree");
     };
     let pcs_config =
-        PcsConfig::from_fri_and_lifting_size(prover_params.fri_config, lifting_log_size);
+        PcsConfig::from_fri_and_lifting_size(prover_params.fri_config, lifting_log_size)
+            .with_grinding(prover_params.grinding);
 
     // Run Cairo.
     let cairo_claim_generator = create_cairo_claim_generator(input, preprocessed_trace.clone());
@@ -289,6 +295,7 @@ where
         include_all_preprocessed_columns,
         opt_n_id_to_big_components: _,
         lifting_size_policy: _,
+        grinding: _,
     } = prover_params;
 
     // Setup protocol.
@@ -422,6 +429,8 @@ pub fn create_and_serialize_proof(
             include_all_preprocessed_columns: false,
             opt_n_id_to_big_components: None,
             lifting_size_policy: LiftingSizePolicy::Auto,
+            // The guard's workload proves without the privacy statement's extra grinding.
+            grinding: stwo::core::proof_of_work::Grinding::NONE,
         }
     };
 

@@ -6,6 +6,7 @@ use crate::core::circle::CirclePoint;
 use crate::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use crate::core::pcs::utils::InvalidLiftingLogSizeError;
 use crate::core::proof::{ExtendedStarkProof, StarkProof};
+use crate::core::proof_of_work::grind_smallest;
 use crate::core::verifier::PREPROCESSED_TRACE_IDX;
 use crate::prover::backend::BackendForChannel;
 
@@ -77,7 +78,8 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     // quotients unless they are handed back.
     crate::prover::backend::simd::column::trim_heap();
 
-    // Draw OODS point.
+    // Proof of work before the OODS point, then draw it.
+    grind_smallest(channel, commitment_scheme.config.grinding.deep_bits);
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
 
     // The composition tree was just committed like any other trace tree, so its height is

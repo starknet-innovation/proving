@@ -111,7 +111,13 @@ impl CairoSerialize for PcsConfig {
         // The lifting log sizes are intentionally not serialized: the Cairo verifier
         // recomputes them from `fri_config.log_blowup_factor` and the committed columns'
         // log sizes (see `pcs/verifier.cairo`), so shipping them would be redundant.
-        let Self { fri_config, trace_lifting_log_size: _, preprocessed_lifting_log_size: _ } = self;
+        // Grinding is never serialized: a verifier pins its own (stwo::core::pcs::PcsConfig).
+        let Self {
+            fri_config,
+            trace_lifting_log_size: _,
+            preprocessed_lifting_log_size: _,
+            grinding: _,
+        } = self;
         fri_config.serialize(output);
     }
 }

@@ -8,6 +8,7 @@ use itertools::{Itertools, zip_eq};
 use stwo::core::fields::qm31::SECURE_EXTENSION_DEGREE;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
+use stwo::core::proof_of_work::Grinding;
 
 use crate::channel::Channel;
 use crate::constraint_eval::CircuitEval;
@@ -246,6 +247,9 @@ pub struct ProofConfig {
     pub log_trace_size: usize,
 
     pub fri: FriConfig,
+
+    /// Proof of work before the DEEP and batching challenges, the native config's.
+    pub grinding: Grinding,
 }
 impl ProofConfig {
     pub fn new<Value: IValue>(
@@ -281,8 +285,12 @@ impl ProofConfig {
         // The circuit verifier verifies every tree against a single evaluation domain, so it
         // only accepts proofs whose trees — the preprocessed one included — were lifted to the
         // same height.
-        let PcsConfig { fri_config, trace_lifting_log_size, preprocessed_lifting_log_size } =
-            pcs_config;
+        let PcsConfig {
+            fri_config,
+            trace_lifting_log_size,
+            preprocessed_lifting_log_size,
+            grinding,
+        } = pcs_config;
         assert_eq!(
             trace_lifting_log_size, preprocessed_lifting_log_size,
             "The circuit verifier expects every tree, the preprocessed one included, to be lifted \
@@ -303,6 +311,7 @@ impl ProofConfig {
             cumulative_sum_columns,
             log_trace_size,
             fri: *fri_config,
+            grinding: *grinding,
         }
     }
 

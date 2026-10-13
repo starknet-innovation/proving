@@ -19,6 +19,7 @@ use super::channel::Channel;
 use super::fields::qm31::SecureField;
 use super::fri::FriConfig;
 use super::verifier::PREPROCESSED_TRACE_IDX;
+use crate::core::proof_of_work::Grinding;
 
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
 pub struct TreeSubspan {
@@ -43,6 +44,11 @@ pub struct PcsConfig {
     pub trace_lifting_log_size: u32,
     /// The height of the preprocessed tree, tree [`PREPROCESSED_TRACE_IDX`].
     pub preprocessed_lifting_log_size: u32,
+    /// Proof of work before the DEEP and batching challenges, none by default. It is neither
+    /// serialized with a proof nor mixed into the channel: a verifier pins its own config, as the
+    /// privacy statement's do (`privacy_circuit_verify::consts`), so a proof cannot lower it.
+    #[serde(skip)]
+    pub grinding: Grinding,
 }
 impl PcsConfig {
     /// The config for proving a trace of `trace_log_size` under `fri_config`: every tree, the
@@ -58,7 +64,13 @@ impl PcsConfig {
             fri_config,
             trace_lifting_log_size: lifting_log_size,
             preprocessed_lifting_log_size: lifting_log_size,
+            grinding: Grinding::NONE,
         }
+    }
+
+    /// The same config with proof of work before the DEEP and batching challenges.
+    pub const fn with_grinding(self, grinding: Grinding) -> Self {
+        Self { grinding, ..self }
     }
 
     /// The height the `tree_index`-th committed tree is lifted to: the preprocessed tree —

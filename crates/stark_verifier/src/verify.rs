@@ -104,7 +104,8 @@ pub fn verify<Value: IValue>(
 
     channel.mix_commitment(context, &proof.composition_polynomial_root);
 
-    // Draw a random point for the OODS.
+    // Proof of work before the OODS point, then draw it.
+    channel.grind_smallest(context, config.grinding.deep_bits);
     let oods_point = channel.draw_point(context);
 
     let shifted_relation_uses = check_relation_uses(context, statement, &component_sizes_bits);
@@ -163,7 +164,9 @@ pub fn verify<Value: IValue>(
     );
     eq(context, composition_eval, expected_composition_eval);
 
-    // Draw a random challenge for the linear combination of the OODS quotients.
+    // Proof of work before the random challenge for the linear combination of the OODS
+    // quotients, then draw it.
+    channel.grind_smallest(context, config.grinding.batching_bits);
     let oods_quotient_coef = channel.draw_qm31(context);
 
     // Run the commit phase of FRI.
