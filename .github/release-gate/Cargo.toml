@@ -1,0 +1,22 @@
+[package]
+name = "release-gate"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Release gate: a fork release must prove byte-identically to upstream and verify upstream"
+
+# Standalone: not a member of the repository's workspace.
+[workspace]
+
+# Both crates come from the upstream base rev that the sequencer (main-v0.14.4) pins for
+# privacy-prove and privacy-circuit-verify-v2. `.github/workflows/release.yml` builds this crate
+# twice: as is (the reference), and with the consumer `[patch]` that points privacy-prove at the
+# fork (the candidate). The patch leaves privacy-circuit-verify upstream's in both builds.
+# Keep the rev in sync with UPSTREAM_BASE_REV in release.yml; the workflow checks it.
+[dependencies]
+privacy-prove = { git = "https://github.com/starkware-libs/proving", rev = "2b495a36d57a4bd754cdfa1c2b5bda8d92b37ec3" }
+privacy-circuit-verify = { git = "https://github.com/starkware-libs/proving", rev = "2b495a36d57a4bd754cdfa1c2b5bda8d92b37ec3" }
+cairo-vm = { version = "3.2.0", default-features = false }
+serde_json = "1.0.142"
+starknet-types-core = "0.2.4"
