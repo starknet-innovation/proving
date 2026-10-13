@@ -48,5 +48,11 @@ curl -fsSLO "$BASE/stwo-run-and-prove-$PLATFORM.tar.gz"
 curl -fsSLO "$BASE/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS  # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
 gh attestation verify "stwo-run-and-prove-$PLATFORM.tar.gz" --repo starknet-innovation/proving
+gh attestation verify "stwo-run-and-prove-$PLATFORM.tar.gz" --repo starknet-innovation/proving \
+  --predicate-type https://github.com/starknet-innovation/proving/release-manifest/v1
 tar -xzf "stwo-run-and-prove-$PLATFORM.tar.gz" stwo-run-and-prove
 ```
+
+The first check is the build provenance: the file was built by a run of `release.yml` in this
+repository. The second checks a statement signed by that run that ties the file to the release's
+`manifest.json`, which records the source commit and the gate's results.

@@ -114,16 +114,32 @@ jobs:
           persist-credentials: false
 
       # Upstream's recursive prover peaks at about 11 GiB with 4 threads (the fork's at about
-      # 2.5 GiB), close to the 16 GiB these runners have; swap keeps the reference from being
-      # OOM-killed.
+      # 2.5 GiB), close to the 16 GiB these runners have, so add up to 16 GiB of swap as headroom.
+      # It goes on the disk-backed filesystem with the most free space, leaving 8 GiB for the
+      # build (about 5 GiB measured), and is skipped rather than failing the job when space is
+      # short.
       - name: Add swap
         run: |
-          swapfile=/mnt/gate.swap
-          [ -d /mnt ] || swapfile=/gate.swap
-          sudo fallocate -l 16G "$swapfile"
-          sudo chmod 600 "$swapfile"
-          sudo mkswap "$swapfile"
-          sudo swapon "$swapfile"
+          dir=""
+          avail=0
+          for candidate in /mnt /; do
+            [ -d "$candidate" ] || continue
+            read -r fstype free_gib <<< "$(df --output=fstype,avail -BG "$candidate" | tail -1 | tr -d G)"
+            case "$fstype" in tmpfs | ramfs) continue ;; esac
+            if [ "$free_gib" -gt "$avail" ]; then dir="$candidate"; avail="$free_gib"; fi
+          done
+          size=$((avail - 8))
+          [ "$size" -le 16 ] || size=16
+          if [ -z "$dir" ] || [ "$size" -lt 2 ]; then
+            echo "::warning::not enough disk for extra swap (${avail} GiB free); proving without it"
+          else
+            swapfile="${dir%/}/gate.swap"
+            sudo fallocate -l "${size}G" "$swapfile"
+            sudo chmod 600 "$swapfile"
+            sudo mkswap "$swapfile"
+            sudo swapon "$swapfile"
+          fi
+          df -h / /mnt 2>/dev/null || true
           free -h
 
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -363,26 +379,45 @@ jobs:
           curl -fsSLO ${REPO_URL}/releases/download/${TAG}/SHA256SUMS
           sha256sum -c --ignore-missing SHA256SUMS
           gh attestation verify stwo-run-and-prove-linux-x86_64.tar.gz --repo ${GITHUB_REPOSITORY}
+          gh attestation verify stwo-run-and-prove-linux-x86_64.tar.gz --repo ${GITHUB_REPOSITORY} \
+            --predicate-type ${REPO_URL}/release-manifest/v1
           ```
 
           [Workflow run](${RUN_URL})
           EOF
           cat notes.md
 
+      # Attesting here rather than in the build jobs keeps the signing token away from the jobs
+      # that run third-party build scripts. The SLSA provenance names this workflow run as the
+      # builder, but its source is the workflow's commit, not the released one; the second
+      # attestation signs each asset together with manifest.json, which records the resolved
+      # source commit and the gate's results.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
 
-      # Created through the API so the job needs no checkout. An existing tag is accepted only
-      # if it already points at this commit (a re-run); tags are never moved.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+          predicate-type: ${{ github.server_url }}/${{ github.repository }}/release-manifest/v1
+          predicate-path: dist/manifest.json
+
+      # Created through the API so the job needs no checkout. An existing tag, lightweight or
+      # annotated, is accepted only if it already points at this commit (a re-run, as in the
+      # resolve job); tags are never moved.
       - name: Create the tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if existing="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+          if ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
             --jq '.object.type + " " + .object.sha' 2>/dev/null)"; then
-            [ "$existing" = "commit $SOURCE_SHA" ] ||
-              { echo "::error::tag $TAG exists ($existing), not at $SOURCE_SHA"; exit 1; }
+            read -r type commit <<< "$ref"
+            if [ "$type" = tag ]; then
+              commit="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$commit" \
+                --jq 'select(.object.type == "commit") | .object.sha')"
+            fi
+            [ "$commit" = "$SOURCE_SHA" ] ||
+              { echo "::error::tag $TAG exists ($ref), not at $SOURCE_SHA"; exit 1; }
           else
             gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SOURCE_SHA"
           fi
