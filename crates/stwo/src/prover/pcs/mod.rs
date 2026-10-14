@@ -1109,20 +1109,26 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .zip(&self.polynomials)
             .sorted_by_key(|(_, poly)| poly.evals.domain.log_size())
             .collect_vec();
-        let leaves: HashMap<usize, <MC::H as MerkleHasherLifted>::Hash> = leaf_positions
+        // Preserve the existing stable size order and its separate updates of up to 16
+        // columns. The backend hashes the gathered rows without regenerating any column.
+        let mut column_chunks = Vec::new();
+        let mut start = 0;
+        while start < by_size.len() {
+            let log_size = by_size[start].1.evals.domain.log_size();
+            let mut end = start + 1;
+            while end < by_size.len() && by_size[end].1.evals.domain.log_size() == log_size {
+                end += 1;
+            }
+            column_chunks.extend((start..end).step_by(16).map(|i| i..(i + 16).min(end)));
+            start = end;
+        }
+        let leaf_columns = by_size
             .iter()
-            .enumerate()
-            .map(|(i, &position)| {
-                let mut hasher = MC::H::default();
-                for (_, group) in &by_size.iter().group_by(|(_, poly)| poly.evals.domain.log_size()) {
-                    for chunk in &group.chunks(16) {
-                        let values = chunk.map(|(rows, _)| rows[queries.len() + i]).collect_vec();
-                        hasher.update_leaf(&values);
-                    }
-                }
-                (position, hasher.finalize())
-            })
-            .collect();
+            .map(|(rows, _)| &rows[queries.len()..])
+            .collect_vec();
+        let hashes = B::hash_sampled_leaves(&leaf_columns, &column_chunks, leaf_positions.len());
+        let leaves: HashMap<usize, <MC::H as MerkleHasherLifted>::Hash> =
+            leaf_positions.iter().copied().zip(hashes).collect();
         self.commitment.decommit_from(queries, queried_values, |positions| {
             positions.iter().map(|position| leaves[position]).collect()
         })

@@ -281,6 +281,70 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
         layers
     }
 
+    fn hash_sampled_leaves(
+        columns: &[&[BaseField]],
+        column_chunks: &[core::ops::Range<usize>],
+        n_rows: usize,
+    ) -> Vec<Blake2sHash> {
+        assert!(columns.iter().all(|column| column.len() == n_rows));
+        if n_rows == 0 {
+            return Vec::new();
+        }
+        // The SIMD compressor handles only the low 32-bit byte counter. Preserve the
+        // scalar hasher's full counter for larger messages, including repeated ranges.
+        let Some(byte_count) = column_chunks.iter().try_fold(0_u32, |bytes, range| {
+            let n_fields = u32::try_from(range.len()).ok()?;
+            bytes.checked_add(n_fields.checked_mul(N_BYTES_FELT as u32)?)
+        }) else {
+            return <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::hash_sampled_leaves(
+                columns,
+                column_chunks,
+                n_rows,
+            );
+        };
+        // Blake2s update_leaf appends the little-endian field words without padding between
+        // calls. Flatten only the references, preserving the exact update and column order.
+        let columns: Vec<_> = column_chunks
+            .iter()
+            .flat_map(|range| columns[range.clone()].iter().copied())
+            .collect();
+        let last_chunk_index =
+            columns.len().saturating_sub(1) / N_FELTS_IN_BLAKE_MESSAGE * N_FELTS_IN_BLAKE_MESSAGE;
+        // Whole SIMD states also handle the final partial group; unused lanes are discarded.
+        let mut hashes = vec![Blake2sHash::default(); n_rows.next_multiple_of(N_HASHES_PER_SIMD_STATE)];
+        chunks_mut_iter(&mut hashes, N_HASHES_PER_SIMD_STATE)
+            .enumerate()
+            .for_each(|(state_index, dst)| {
+                let first = state_index * N_HASHES_PER_SIMD_STATE;
+                let message_word = |column: &[BaseField]| {
+                    u32x16::from_array(array::from_fn(|lane| {
+                        if first + lane < n_rows { column[first + lane].0 } else { 0 }
+                    }))
+                };
+                let mut state = INITIAL_STATE;
+                for (block, chunk) in columns[..last_chunk_index]
+                    .chunks_exact(N_FELTS_IN_BLAKE_MESSAGE)
+                    .enumerate()
+                {
+                    let msgs = array::from_fn(|i| message_word(chunk[i]));
+                    state = compress_unfinalized(
+                        state,
+                        msgs,
+                        (block as u64 + 1) * N_BYTES_IN_BLAKE_MESSAGE,
+                    );
+                }
+                // Even a full terminal block must be finalized, with no extra empty block.
+                let mut msgs = [u32x16::splat(0); N_FELTS_IN_BLAKE_MESSAGE];
+                for (i, column) in columns[last_chunk_index..].iter().enumerate() {
+                    msgs[i] = message_word(column);
+                }
+                state = compress_finalize(state, msgs, u64::from(byte_count));
+                store_states(untranspose_states(state), dst);
+            });
+        hashes.truncate(n_rows);
+        hashes
+    }
+
     /// See [`MerkleOpsLifted::leaf_hashes_at`]: the leaves are recomputed one packed row at a
     /// time, through every pass, without the full-size state buffers of [`Self::build_leaves`].
     fn leaf_hashes_at(
