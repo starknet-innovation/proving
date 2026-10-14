@@ -424,7 +424,9 @@ fn stripe0_of_coordinates<B: PolyOps>(
         let coefficients: CircleCoefficients<B> =
             CircleEvaluation::<B, BaseField, BitReversedOrder>::new(trace_domain, column)
                 .interpolate_with_twiddles(trace_twiddles);
-        let mut stripe = Col::<B, BaseField>::zeros(1 << coefficients.log_size());
+        // Every value is written by the FFT: taken as the pool's FFT buffers are, not zeroed.
+        let mut stripe = crate::prover::mempool::BaseColumnPool::<B>::new()
+            .take_or_alloc(coefficients.log_size());
         B::evaluate_stripe_into(&coefficients, domain, twiddles, 0, &mut stripe);
         stripe
     };

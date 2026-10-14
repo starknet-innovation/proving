@@ -47,6 +47,13 @@ pub trait TraceSource: Send + Sync {
     /// Writes the column's values on its trace domain, in bit-reversed order, into `dst`, of
     /// length `2^log_size`.
     fn write_values(&self, dst: &mut [BaseField]);
+    /// Writes the values of the rows `first..first + dst.len()`, the ones [`Self::write_values`]
+    /// writes there, into `dst`.
+    fn write_rows(&self, first: usize, dst: &mut [BaseField]) {
+        let mut values = vec![BaseField::from(0); 1 << self.log_size()];
+        self.write_values(&mut values);
+        dst.copy_from_slice(&values[first..first + dst.len()]);
+    }
 }
 
 /// A shared [`TraceSource`].
@@ -54,7 +61,9 @@ pub type SharedTraceSource = std::sync::Arc<dyn TraceSource>;
 
 /// The values of `source` on its trace domain, in bit-reversed order, as a column.
 pub fn source_column<B: Backend>(source: &dyn TraceSource) -> Col<B, BaseField> {
-    Col::<B, BaseField>::from_fill(1 << source.log_size(), &|dst| source.write_values(dst))
+    Col::<B, BaseField>::from_rows(1 << source.log_size(), &|first, dst| {
+        source.write_rows(first, dst)
+    })
 }
 
 /// A struct for representing a polynomial corresponding to a trace column.

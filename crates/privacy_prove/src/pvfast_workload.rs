@@ -93,6 +93,11 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
         || build_and_fill_cairo_verifier_circuit(&precomputes.cairo_verifier_config, proof, aux, output_hash),
         || {
             let _ = &**precomputes.circuit_preprocessed_tree;
+            // The columns the base trace's first writers read are built here, on the workers the
+            // fill leaves idle, instead of one after the other once it is done.
+            circuit_prover::witness::trace::warm_writer_columns(
+                &precomputes.preprocessed_circuit.preprocessed_trace,
+            );
         },
     );
     ensure!(context.is_circuit_valid(), "Circuit is not valid");

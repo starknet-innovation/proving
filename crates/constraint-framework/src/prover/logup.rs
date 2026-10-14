@@ -9,7 +9,7 @@ use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::uninit_vec;
 use stwo::prover::backend::Column;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::simd::column::SecureColumn;
+use stwo::prover::backend::simd::column::{BaseColumn, SecureColumn};
 use stwo::prover::backend::simd::m31::{LOG_N_LANES, N_LANES, PackedBaseField};
 use stwo::prover::backend::simd::prefix_sum::inclusive_prefix_sum;
 use stwo::prover::backend::simd::qm31::{PackedSecureField, batch_inverse_packed_qm31};
@@ -78,8 +78,13 @@ impl LogupTraceGenerator {
         }
         const CHUNK_SIZE: usize = 1024;
         let n_rows: usize = 1 << (self.log_size - LOG_N_LANES);
+        // Every value of the columns is written below (each task writes every row of its chunk of
+        // every column): their buffers are taken as the commitment's FFT buffers are, unzeroed.
+        let pool = stwo::prover::mempool::BaseColumnPool::<SimdBackend>::new();
         let mut columns: Vec<_> = (0..n_columns)
-            .map(|_| SecureColumnByCoords::<SimdBackend>::zeros(1 << self.log_size))
+            .map(|_| SecureColumnByCoords::<SimdBackend> {
+                columns: std::array::from_fn(|_| pool.take_or_alloc(self.log_size)),
+            })
             .collect();
         let mut tasks: Vec<Vec<_>> =
             (0..n_rows.div_ceil(CHUNK_SIZE)).map(|_| Vec::with_capacity(n_columns)).collect();
@@ -130,8 +135,6 @@ impl LogupTraceGenerator {
         &mut self,
         iter: impl IndexedParallelIterator<Item = (PackedSecureField, PackedSecureField)>,
     ) {
-        use stwo::prover::backend::simd::column::BaseColumn;
-
         let length = 1 << self.log_size;
         assert_eq!(iter.len() * N_LANES, length);
 
@@ -154,7 +157,7 @@ impl LogupTraceGenerator {
     pub fn finalize_last(
         mut self,
     ) -> (ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>, SecureField) {
-        let mut last_col_coords = self.trace.pop().unwrap().columns;
+        let last_col_coords = self.trace.pop().unwrap().columns;
 
         // Compute cumsum_shift.
         let coordinate_sums = last_col_coords
@@ -164,10 +167,24 @@ impl LogupTraceGenerator {
         let cumsum_shift = claimed_sum / BaseField::from_u32_unchecked(1 << self.log_size);
         let packed_cumsum_shift = PackedSecureField::broadcast(cumsum_shift);
 
-        last_col_coords.iter_mut().enumerate().for_each(|(i, c)| {
-            c.data.iter_mut().for_each(|x| *x -= packed_cumsum_shift.into_packed_m31s()[i])
-        });
-        let coord_prefix_sum = last_col_coords.map(inclusive_prefix_sum);
+        // Each coordinate is shifted and prefix-summed on its own; the four are independent
+        // columns, so they run as separate tasks.
+        let shifted_prefix_sum = |(mut c, shift): (BaseColumn, PackedBaseField)| {
+            c.data.iter_mut().for_each(|x| *x -= shift);
+            inclusive_prefix_sum(c)
+        };
+        let coords = last_col_coords.into_iter().zip(packed_cumsum_shift.into_packed_m31s());
+        #[cfg(feature = "parallel")]
+        let coord_prefix_sum: [BaseColumn; SECURE_EXTENSION_DEGREE] = coords
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(shifted_prefix_sum)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        #[cfg(not(feature = "parallel"))]
+        let coord_prefix_sum: [BaseColumn; SECURE_EXTENSION_DEGREE] =
+            coords.map(shifted_prefix_sum).collect::<Vec<_>>().try_into().unwrap();
         let secure_prefix_sum = SecureColumnByCoords { columns: coord_prefix_sum };
         self.trace.push(secure_prefix_sum);
         let trace = self

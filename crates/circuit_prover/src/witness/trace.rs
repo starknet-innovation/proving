@@ -23,6 +23,30 @@ use crate::witness::components::{
     verify_bitwise_xor_7, verify_bitwise_xor_8, verify_bitwise_xor_9, verify_bitwise_xor_12,
 };
 
+/// The preprocessed columns the eq and qm31_ops writers materialize first: those writers run
+/// alone at the start of the base trace, one column after the other.
+const WRITER_FIRST_COLUMNS: [&str; 10] = [
+    "qm31_ops_add_flag",
+    "qm31_ops_sub_flag",
+    "qm31_ops_mul_flag",
+    "qm31_ops_pointwise_mul_flag",
+    "qm31_ops_in0_address",
+    "qm31_ops_in1_address",
+    "qm31_ops_out_address",
+    "qm31_ops_mults",
+    "eq_in0_address",
+    "eq_in1_address",
+];
+
+/// Materializes [`WRITER_FIRST_COLUMNS`] on the thread pool ahead of the base trace (see
+/// [`PreProcessedTrace::warm_columns`]); the writers then take them instead of building them.
+pub fn warm_writer_columns(preprocessed_trace: &PreProcessedTrace) {
+    let ids = WRITER_FIRST_COLUMNS.map(|id| {
+        stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId { id: id.to_owned() }
+    });
+    preprocessed_trace.warm_columns(&ids);
+}
+
 pub struct TraceGenerator {
     pub qm31_ops_trace_generator: Qm31OpsTraceGenerator,
 }

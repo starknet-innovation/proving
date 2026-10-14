@@ -199,24 +199,31 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
         }
         let plan = LeavesPlan::new(columns);
 
-        // Every tile of `TILE` states is reduced to one state of the layer `FUSED_LEVELS`.
-        let mut top: Vec<Blake2sHash> =
-            vec![Blake2sHash::default(); 1 << (lifting_log_size - FUSED_LEVELS)];
-        chunks_mut_iter(&mut top, N_HASHES_PER_SIMD_STATE).enumerate().for_each(
-            |(tile_index, dst)| {
-                let mut states = [INITIAL_STATE; TILE];
-                plan.compute_tile(tile_index * TILE, &mut states);
-                let mut n_states = TILE;
-                while n_states > 1 {
-                    // Hash pairs of states into the states of the next layer.
-                    n_states /= 2;
-                    for k in 0..n_states {
-                        states[k] = hash_state_pair(&states[2 * k], &states[2 * k + 1]);
-                    }
+        // Every tile of `TILE` states is reduced to one state of the layer `FUSED_LEVELS`: the
+        // tile's `N_HASHES_PER_SIMD_STATE` hashes, collected in tile order.
+        let tile_hashes = |tile_index: usize| -> [Blake2sHash; N_HASHES_PER_SIMD_STATE] {
+            let mut states = [INITIAL_STATE; TILE];
+            plan.compute_tile(tile_index * TILE, &mut states);
+            let mut n_states = TILE;
+            while n_states > 1 {
+                // Hash pairs of states into the states of the next layer.
+                n_states /= 2;
+                for k in 0..n_states {
+                    states[k] = hash_state_pair(&states[2 * k], &states[2 * k + 1]);
                 }
-                store_states(untranspose_states(states[0]), dst);
-            },
-        );
+            }
+            let mut dst = [Blake2sHash::default(); N_HASHES_PER_SIMD_STATE];
+            store_states(untranspose_states(states[0]), &mut dst);
+            dst
+        };
+        let n_tiles = (1usize << (lifting_log_size - FUSED_LEVELS)) / N_HASHES_PER_SIMD_STATE;
+        #[cfg(feature = "parallel")]
+        let top: Vec<[Blake2sHash; N_HASHES_PER_SIMD_STATE]> =
+            (0..n_tiles).into_par_iter().map(tile_hashes).collect();
+        #[cfg(not(feature = "parallel"))]
+        let top: Vec<[Blake2sHash; N_HASHES_PER_SIMD_STATE]> =
+            (0..n_tiles).map(tile_hashes).collect();
+        let top: Vec<Blake2sHash> = top.into_flattened();
 
         let mut layers: Vec<Vec<Blake2sHash>> = (0..FUSED_LEVELS).map(|_| Vec::new()).collect();
         layers.push(top);

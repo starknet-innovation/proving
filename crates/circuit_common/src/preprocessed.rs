@@ -578,6 +578,12 @@ impl CompactColumn {
     }
 }
 
+/// Columns materialized ahead of their witness writer by [`PreProcessedTrace::warm_columns`], with
+/// the address of their trace: [`PreProcessedTrace::get_column`] takes each one once, so it is
+/// freed when the writer drops it, as a column it built itself would be.
+static WARM_COLUMNS: std::sync::Mutex<Vec<(usize, PreProcessedColumnId, Vec<usize>)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// A collection of preprocessed columns, whose values are publicly acknowledged, and independent of
 /// the proof.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -652,8 +658,33 @@ impl PreProcessedTrace {
             self.columns.get(id).unwrap_or_else(|| panic!("Missing preprocessed column {id:?}"));
         match column {
             CompactColumn::Wide(values) => Cow::Borrowed(values.as_slice()),
-            _ => Cow::Owned(column.to_vec()),
+            _ => {
+                // A column materialized ahead by `warm_columns` is taken (once) instead.
+                let key = self as *const Self as usize;
+                let warm = {
+                    let mut warm = WARM_COLUMNS.lock().unwrap();
+                    let position = warm.iter().position(|(k, warm_id, _)| *k == key && warm_id == id);
+                    position.map(|position| warm.swap_remove(position).2)
+                };
+                Cow::Owned(warm.unwrap_or_else(|| column.to_vec()))
+            }
         }
+    }
+
+    /// Materializes the columns `ids` as [`Self::get_column`] does, on the thread pool and ahead of
+    /// their reader: its `get_column` then takes each one instead of building it. Called beside the
+    /// mostly sequential verifier-circuit fill, whose idle workers would otherwise wait.
+    pub fn warm_columns(&self, ids: &[PreProcessedColumnId]) {
+        use rayon::prelude::*;
+        let key = self as *const Self as usize;
+        let warm: Vec<(usize, PreProcessedColumnId, Vec<usize>)> = ids
+            .par_iter()
+            .filter_map(|id| match self.columns.get(id)? {
+                CompactColumn::Wide(_) => None,
+                column => Some((key, id.clone(), column.to_vec())),
+            })
+            .collect();
+        WARM_COLUMNS.lock().unwrap().extend(warm);
     }
 
     #[cfg(feature = "prover")]
@@ -715,6 +746,32 @@ impl stwo::prover::TraceSource for PreprocessedColumnSource {
             }
             _ => {
                 for (row, value) in dst.iter_mut().enumerate() {
+                    *value = BaseField::from(column.at(row));
+                }
+            }
+        }
+    }
+
+    fn write_rows(&self, first: usize, dst: &mut [BaseField]) {
+        // The conversions of `write_values`, for the rows `first..first + dst.len()`.
+        let column = self.column();
+        let rows = first..first + dst.len();
+        assert!(rows.end <= column.len());
+        match column {
+            CompactColumn::Narrow(values) => {
+                for (value, &narrow) in dst.iter_mut().zip(&values[rows]) {
+                    *value = BaseField::from(
+                        usize::try_from(narrow).expect("value originally fit usize"),
+                    );
+                }
+            }
+            CompactColumn::Wide(values) => {
+                for (value, &wide) in dst.iter_mut().zip(&values[rows]) {
+                    *value = BaseField::from(wide);
+                }
+            }
+            _ => {
+                for (row, value) in rows.zip(dst.iter_mut()) {
                     *value = BaseField::from(column.at(row));
                 }
             }

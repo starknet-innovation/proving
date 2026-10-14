@@ -60,6 +60,14 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
         fill(&mut values);
         values.into_iter().collect()
     }
+    /// A column of `len` elements, the rows `first..first + dst.len()` written by
+    /// `rows(first, dst)`; a backend may call it on any partition of the rows into blocks.
+    fn from_rows(len: usize, rows: &(dyn Fn(usize, &mut [T]) + Sync)) -> Self
+    where
+        T: Copy + Default,
+    {
+        Self::from_fill(len, &|dst| rows(0, dst))
+    }
     /// Returns the length of the column.
     fn len(&self) -> usize;
     /// Returns true if the column is empty.

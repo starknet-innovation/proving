@@ -12,11 +12,14 @@ use stwo::core::poly::circle::{CanonicCoset, CircleDomain};
 use stwo::core::utils::bit_reverse;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::circle::evaluate_block_into;
+use stwo::core::fields::qm31::SECURE_EXTENSION_DEGREE;
 use stwo::prover::backend::simd::column::{
-    BaseColumn, VeryPackedSecureColumnByCoords, VeryPackedSecureColumnByCoordsMutSlice,
+    BaseColumn, VeryPackedBaseColumnMutSlice, VeryPackedSecureColumnByCoordsMutSlice,
 };
-use stwo::prover::backend::simd::m31::LOG_N_LANES;
-use stwo::prover::backend::simd::very_packed_m31::{LOG_N_VERY_PACKED_ELEMS, VeryPackedBaseField};
+use stwo::prover::backend::simd::m31::{LOG_N_LANES, PackedBaseField};
+use stwo::prover::backend::simd::very_packed_m31::{
+    LOG_N_VERY_PACKED_ELEMS, VeryPackedBaseField, as_very_packed_mut,
+};
 use stwo::prover::backend::{Backend, Column, CpuBackend};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
@@ -247,14 +250,71 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         window: Option<(usize, isize)>,
         block: usize,
     ) {
-        let range = 0..(col.len() >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS));
-        let col = unsafe { VeryPackedSecureColumnByCoords::transform_under_mut(col) };
+        // Whole very packed rows only, as before (a trailing half is never evaluated).
+        let n_packed = (col.len() >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS)) << LOG_N_VERY_PACKED_ELEMS;
+        let [c0, c1, c2, c3] = &mut col.columns;
+        let coords = [c0, c1, c2, c3].map(|c| &mut c.data[..n_packed]);
+        self.accumulate_rows_into(
+            trace_cols,
+            coords,
+            random_coeff_powers,
+            eval_log_size,
+            denom_inv,
+            window,
+            block,
+        );
+    }
+
+    /// [`Self::accumulate_rows`] into four coordinate slices of packed rows (the rows of a whole
+    /// column, or of one block of it): each row adds `row_res * denom_inv` to the value already
+    /// there, as before.
+    fn accumulate_rows_into(
+        &self,
+        trace_cols: &TreeVec<Vec<&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>>,
+        coords: [&mut [PackedBaseField]; SECURE_EXTENSION_DEGREE],
+        random_coeff_powers: &[SecureField],
+        eval_log_size: u32,
+        denom_inv: &[BaseField],
+        window: Option<(usize, isize)>,
+        block: usize,
+    ) {
+        let [c0, c1, c2, c3] =
+            coords.map(as_very_packed_mut);
+        let range = 0..c0.len();
 
         #[cfg(not(feature = "parallel"))]
-        let iter = range.step_by(CHUNK_SIZE).zip(col.chunks_mut(CHUNK_SIZE));
+        let iter = range.step_by(CHUNK_SIZE).zip(
+            itertools::izip!(
+                c0.chunks_mut(CHUNK_SIZE),
+                c1.chunks_mut(CHUNK_SIZE),
+                c2.chunks_mut(CHUNK_SIZE),
+                c3.chunks_mut(CHUNK_SIZE)
+            )
+            .map(|(a, b, c, d)| {
+                VeryPackedSecureColumnByCoordsMutSlice([
+                    VeryPackedBaseColumnMutSlice(a),
+                    VeryPackedBaseColumnMutSlice(b),
+                    VeryPackedBaseColumnMutSlice(c),
+                    VeryPackedBaseColumnMutSlice(d),
+                ])
+            }),
+        );
 
         #[cfg(feature = "parallel")]
-        let iter = range.into_par_iter().step_by(CHUNK_SIZE).zip(col.par_chunks_mut(CHUNK_SIZE));
+        let iter = range.into_par_iter().step_by(CHUNK_SIZE).zip(
+            c0.par_chunks_mut(CHUNK_SIZE)
+                .zip(c1.par_chunks_mut(CHUNK_SIZE))
+                .zip(c2.par_chunks_mut(CHUNK_SIZE))
+                .zip(c3.par_chunks_mut(CHUNK_SIZE))
+                .map(|(((a, b), c), d)| {
+                    VeryPackedSecureColumnByCoordsMutSlice([
+                        VeryPackedBaseColumnMutSlice(a),
+                        VeryPackedBaseColumnMutSlice(b),
+                        VeryPackedBaseColumnMutSlice(c),
+                        VeryPackedBaseColumnMutSlice(d),
+                    ])
+                }),
+        );
 
         // Define any `self` values outside the loop to prevent the compiler thinking there is a
         // `Sync` requirement on `Self`.
@@ -390,6 +450,9 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         let regrown = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).par_map_cols(regrow);
         // A block's column buffers are reused by the next block (no fresh pages).
         let spare = std::sync::Mutex::new(Vec::<BaseColumn>::new());
+        // The first block's buffers: every value is written by `evaluate_block_into`'s FFT, so they
+        // are taken as the commitment's evaluation buffers are, without zeroing them first.
+        let fresh = stwo::prover::mempool::BaseColumnPool::<SimdBackend>::new();
         for block in 0..1usize << log_n_blocks {
             let fill = |((poly, whole), regrown): (
                 (&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>),
@@ -398,8 +461,8 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                 if whole.is_some() {
                     return None;
                 }
-                let mut values =
-                    spare.lock().unwrap().pop().unwrap_or_else(|| BaseColumn::zeros(block_len));
+                let reused = spare.lock().unwrap().pop();
+                let mut values = reused.unwrap_or_else(|| fresh.take_or_alloc(log_block));
                 let coeffs = match regrown {
                     Some(coeffs) => Cow::Borrowed(coeffs),
                     None => coefficients(**poly),
@@ -427,29 +490,29 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                         &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
                     )| block.as_ref().or(whole.as_ref()).unwrap(),
                 );
-            let mut rows = SecureColumnByCoords::<SimdBackend>::zeros(block_len);
-            self.accumulate_rows(
-                &columns,
-                &mut rows,
-                &accum.random_coeff_powers,
-                eval_domain.log_size(),
-                &denom_inv,
-                None,
-                block * block_len >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS),
-            );
+            // The block's rows accumulate straight into the accumulator's slice for the block:
+            // each row adds `row_res * denom_inv` to the value there, the value the zeroed
+            // per-block buffer and its add pass produced (the accumulator stays below P).
+            {
+                let start = (block * block_len) >> LOG_N_LANES;
+                let n_packed = block_len >> LOG_N_LANES;
+                let [c0, c1, c2, c3] = &mut accum.col.columns;
+                let coords = [c0, c1, c2, c3].map(|c| &mut c.data[start..start + n_packed]);
+                self.accumulate_rows_into(
+                    &columns,
+                    coords,
+                    &accum.random_coeff_powers,
+                    eval_domain.log_size(),
+                    &denom_inv,
+                    None,
+                    block * block_len >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS),
+                );
+            }
             drop(columns);
             spare
                 .lock()
                 .unwrap()
                 .extend(blocks.0.into_iter().flatten().flatten().map(|evaluation| evaluation.values));
-            for (dst, src) in accum.col.columns.iter_mut().zip(&rows.columns) {
-                let dst = &mut dst.as_mut_slice()[block * block_len..][..block_len];
-                #[cfg(not(feature = "parallel"))]
-                let pairs = dst.iter_mut().zip(src.as_slice());
-                #[cfg(feature = "parallel")]
-                let pairs = dst.par_iter_mut().zip(src.as_slice().par_iter());
-                pairs.for_each(|(dst, src)| *dst += *src);
-            }
         }
     }
 }

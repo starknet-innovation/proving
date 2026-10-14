@@ -62,8 +62,64 @@ fn pad_blake_g_gate(context: &mut Context<impl IValue>, target: usize) {
 pub fn pad_context(context: &mut FinalizedContext<impl IValue>) {
     // Padding the components to a power of two.
     let padded_sizes = compute_padded_sizes(context);
-    pad_to_targets(context, &padded_sizes);
+    if context.context.releases_on_padding() {
+        pad_to_targets_released(context, &padded_sizes);
+    } else {
+        pad_to_targets(context, &padded_sizes);
+    }
     context.release_if_requested();
+}
+
+/// [pad_to_targets] for a context released right after padding, which keeps only its values and
+/// `n_vars`: each component's first padding gate is added as usual, and the values of the others,
+/// identical to the first's (their inputs are the constant zero and one variables), are appended
+/// directly. The released values and variable numbering are those of [pad_to_targets].
+fn pad_to_targets_released(context: &mut FinalizedContext<impl IValue>, targets: &ComponentSizes) {
+    let inner_context = &mut context.context;
+    let n_eq = inner_context.circuit.eq.len();
+    pad_released(inner_context, n_eq, targets.eq, |context| {
+        let zero = context.zero();
+        circuits::ops::eq(context, zero, zero);
+    });
+    let n_qm31_ops = qm31_ops_n_rows(&inner_context.circuit);
+    pad_released(inner_context, n_qm31_ops, targets.qm31_ops, |context| {
+        let one = context.one();
+        // Use 1 + 1 to work around + zero optimization.
+        eval!(context, (one) + (one));
+    });
+    let n_triple_xor = inner_context.circuit.triple_xor.len();
+    pad_released(inner_context, n_triple_xor, targets.triple_xor, |context| {
+        let zero = context.zero();
+        circuits::blake::triple_xor(context, zero, zero, zero);
+    });
+    let n_m31_to_u32 = inner_context.circuit.m31_to_u32.len();
+    pad_released(inner_context, n_m31_to_u32, targets.m31_to_u32, |context| {
+        let zero = context.zero();
+        circuits::blake::m31_to_u32(context, zero);
+    });
+    let n_blake_g_gate = inner_context.circuit.blake_g_gate.len();
+    pad_released(inner_context, n_blake_g_gate, targets.blake_g_gate, |context| {
+        let zero = context.zero();
+        blake_g_gate(context, zero, zero, zero, zero, zero, zero);
+    });
+}
+
+/// Pads one component from `n_rows` to `target` rows in a context released at padding: one gate
+/// as usual, then the values of the other `target - n_rows - 1` gates.
+fn pad_released<Value: IValue>(
+    context: &mut Context<Value>,
+    n_rows: usize,
+    target: usize,
+    mut gate: impl FnMut(&mut Context<Value>),
+) {
+    assert!(n_rows <= target);
+    if n_rows == target {
+        return;
+    }
+    let before = context.values().len();
+    gate(context);
+    let pattern = context.values()[before..].to_vec();
+    context.append_released_padding_values(&pattern, target - n_rows - 1);
 }
 
 /// Pads each component to its target size by appending trivial gates. The target sizes are passed

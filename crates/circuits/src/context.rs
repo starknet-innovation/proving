@@ -132,6 +132,25 @@ impl<Value: IValue> Context<Value> {
         Var { idx }
     }
 
+    /// Whether this context hands its values over and drops its gates once it is padded (see
+    /// [FinalizedContext::release_on_padding]).
+    pub fn releases_on_padding(&self) -> bool {
+        self.release_on_padding
+    }
+
+    /// Appends `count` copies of `pattern` as new variables, numbered after the existing ones, with
+    /// no gates. Only for a context released at padding, whose gates are dropped right after it
+    /// is padded: the values and the variable numbering are exactly those that `count` more
+    /// padding gates producing `pattern` each would have left.
+    pub fn append_released_padding_values(&mut self, pattern: &[Value], count: usize) {
+        assert!(self.release_on_padding, "only a context released at padding drops its gates");
+        self.values.reserve(pattern.len() * count);
+        for _ in 0..count {
+            self.values.extend_from_slice(pattern);
+        }
+        self.circuit.n_vars += pattern.len() * count;
+    }
+
     /// Returns the value of a variable.
     pub fn get(&self, var: Var) -> Value {
         assert!(!self.reserved_vars.contains(&var.idx), "read of reserved variable",);

@@ -51,6 +51,13 @@ pub type VeryPackedM31 = Vectorized<PackedM31, N_VERY_PACKED_ELEMS>;
 pub type VeryPackedCM31 = Vectorized<PackedCM31, N_VERY_PACKED_ELEMS>;
 pub type VeryPackedQM31 = Vectorized<PackedQM31, N_VERY_PACKED_ELEMS>;
 pub type VeryPackedBaseField = VeryPackedM31;
+
+/// Views a slice of packed base field elements as very packed ones, `N_VERY_PACKED_ELEMS` packed
+/// elements per very packed element (the same words, reinterpreted). Panics if the length is not a
+/// multiple of `N_VERY_PACKED_ELEMS`.
+pub fn as_very_packed_mut(packed: &mut [PackedM31]) -> &mut [VeryPackedM31] {
+    bytemuck::cast_slice_mut(packed)
+}
 pub type VeryPackedSecureField = VeryPackedQM31;
 
 impl VeryPackedM31 {

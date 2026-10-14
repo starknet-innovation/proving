@@ -186,6 +186,28 @@ impl Column<BaseField> for BaseColumn {
         column
     }
 
+    fn from_rows(len: usize, rows: &(dyn Fn(usize, &mut [BaseField]) + Sync)) -> Self {
+        // Each block of rows is written into a buffer on the stack and packed into the column,
+        // which receives every word once (no zeroed column first); the blocks run in parallel.
+        const BLOCK_ROWS: usize = 1 << 10;
+        const BLOCK_WORDS: usize = BLOCK_ROWS / N_LANES;
+        if len % BLOCK_ROWS != 0 {
+            return Self::from_fill(len, &|dst| rows(0, dst));
+        }
+        let block = |b: usize| -> [PackedBaseField; BLOCK_WORDS] {
+            let mut values = [BaseField::zero(); BLOCK_ROWS];
+            rows(b * BLOCK_ROWS, &mut values);
+            array::from_fn(|w| PackedBaseField::from_array(array::from_fn(|i| values[w * N_LANES + i])))
+        };
+        #[cfg(feature = "parallel")]
+        let blocks: Vec<[PackedBaseField; BLOCK_WORDS]> =
+            (0..len / BLOCK_ROWS).into_par_iter().map(block).collect();
+        #[cfg(not(feature = "parallel"))]
+        let blocks: Vec<[PackedBaseField; BLOCK_WORDS]> =
+            (0..len / BLOCK_ROWS).map(block).collect();
+        Self::from_simd(blocks.into_flattened())
+    }
+
     fn len(&self) -> usize {
         self.length
     }
