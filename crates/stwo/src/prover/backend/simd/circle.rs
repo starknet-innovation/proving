@@ -22,6 +22,7 @@ use crate::core::fields::{Field, FieldExpOps, batch_inverse};
 use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::core::poly::utils::{domain_line_twiddles_from_tree, fold, get_folding_alphas};
 use crate::core::utils::{SliceExt, bit_reverse_index};
+use crate::prover::air::component_prover::TraceSource;
 use crate::prover::backend::cpu::circle::slow_precompute_twiddles;
 use crate::prover::backend::simd::column::{BaseColumn, advise_pages};
 use crate::prover::backend::simd::fft::transpose_vecs;
@@ -846,6 +847,40 @@ impl PolyOps for SimdBackend {
         evaluate_from_prefix_simd(prefix, log_size, domain, targets, scratch)
     }
 
+    fn evaluate_from_source(
+        source: &dyn TraceSource,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+        scratch: &mut Col<Self, BaseField>,
+    ) -> Option<Vec<Vec<BaseField>>> {
+        evaluate_from_source_simd(source, domain, targets, scratch)
+    }
+
+    fn prepare_source_reads(log_size: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) {
+        if log_size >= 10 {
+            PrefixPlan::get(log_size, domain, targets, PlanInput::TraceCoset);
+        }
+    }
+
+    fn evaluate_from_coefficients(
+        coeffs: &CircleCoefficients<Self>,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+        scratch: &mut Col<Self, BaseField>,
+    ) -> Option<Vec<Vec<BaseField>>> {
+        evaluate_from_coefficients_simd(&coeffs.coeffs, domain, targets, scratch)
+    }
+
+    fn prepare_coefficient_reads(
+        log_size: u32,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+    ) {
+        if log_size >= 10 && bary_tail() {
+            PrefixPlan::get(log_size, domain, targets, PlanInput::Coefficients);
+        }
+    }
+
     fn evaluate_stripe_into(
         poly: &CircleCoefficients<Self>,
         domain: CircleDomain,
@@ -1274,31 +1309,114 @@ fn evaluate_from_prefix_mode(
     if log_size < 10 {
         return None;
     }
+    Some(evaluate_from_values(
+        log_size,
+        domain,
+        targets,
+        Some(&prefix.data),
+        scratch,
+        bary,
+        PlanInput::Stripe0,
+    ))
+}
+
+/// [`evaluate_from_prefix_simd`] for a column given by `source`, its values on its trace domain
+/// (the canonic coset of its size, in bit-reversed order), written into `scratch` and folded on
+/// that domain's inverse twiddles instead of stripe 0's. Both domains have the column's size, so
+/// the values on either determine its polynomial, and the folds evaluate that polynomial at the
+/// targets: the values are the ones stripe 0 gives.
+fn evaluate_from_source_simd(
+    source: &dyn TraceSource,
+    domain: CircleDomain,
+    targets: &[(usize, Vec<usize>)],
+    scratch: &mut BaseColumn,
+) -> Option<Vec<Vec<BaseField>>> {
+    let log_size = source.log_size();
+    if log_size < 10 {
+        return None;
+    }
+    // The source's rows in parallel runs, as `source_column` writes them.
+    const RUN: usize = 1 << 14;
+    let values = &mut scratch.as_mut_slice()[..1 << log_size];
+    #[cfg(feature = "parallel")]
+    values.par_chunks_mut(RUN).enumerate().for_each(|(i, run)| source.write_rows(i * RUN, run));
+    #[cfg(not(feature = "parallel"))]
+    values.chunks_mut(RUN).enumerate().for_each(|(i, run)| source.write_rows(i * RUN, run));
+    Some(evaluate_from_values(
+        log_size,
+        domain,
+        targets,
+        None,
+        scratch,
+        bary_tail(),
+        PlanInput::TraceCoset,
+    ))
+}
+
+/// [`evaluate_from_prefix_simd`] for a column given by its coefficients: the bary tail's sums run
+/// over the coefficient chunks with the basis' products as weights (no inverse layers, no scale),
+/// so no stripe of the column is evaluated. `None` without the bary tail or below 2^10 rows.
+fn evaluate_from_coefficients_simd(
+    coeffs: &BaseColumn,
+    domain: CircleDomain,
+    targets: &[(usize, Vec<usize>)],
+    scratch: &mut BaseColumn,
+) -> Option<Vec<Vec<BaseField>>> {
+    let log_size = coeffs.len().ilog2();
+    if log_size < 10 || !bary_tail() {
+        return None;
+    }
+    Some(evaluate_from_values(
+        log_size,
+        domain,
+        targets,
+        Some(&coeffs.data),
+        scratch,
+        true,
+        PlanInput::Coefficients,
+    ))
+}
+
+/// The evaluation of [`evaluate_from_prefix_mode`] on a column whose values on the domain of
+/// `input` are `prefix`'s vectors, or are already in `scratch` (`prefix` is `None`).
+fn evaluate_from_values(
+    log_size: u32,
+    domain: CircleDomain,
+    targets: &[(usize, Vec<usize>)],
+    prefix: Option<&[PackedBaseField]>,
+    scratch: &mut BaseColumn,
+    bary: bool,
+    input: PlanInput,
+) -> Vec<Vec<BaseField>> {
     let n = log_size;
-    let plan = PrefixPlan::get(n, domain, targets);
-    // 1. The first five inverse layers, chunk by chunk, in the caller's (pooled) scratch.
+    let plan = PrefixPlan::get(n, domain, targets, input);
     let n_vecs = 1usize << (n - LOG_N_LANES);
-    let unfolded = &mut scratch.data[..n_vecs];
-    unfolded.copy_from_slice(&prefix.data[..n_vecs]);
-    // The loop body of `ifft::ifft_lower_with_vecwise` for its first five layers.
-    let twiddles = plan.twiddles();
-    for (index, chunk) in unfolded.chunks_exact_mut(2).enumerate() {
+    // 1. The first five inverse layers of chunk `index` (two vectors): the loop body of
+    //    `ifft::ifft_lower_with_vecwise` for its first five layers.
+    let twiddles = if input == PlanInput::Coefficients { vec![] } else { plan.twiddles() };
+    let first_layers = |index: usize, val0: PackedBaseField, val1: PackedBaseField| {
+        if input == PlanInput::Coefficients {
+            return (val0, val1);
+        }
         let (val0, val1) = ifft::vecwise_ibutterflies(
-            chunk[0],
-            chunk[1],
+            val0,
+            val1,
             std::array::from_fn(|i| twiddles[0][index * 8 + i]),
             std::array::from_fn(|i| twiddles[1][index * 4 + i]),
             std::array::from_fn(|i| twiddles[2][index * 2 + i]),
         );
-        let (val0, val1) =
-            ifft::simd_ibutterfly(val0, val1, std::simd::u32x16::splat(twiddles[3][index]));
-        chunk[0] = val0;
-        chunk[1] = val1;
-    }
+        ifft::simd_ibutterfly(val0, val1, std::simd::u32x16::splat(twiddles[3][index]))
+    };
     // 2. The remaining layers, tile by tile, for every block.
     let n_chunks = 1usize << (n - PrefixPlan::LOW);
     let tile = 1usize << plan.tile_bits;
     if bary {
+        // The first layers are applied to each tile's chunks as the tile is read (the same
+        // operations on the same chunks), so the column is read once, in place.
+        let values: &[PackedBaseField] = match prefix {
+            Some(prefix) => &prefix[..n_vecs],
+            None => &scratch.data[..n_vecs],
+        };
         // Q722: one weighted accumulate per block, tile by tile so the column is read once.
         // The sums are kept exact in 64-bit lanes and reduced once per block. Every source word is
         // at most P and every weight below 2^31, so a product is below 2^62 and four products fit
@@ -1317,10 +1435,11 @@ fn evaluate_from_prefix_mode(
         // A tile's source vectors as even and odd u64 lanes, split once for all the blocks.
         let mut lanes = vec![[u64x8::splat(0); 4]; tile];
         for t in 0..n_chunks >> plan.tile_bits {
-            let src = &unfolded[2 * t * tile..2 * (t + 1) * tile];
             for (j, lane) in lanes.iter_mut().enumerate() {
-                let [e0, o0] = split(src[2 * j]);
-                let [e1, o1] = split(src[2 * j + 1]);
+                let (first, second, _) = chunk_vectors(n, input, t * tile + j);
+                let (val0, val1) = first_layers(t * tile + j, values[first], values[second]);
+                let [e0, o0] = split(val0);
+                let [e1, o1] = split(val1);
                 *lane = [e0, o0, e1, o1];
             }
             let tile_weights = &plan.tile_weights[t * plan.blocks.len() * tile..][..plan.blocks.len() * tile];
@@ -1358,7 +1477,17 @@ fn evaluate_from_prefix_mode(
                 out[block.target][k] = fold(&values, own) * plan.scale;
             }
         }
-        return Some(out);
+        return out;
+    }
+    // Without the bary tail, the first layers run over the whole column first, in the scratch.
+    if let Some(prefix) = prefix {
+        scratch.data[..n_vecs].copy_from_slice(&prefix[..n_vecs]);
+    }
+    let unfolded = &mut scratch.data[..n_vecs];
+    for (index, chunk) in unfolded.chunks_exact_mut(2).enumerate() {
+        let (val0, val1) = first_layers(index, chunk[0], chunk[1]);
+        chunk[0] = val0;
+        chunk[1] = val1;
     }
     let mut level: Vec<Vec<[PackedBaseField; 2]>> =
         plan.blocks.iter().map(|_| Vec::with_capacity(n_chunks >> plan.tile_bits)).collect();
@@ -1407,7 +1536,7 @@ fn evaluate_from_prefix_mode(
             out[block.target][k] = fold(&values, own) * plan.scale;
         }
     }
-    Some(out)
+    out
 }
 
 /// The column-independent part of [`evaluate_from_prefix_simd`] for one column size and set of
@@ -1428,6 +1557,42 @@ static PREFIX_PLANS: std::sync::LazyLock<
 pub fn clear_stripe_caches() {
     SUBDOMAIN_TWIDDLES.lock().unwrap().clear();
     PREFIX_PLANS.lock().unwrap().clear();
+}
+
+/// The domain whose values a [`PrefixPlan`] folds: stripe 0 of the column's extension, or the
+/// column's trace domain (the canonic coset of its size), whose values a sourced column
+/// reproduces.
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum PlanInput {
+    Stripe0,
+    TraceCoset,
+    /// The column's coefficients: no inverse layers, and the folds are the basis' own products.
+    Coefficients,
+}
+
+/// The two vectors (indices into the column's packed vectors) of chunk `chunk` of a column of
+/// `log_size` given by `input`, in the order the bary tail reads the chunks, and the column's chunk
+/// (the two vectors `2j` and `2j + 1` of its natural order) that they hold. Evaluations and small
+/// coefficient columns are in natural order. The SIMD inverse FFT leaves the coefficients of a
+/// larger column with the low and high halves of their vector index swapped (see
+/// `transpose_vecs`), so a natural chunk is the vector pair that differs in the bit the low bit
+/// moved to; the tail reads those pairs in stored order, and plans its weights in that order.
+fn chunk_vectors(log_size: u32, input: PlanInput, chunk: usize) -> (usize, usize, usize) {
+    if input != PlanInput::Coefficients || log_size <= CACHED_FFT_LOG_SIZE {
+        return (2 * chunk, 2 * chunk + 1, chunk);
+    }
+    let log_n_vecs = (log_size - LOG_N_LANES) as usize;
+    let half = log_n_vecs / 2;
+    let pair_bit = log_n_vecs - half;
+    let low = chunk & ((1 << pair_bit) - 1);
+    let first = ((chunk >> pair_bit) << (pair_bit + 1)) | low;
+    // The natural index of `first`: its low and high `half` bits swapped back.
+    let low_bits = first & ((1 << half) - 1);
+    let high_bits = first >> (log_n_vecs - half);
+    let middle = first & !((1 << half) - 1) & ((1 << (log_n_vecs - half)) - 1);
+    let natural = (low_bits << (log_n_vecs - half)) | middle | high_bits;
+    debug_assert_eq!(natural & 1, 0);
+    (first, first | (1 << pair_bit), natural >> 1)
 }
 
 struct PrefixPlan {
@@ -1479,6 +1644,16 @@ fn fold_weights(coeffs: &[Vec<BaseField>]) -> Vec<BaseField> {
     w
 }
 
+/// The weight of every chunk of coefficients under the factors `alphas` (layer 0 pairs chunks):
+/// the product of the factors of the layers whose bit is set in the chunk's index.
+fn basis_weights(alphas: &[BaseField]) -> Vec<BaseField> {
+    let mut w = vec![BaseField::from(1u32)];
+    for &alpha in alphas.iter().rev() {
+        w = w.iter().flat_map(|&w| [w, w * alpha]).collect();
+    }
+    w
+}
+
 impl PrefixPlan {
     const LOW: u32 = 5;
 
@@ -1486,23 +1661,32 @@ impl PrefixPlan {
         domain_line_twiddles_from_tree(self.subdomain, &self.sub_twiddles.itwiddles)
     }
 
-    fn get(n: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) -> std::sync::Arc<Self> {
+    fn get(
+        n: u32,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+        input: PlanInput,
+    ) -> std::sync::Arc<Self> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (n, domain.log_size(), domain.half_coset.initial_index.0, targets).hash(&mut hasher);
+        (n, domain.log_size(), domain.half_coset.initial_index.0, targets, input).hash(&mut hasher);
         let key = hasher.finish();
         if let Some(plan) = PREFIX_PLANS.lock().unwrap().get(&key) {
             return plan.clone();
         }
         // Planned outside the lock: planning may run on the thread pool, whose other workers may
         // be waiting for this lock (a blocking lock held across a join deadlocks).
-        let plan = std::sync::Arc::new(Self::new(n, domain, targets));
+        let plan = std::sync::Arc::new(Self::new(n, domain, targets, input));
         PREFIX_PLANS.lock().unwrap().entry(key).or_insert(plan).clone()
     }
 
-    fn new(n: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) -> Self {
+    fn new(n: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)], input: PlanInput) -> Self {
         let low = Self::LOW;
-        let subdomain = domain.split(domain.log_size() - n).0;
+        let subdomain = match input {
+            // Coefficients use no twiddles: the subdomain is kept for the plan's shape only.
+            PlanInput::Stripe0 | PlanInput::Coefficients => domain.split(domain.log_size() - n).0,
+            PlanInput::TraceCoset => CanonicCoset::new(n).circle_domain(),
+        };
         let sub_twiddles = SimdBackend::subdomain_twiddles(subdomain.half_coset);
         let twiddles = domain_line_twiddles_from_tree(subdomain, &sub_twiddles.itwiddles);
         // The blocks are independent: built in parallel, collected in target and row order.
@@ -1538,7 +1722,19 @@ impl PrefixPlan {
                             .collect()
                     })
                     .collect();
-                let weights = if bary_tail() { fold_weights(&coeffs) } else { vec![] };
+                // With the bary tail the weights replace the coefficients, which nothing reads
+                // after this: they are not kept with the plan.
+                let (weights, coeffs) = if input == PlanInput::Coefficients {
+                    // On coefficients a fold is the basis' product: chunk `j` is weighted by the
+                    // block's factor of every folded layer whose bit is set in `j`.
+                    let alphas: Vec<BaseField> =
+                        (0..(n - low) as usize).map(|layer| factors[0][low as usize + layer]).collect();
+                    (basis_weights(&alphas), vec![])
+                } else if bary_tail() {
+                    (fold_weights(&coeffs), vec![])
+                } else {
+                    (vec![], coeffs)
+                };
                 PrefixBlock {
                     target,
                     rows: start..start + block.len(),
@@ -1561,8 +1757,10 @@ impl PrefixPlan {
             let run = |i: usize| -> [u32; 64] {
                 let (t, b) = (i / n_blocks, i % n_blocks);
                 let mut run = [0u32; 64];
-                for (dst, w) in run.iter_mut().zip(&blocks[b].weights[t * tile..(t + 1) * tile]) {
-                    *dst = w.0;
+                for (j, dst) in run[..tile].iter_mut().enumerate() {
+                    // The weight of the chunk the tail reads at this place (see `chunk_vectors`).
+                    let (_, _, natural) = chunk_vectors(n, input, t * tile + j);
+                    *dst = blocks[b].weights[natural].0;
                 }
                 run
             };
@@ -1589,7 +1787,11 @@ impl PrefixPlan {
             tile_bits,
             blocks,
             tile_weights,
-            scale: BaseField::from(1u32 << n).inverse(),
+            scale: if input == PlanInput::Coefficients {
+                BaseField::from(1u32)
+            } else {
+                BaseField::from(1u32 << n).inverse()
+            },
         }
     }
 }

@@ -7,7 +7,7 @@ use crate::core::circle::{CirclePoint, Coset};
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::poly::circle::{CanonicCoset, CircleDomain};
-use crate::prover::air::component_prover::Poly;
+use crate::prover::air::component_prover::{Poly, TraceSource};
 use crate::prover::backend::{Col, ColumnOps};
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::poly::BitReversedOrder;
@@ -181,6 +181,50 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         _scratch: &mut Col<Self, BaseField>,
     ) -> Option<Vec<Vec<BaseField>>> {
         None
+    }
+
+    /// [`Self::evaluate_from_prefix`] for a column that stores no values and reproduces its
+    /// values on its trace domain (the canonic coset of its size, in bit-reversed order) from
+    /// `source`: they are written into `scratch` and read in place of stripe 0. `None` where the
+    /// backend does not support it (the caller then regrows the coefficients).
+    fn evaluate_from_source(
+        _source: &dyn TraceSource,
+        _domain: CircleDomain,
+        _targets: &[(usize, Vec<usize>)],
+        _scratch: &mut Col<Self, BaseField>,
+    ) -> Option<Vec<Vec<BaseField>>> {
+        None
+    }
+
+    /// Prepares what [`Self::evaluate_from_source`] needs for every column of `log_size` on
+    /// `domain` read at `targets`, so that the columns of that size can be read concurrently
+    /// without each preparing it.
+    fn prepare_source_reads(
+        _log_size: u32,
+        _domain: CircleDomain,
+        _targets: &[(usize, Vec<usize>)],
+    ) {
+    }
+
+    /// [`Self::evaluate_from_prefix`] for a column that keeps its coefficients and no stripe: its
+    /// rows in every stripe of `targets`, evaluated from `coeffs` without evaluating a stripe.
+    /// `None` where the backend does not support it (the caller then evaluates the stripes).
+    fn evaluate_from_coefficients(
+        _coeffs: &CircleCoefficients<Self>,
+        _domain: CircleDomain,
+        _targets: &[(usize, Vec<usize>)],
+        _scratch: &mut Col<Self, BaseField>,
+    ) -> Option<Vec<Vec<BaseField>>> {
+        None
+    }
+
+    /// Prepares what [`Self::evaluate_from_coefficients`] needs for every column of `log_size` on
+    /// `domain` read at `targets` (see [`Self::prepare_source_reads`]).
+    fn prepare_coefficient_reads(
+        _log_size: u32,
+        _domain: CircleDomain,
+        _targets: &[(usize, Vec<usize>)],
+    ) {
     }
 
     /// Writes the `stripe`-th contiguous block of [`Self::evaluate`]'s output on `domain`, of

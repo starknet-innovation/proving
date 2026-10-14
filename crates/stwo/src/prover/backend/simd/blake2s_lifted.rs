@@ -505,7 +505,7 @@ impl<'a> LeavesPlan<'a> {
         let lifting_indices =
             get_lifting_indices(columns.iter().map(|c| c.data.len()), last_chunk_index);
         let mut byte_count = 0_u64;
-        let mut passes: Vec<Pass> = lifting_indices
+        let passes: Vec<Pass> = lifting_indices
             .into_iter()
             .tuple_windows()
             .map(|(start, end)| {
@@ -525,6 +525,22 @@ impl<'a> LeavesPlan<'a> {
                 pass
             })
             .collect();
+        // A pass whose columns all have the size of the previous pass's domain continues that pass:
+        // its chunks are hashed as further chunks of it, with the same byte counts, instead of in a
+        // pass of its own over the same domain.
+        let mut passes = passes.into_iter().fold(Vec::<Pass>::new(), |mut merged, pass| {
+            match merged.last_mut() {
+                Some(last)
+                    if last.log_size == pass.log_size
+                        && last.end == pass.start
+                        && pass.msg_log_ratios.iter().all(|&ratio| ratio == 0) =>
+                {
+                    last.end = pass.end;
+                }
+                _ => merged.push(pass),
+            }
+            merged
+        });
         let tail_log_ratios: Vec<u32> = columns[last_chunk_index..]
             .iter()
             .map(|column| max_log_size - column.data.len().ilog2())

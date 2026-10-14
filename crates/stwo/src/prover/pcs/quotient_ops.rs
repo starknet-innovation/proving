@@ -13,7 +13,7 @@ use crate::core::pcs::quotients::{
     ColumnSampleBatch, PointSample, build_samples_with_randomness_and_periodicity,
     quotient_constants,
 };
-use crate::core::poly::circle::CircleDomain;
+use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::prover::AccumulationOps;
 use crate::prover::air::component_prover::Poly;
 use crate::prover::backend::{Backend, Col, Column, ColumnOps};
@@ -236,6 +236,66 @@ pub fn compute_fri_quotients_with_regrowth<B: Backend>(
     // before their transforms.
     for group in regrown_groups {
         let sourced = sourced.unwrap();
+        // The columns that keep their coefficients (no stripe) and those with a source.
+        let (coefficient_group, group): (Vec<_>, Vec<_>) = group
+            .into_iter()
+            .partition(|&(_, &(tree, column))| sourced(tree, column).coeffs.is_some());
+        if !coefficient_group.is_empty() {
+            let polys: Vec<&Poly<B>> =
+                coefficient_group.iter().map(|&(_, &(tree, column))| sourced(tree, column)).collect();
+            let group_samples: Vec<&Vec<(PointSample, SecureField)>> =
+                coefficient_group.iter().map(|((_, s), _)| *s).collect();
+            let domain: CircleDomain = coefficient_group[0].0.0.domain;
+            if coefficient_group.iter().all(|((c, _), _)| c.domain == domain)
+                && combines_coefficient_columns(&polys, &group_samples)
+            {
+                for accumulation in
+                    combined_coefficient_accumulations(&polys, &group_samples, domain, twiddles)
+                {
+                    add_accumulation(&mut accumulated_numerators_vec, accumulation);
+                }
+            } else {
+                // Too few columns to save transforms: each one's stripe 0, a batch at a time.
+                let stripe0 = |poly: &Poly<B>| {
+                    let coeffs = poly.coeffs.as_ref().unwrap();
+                    let mut values = Col::<B, BaseField>::zeros(1 << coeffs.log_size());
+                    B::evaluate_stripe_into(coeffs, poly.evals.domain, twiddles, 0, &mut values);
+                    let mut evals = CircleEvaluation::new(
+                        CanonicCoset::new(coeffs.log_size()).circle_domain(),
+                        values,
+                    );
+                    evals.domain = poly.evals.domain;
+                    evals
+                };
+                for batch in coefficient_group.chunks(REGROWN_BATCH) {
+                    #[cfg(feature = "parallel")]
+                    let stripes: Vec<_> = batch
+                        .par_iter()
+                        .map(|&(_, &(tree, column))| stripe0(sourced(tree, column)))
+                        .collect();
+                    #[cfg(not(feature = "parallel"))]
+                    let stripes: Vec<_> =
+                        batch.iter().map(|&(_, &(tree, column))| stripe0(sourced(tree, column))).collect();
+                    let stripes = stripes.iter().collect_vec();
+                    let samples_with_randomness = batch.iter().map(|((_, s), _)| *s).collect_vec();
+                    let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
+                    #[cfg(feature = "parallel")]
+                    let accumulations: Vec<Vec<AccumulatedNumerators<B>>> = sample_batches
+                        .par_iter()
+                        .map(|batch| accumulate_batch(&stripes, batch))
+                        .collect();
+                    #[cfg(not(feature = "parallel"))]
+                    let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+                        sample_batches.iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
+                    for accumulation in accumulations.into_iter().flatten() {
+                        add_accumulation(&mut accumulated_numerators_vec, accumulation);
+                    }
+                }
+            }
+        }
+        if group.is_empty() {
+            continue;
+        }
         let polys: Vec<&Poly<B>> =
             group.iter().map(|&(_, &(tree, column))| sourced(tree, column)).collect();
         let group_samples: Vec<&Vec<(PointSample, SecureField)>> =
@@ -398,6 +458,84 @@ fn combined_sourced_accumulations<B: Backend>(
             let sum = sum.expect("every sample point has columns");
             let mut partial_numerators_acc =
                 stripe0_of_coordinates(sum, trace_domain, domain, twiddles);
+            let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
+            B::canonicalize_and_subtract(&mut partial_numerators_acc, b_sum);
+            AccumulatedNumerators {
+                sample_point: batch.point,
+                partial_numerators_acc,
+                first_linear_term_acc: coeffs.iter().map(|(a, ..)| *a).sum(),
+            }
+        })
+        .collect()
+}
+
+/// Whether the columns of one size that keep their coefficients, `polys`, sampled at `samples`,
+/// are combined before their transforms by [`combined_coefficient_accumulations`]: the backend
+/// supports it, every coefficient column has the same log size, at least
+/// [`MIN_COMBINED_LOG_SIZE`], and the combination saves transforms (one per coordinate and sample
+/// point, four per point, where the per-column path transforms each column once).
+fn combines_coefficient_columns<B: Backend>(
+    polys: &[&Poly<B>],
+    samples: &[&Vec<(PointSample, SecureField)>],
+) -> bool {
+    if !B::COMBINES_SOURCED_COLUMNS {
+        return false;
+    }
+    let Some(log_size) = polys.first().and_then(|poly| poly.coeffs.as_ref()).map(|c| c.log_size())
+    else {
+        return false;
+    };
+    if log_size < MIN_COMBINED_LOG_SIZE
+        || polys.iter().any(|poly| poly.coeffs.as_ref().map(|c| c.log_size()) != Some(log_size))
+    {
+        return false;
+    }
+    let n_points = ColumnSampleBatch::new_vec(samples).len();
+    polys.len() > SECURE_EXTENSION_DEGREE * n_points
+}
+
+/// [`combined_sourced_accumulations`] for columns that keep their coefficients: per sample point
+/// the coefficients are summed as `∑ cᵢ * coeffsᵢ` over the point's columns, and each of the four
+/// coordinates of the sum is evaluated on stripe 0 of `domain` once, canonicalized, and offset by
+/// `-∑ bᵢ`. Evaluation is linear, so stripe 0 of the sum is `∑ cᵢ * fᵢ`, `fᵢ` column `i`'s stripe 0
+/// (the one the column would get back as its stripe 0), modulo `P`; once canonical the values are
+/// those of the per-column path word for word, as in [`combined_sourced_accumulations`].
+fn combined_coefficient_accumulations<B: Backend>(
+    polys: &[&Poly<B>],
+    samples: &[&Vec<(PointSample, SecureField)>],
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<B>,
+) -> Vec<AccumulatedNumerators<B>> {
+    let sample_batches: Vec<ColumnSampleBatch> = ColumnSampleBatch::new_vec(samples);
+    let line_coeffs: Vec<Vec<(SecureField, SecureField, SecureField)>> =
+        quotient_constants(&sample_batches).line_coeffs;
+    let log_size = polys[0].coeffs.as_ref().expect("coefficient columns").log_size();
+    zip(sample_batches, line_coeffs)
+        .map(|(batch, coeffs)| {
+            let terms: Vec<(&Col<B, BaseField>, SecureField)> = zip(&batch.cols_vals_randpows, &coeffs)
+                .map(|(data, &(_, _, c))| {
+                    (&polys[data.column_index].coeffs.as_ref().unwrap().coeffs, c)
+                })
+                .collect();
+            let mut sum = SecureColumnByCoords::<B>::zeros(1 << log_size);
+            B::accumulate_weighted_columns(&mut sum, &terms);
+            let evaluate = |column: Col<B, BaseField>| {
+                let mut stripe = Col::<B, BaseField>::zeros(1 << log_size);
+                B::evaluate_stripe_into(&CircleCoefficients::new(column), domain, twiddles, 0, &mut stripe);
+                stripe
+            };
+            let [c0, c1, c2, c3] = sum.columns;
+            #[cfg(feature = "parallel")]
+            let columns = {
+                let ((s0, s1), (s2, s3)) = rayon::join(
+                    || rayon::join(|| evaluate(c0), || evaluate(c1)),
+                    || rayon::join(|| evaluate(c2), || evaluate(c3)),
+                );
+                [s0, s1, s2, s3]
+            };
+            #[cfg(not(feature = "parallel"))]
+            let columns = [evaluate(c0), evaluate(c1), evaluate(c2), evaluate(c3)];
+            let mut partial_numerators_acc = SecureColumnByCoords { columns };
             let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
             B::canonicalize_and_subtract(&mut partial_numerators_acc, b_sum);
             AccumulatedNumerators {

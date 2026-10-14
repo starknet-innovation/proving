@@ -157,37 +157,6 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         }
     }
 
-    /// Undoes [`Self::striped_to_coefficients`]: a column that holds coefficients and no stripe
-    /// gets its stripe 0 back, and drops the coefficients.
-    fn coefficients_to_striped(&mut self) {
-        let twiddles = self.twiddles;
-        let pool = &self.base_column_pool;
-        for tree in &mut self.trees.0 {
-            if let MaybeOwned::Owned(tree) = tree {
-                let to_stripe = |poly: &mut Poly<B>| {
-                    if poly.evals.values.len() == 0 {
-                        let coeffs = poly.coeffs.take().unwrap();
-                        let log_size = coeffs.log_size();
-                        let mut stripe = pool.take_or_alloc(log_size);
-                        B::evaluate_stripe_into(&coeffs, poly.evals.domain, twiddles, 0, &mut stripe);
-                        poly.evals.values = stripe;
-                        // The coefficients are dead once stripe 0 is back. Their buffer is
-                        // resident, so it serves as the next column's stripe instead of a fresh
-                        // allocation whose pages the kernel would zero first.
-                        pool.give_back(log_size, coeffs.coeffs);
-                    }
-                };
-                #[cfg(feature = "parallel")]
-                {
-                    use rayon::iter::IntoParallelRefMutIterator;
-                    tree.polynomials.par_iter_mut().for_each(to_stripe);
-                }
-                #[cfg(not(feature = "parallel"))]
-                tree.polynomials.iter_mut().for_each(to_stripe);
-            }
-        }
-    }
-
     pub fn trace(&self) -> Trace<'_, B> {
         let polys = self.polynomials();
         Trace { polys, twiddles: Some(self.twiddles) }
@@ -482,10 +451,11 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Evaluate polynomials on open points.
         let samples = self.compute_samples(&sampled_points, lifting_log_size);
 
-        // The regrown stripes take the idle weight buffers and each other's dead coefficient
-        // buffers; the pool is emptied once they are back. Quotient and opening paths own their
-        // buffers.
-        self.coefficients_to_striped();
+        // A striped column that keeps its coefficients keeps them through the quotients and the
+        // decommitment instead of getting its stripe 0 back: the quotients combine the
+        // coefficient columns of a size before one transform per coordinate, and the
+        // decommitment evaluates their rows from the coefficients. Quotient and opening paths
+        // own their buffers.
         self.base_column_pool.release_all_idle();
         crate::prover::backend::simd::column::trim_heap();
         // Point samples are complete; subsequent quotient and opening paths use evaluations.
@@ -712,6 +682,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
         let _span = span!(Level::INFO, "Commitment").entered();
         self.commitment_scheme.commit(self.polys, channel);
     }
+
 }
 
 /// Prover data for a single commitment tree in a commitment scheme. The commitment scheme allows to
@@ -887,8 +858,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             })
             .collect_vec();
         // With `keep_coef`, a prefix column keeps its coefficients instead of stripe 0 (the same size):
-        // composition and the samples read coefficients, and stripe 0 is evaluated back only for
-        // the quotients (`coefficients_to_striped`).
+        // composition, the samples, the quotients (which combine the columns of a size before their
+        // transforms) and the decommitment read coefficients.
         // Prefix columns get their stripe-0 buffer now (the last stripe hashed, which the FFT writes
         // in place). Whole-extension columns are evaluated now.
         let mut evals = polynomials
@@ -1004,13 +975,22 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         let stripe_layers = stripe_layers.into_iter().map(Option::unwrap).collect_vec();
 
         // Level `l` of the tree, up to the stripes' roots, is the concatenation of the stripes'
-        // levels `l`, in stripe order.
-        let mut layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> = (0
-            ..=stripe_lifting_log_size as usize)
-            .map(|level| {
-                stripe_layers.iter().flat_map(|layers| layers[level].to_cpu()).collect()
-            })
-            .collect();
+        // levels `l`, in stripe order: gathered at its final size, on the pool.
+        let gather = |level: usize| -> Col<B, <MC::H as MerkleHasherLifted>::Hash> {
+            let parts = stripe_layers.iter().map(|layers| &layers[level]).collect_vec();
+            let len = parts[0].len();
+            let at = |i: usize| parts[i / len].at(i % len);
+            #[cfg(feature = "parallel")]
+            let values: Vec<_> = {
+                use rayon::iter::IntoParallelIterator;
+                (0..parts.len() * len).into_par_iter().map(at).collect()
+            };
+            #[cfg(not(feature = "parallel"))]
+            let values: Vec<_> = (0..parts.len() * len).map(at).collect();
+            values.into_iter().collect()
+        };
+        let mut layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> =
+            (0..=stripe_lifting_log_size as usize).map(gather).collect();
         drop(stripe_layers);
         for _ in stripe_lifting_log_size..lifting_log_size {
             let next = B::build_next_layer(layers.last().unwrap());
@@ -1141,6 +1121,54 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                         .collect();
                 }
             }
+            // A column that keeps its coefficients and no stripe (see `prove_values`): its rows in
+            // every stripe are evaluated from the coefficients, with no stripe evaluated.
+            if let Some(coeffs) = poly.coeffs.as_ref().filter(|_| poly.evals.values.is_empty()) {
+                let log_size = coeffs.log_size();
+                let targets =
+                    stripes.iter().map(|&stripe| (stripe, rows_of(log_size, stripe))).collect_vec();
+                // The coefficients are read in place: the scratch is not written.
+                let mut scratch = Col::<B, BaseField>::zeros(0);
+                if let Some(values) =
+                    B::evaluate_from_coefficients(coeffs, poly.evals.domain, &targets, &mut scratch)
+                {
+                    let shift = stripe_log_size - log_size;
+                    return positions
+                        .iter()
+                        .map(|&position| {
+                            let stripe = position >> stripe_log_size;
+                            let local = position - (stripe << stripe_log_size);
+                            let row = (local >> (shift + 1) << 1) + (local & 1);
+                            let t = targets.iter().position(|(s, _)| *s == stripe).unwrap();
+                            values[t][targets[t].1.binary_search(&row).unwrap()]
+                        })
+                        .collect();
+                }
+            }
+            // A sourced column keeps no stripe: its rows in every stripe are evaluated the same
+            // way, from its trace values, which the source writes into the scratch.
+            if let Some(source) = poly.source.as_deref().filter(|_| poly.is_sourced()) {
+                let log_size = source.log_size();
+                let targets =
+                    stripes.iter().map(|&stripe| (stripe, rows_of(log_size, stripe))).collect_vec();
+                let mut scratch = base_column_pool.take_or_alloc(log_size);
+                let values =
+                    B::evaluate_from_source(source, poly.evals.domain, &targets, &mut scratch);
+                base_column_pool.give_back(log_size, scratch);
+                if let Some(values) = values {
+                    let shift = stripe_log_size - log_size;
+                    return positions
+                        .iter()
+                        .map(|&position| {
+                            let stripe = position >> stripe_log_size;
+                            let local = position - (stripe << stripe_log_size);
+                            let row = (local >> (shift + 1) << 1) + (local & 1);
+                            let t = targets.iter().position(|(s, _)| *s == stripe).unwrap();
+                            values[t][targets[t].1.binary_search(&row).unwrap()]
+                        })
+                        .collect();
+                }
+            }
             let regrown = poly.coeffs.is_none().then(|| poly.regrown_coefficients());
             let coeffs = poly.coeffs.as_ref().or(regrown.as_ref()).unwrap();
             let len = 1usize << coeffs.log_size();
@@ -1183,11 +1211,48 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             })
             .map(|(i, _)| i)
             .collect_vec();
+        // A sourced column's plan (on its trace domain, for every stripe) is prepared beside those
+        // first reads, without reading a column, so that the sourced columns of a size are all read
+        // at once after it, the large ones as soon as the reads start.
+        let source_plans = self
+            .polynomials
+            .iter()
+            .filter(|poly| poly.is_sourced())
+            .map(|poly| (poly.source.as_ref().unwrap().log_size(), poly.evals.domain))
+            .unique_by(|&(log_size, domain)| {
+                (log_size, domain.log_size(), domain.half_coset.initial_index.0)
+            })
+            .collect_vec();
+        let prepare_source_plan = |&(log_size, domain): &(u32, CircleDomain)| {
+            let targets =
+                stripes.iter().map(|&stripe| (stripe, rows_of(log_size, stripe))).collect_vec();
+            B::prepare_source_reads(log_size, domain, &targets);
+        };
+        // So is the plan of the columns that keep their coefficients and no stripe.
+        let coefficient_plans = self
+            .polynomials
+            .iter()
+            .filter(|poly| poly.coeffs.is_some() && poly.evals.values.is_empty())
+            .map(|poly| (poly.coeffs.as_ref().unwrap().log_size(), poly.evals.domain))
+            .unique_by(|&(log_size, domain)| {
+                (log_size, domain.log_size(), domain.half_coset.initial_index.0)
+            })
+            .collect_vec();
+        let prepare_coefficient_plan = |&(log_size, domain): &(u32, CircleDomain)| {
+            let targets =
+                stripes.iter().map(|&stripe| (stripe, rows_of(log_size, stripe))).collect_vec();
+            B::prepare_coefficient_reads(log_size, domain, &targets);
+        };
         #[cfg(feature = "parallel")]
         let rows: Vec<Vec<BaseField>> = {
-            use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator};
-            let read =
-                first_of_size.par_iter().map(|&i| read_rows(&self.polynomials[i])).collect::<Vec<_>>();
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
+            let (read, ()) = rayon::join(
+                || first_of_size.par_iter().map(|&i| read_rows(&self.polynomials[i])).collect::<Vec<_>>(),
+                || {
+                    source_plans.par_iter().for_each(prepare_source_plan);
+                    coefficient_plans.par_iter().for_each(prepare_coefficient_plan);
+                },
+            );
             let mut first_rows = vec![None; self.polynomials.len()];
             for (&i, rows) in first_of_size.iter().zip(read) {
                 first_rows[i] = Some(rows);
@@ -1201,6 +1266,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         #[cfg(not(feature = "parallel"))]
         let rows: Vec<Vec<BaseField>> = {
             let _ = first_of_size;
+            source_plans.iter().for_each(prepare_source_plan);
+            coefficient_plans.iter().for_each(prepare_coefficient_plan);
             self.polynomials.iter().map(read_rows).collect()
         };
         base_column_pool.release_all_idle();
