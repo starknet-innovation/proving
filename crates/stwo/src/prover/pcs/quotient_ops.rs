@@ -7,15 +7,20 @@ use tracing::{Level, span};
 
 use crate::core::circle::CirclePoint;
 use crate::core::fields::m31::BaseField;
-use crate::core::fields::qm31::SecureField;
+use crate::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use crate::core::pcs::TreeVec;
 use crate::core::pcs::quotients::{
     ColumnSampleBatch, PointSample, build_samples_with_randomness_and_periodicity,
+    quotient_constants,
 };
+use crate::core::poly::circle::CircleDomain;
 use crate::prover::AccumulationOps;
-use crate::prover::backend::{Column, ColumnOps};
+use crate::prover::air::component_prover::Poly;
+use crate::prover::backend::{Backend, Col, Column, ColumnOps};
 use crate::prover::poly::BitReversedOrder;
-use crate::prover::poly::circle::{CircleEvaluation, PolyOps, SecureEvaluation};
+use crate::prover::poly::circle::{
+    CircleCoefficients, CircleEvaluation, PolyOps, SecureEvaluation,
+};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::secure_column::SecureColumnByCoords;
 
@@ -52,6 +57,29 @@ pub trait QuotientOps: PolyOps {
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
     ) -> SecureEvaluation<Self, BitReversedOrder>;
+
+    /// Whether the backend implements [`Self::accumulate_weighted_columns`] and
+    /// [`Self::canonicalize_and_subtract`], with which [`compute_fri_quotients_with_regrowth`]
+    /// combines the sourced columns of a size before their transforms.
+    const COMBINES_SOURCED_COLUMNS: bool = false;
+
+    /// Adds `∑ cᵢ * columnᵢ` to `acc` row by row, over `terms` = `(columnᵢ, cᵢ)`, columns of the
+    /// length of `acc` with values in `[0, P]`. Every value of `acc` is left in `[0, P)`.
+    fn accumulate_weighted_columns(
+        _acc: &mut SecureColumnByCoords<Self>,
+        _terms: &[(&Col<Self, BaseField>, SecureField)],
+    ) {
+        unimplemented!("combined sourced columns are not supported by this backend")
+    }
+
+    /// Maps every value of `numerators` to its canonical representative in `[0, P)` (a
+    /// transform may return `P` for zero), then subtracts `b_sum` from every row.
+    fn canonicalize_and_subtract(
+        _numerators: &mut SecureColumnByCoords<Self>,
+        _b_sum: SecureField,
+    ) {
+        unimplemented!("combined sourced columns are not supported by this backend")
+    }
 }
 
 /// Helper struct that keeps track of the accumulation of the numerators involved in the FRI
@@ -85,7 +113,7 @@ pub struct AccumulatedNumerators<B: ColumnOps<BaseField>> {
     pub first_linear_term_acc: SecureField,
 }
 
-pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
+pub fn compute_fri_quotients<B: Backend>(
     columns: &TreeVec<Vec<&CircleEvaluation<B, BaseField, BitReversedOrder>>>,
     samples: &TreeVec<Vec<Vec<PointSample>>>,
     random_coeff: SecureField,
@@ -104,22 +132,31 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     )
 }
 
-/// Regrows the stripe-0 evaluation of the column `(tree, column)` that stores no values.
-pub type RegrowStripe<'a, B> =
-    dyn Fn(usize, usize) -> CircleEvaluation<B, BaseField, BitReversedOrder> + Sync + 'a;
+/// The polynomial of the column `(tree, column)` that stores no values: a sourced column (see
+/// [`Poly::is_sourced`]), whose values are reproduced from its trace source.
+pub type SourcedColumn<'a, B> = dyn Fn(usize, usize) -> &'a Poly<B> + Sync + 'a;
 
-/// The most stored-nothing columns whose stripe 0 is regrown at once in
-/// [`compute_fri_quotients_with_regrowth`]: the regrown stripes are its only extra memory.
+/// The most stored-nothing columns whose stripe 0 (or trace values, when combined) are regrown at
+/// once in [`compute_fri_quotients_with_regrowth`]: the regrown columns are its only extra memory.
 const REGROWN_BATCH: usize = 16;
 
+/// The smallest log size of the sourced columns that are combined before their transforms (the
+/// smallest size the SIMD transforms run at, `simd::fft::MIN_FFT_LOG_SIZE`): smaller columns have
+/// no transform cost to save.
+const MIN_COMBINED_LOG_SIZE: u32 = 5;
+
 /// [`compute_fri_quotients`] where some columns store no values (an empty evaluation on their
-/// domain) and `regrow` reproduces their stripe 0. Their numerators are accumulated
-/// [`REGROWN_BATCH`] columns at a time and added to those of the stored columns of the same size
-/// and sample point. Field addition is exact, so the accumulations, and the quotients, are those
-/// of a single pass over every column.
-pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
+/// domain) and `sourced` gives their polynomials, which reproduce them. Their numerators are
+/// accumulated [`REGROWN_BATCH`] columns at a time and added to those of the stored columns of the
+/// same size and sample point. Field addition is exact, so the accumulations, and the quotients,
+/// are those of a single pass over every column.
+///
+/// Where the backend supports it and it saves transforms, the sourced columns of a size are
+/// combined before their transforms instead of regrowing each one's stripe 0: see
+/// [`combined_sourced_accumulations`].
+pub fn compute_fri_quotients_with_regrowth<B: Backend>(
     columns: &TreeVec<Vec<&CircleEvaluation<B, BaseField, BitReversedOrder>>>,
-    regrow: Option<&RegrowStripe<'_, B>>,
+    sourced: Option<&SourcedColumn<'_, B>>,
     samples: &TreeVec<Vec<Vec<PointSample>>>,
     random_coeff: SecureField,
     lifting_log_size: u32,
@@ -149,7 +186,7 @@ pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
         .flat_map(|(tree, columns)| (0..columns.len()).map(move |column| (tree, column)))
         .collect_vec();
     let is_regrown = |column: &CircleEvaluation<B, BaseField, BitReversedOrder>| {
-        regrow.is_some() && column.values.len() == 0
+        sourced.is_some() && column.values.len() == 0
     };
     let mut regrown_groups = vec![];
     let groups: Vec<(Vec<_>, Vec<ColumnSampleBatch>)> = zip(
@@ -195,9 +232,27 @@ pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
         .collect();
     accumulated_numerators_vec.extend(accumulations.into_iter().flatten());
 
-    // The columns that store no values, a bounded batch of regrown stripes at a time.
+    // The columns that store no values, a bounded batch of regrown stripes at a time, or combined
+    // before their transforms.
     for group in regrown_groups {
-        let regrow = regrow.unwrap();
+        let sourced = sourced.unwrap();
+        let polys: Vec<&Poly<B>> =
+            group.iter().map(|&(_, &(tree, column))| sourced(tree, column)).collect();
+        let group_samples: Vec<&Vec<(PointSample, SecureField)>> =
+            group.iter().map(|((_, s), _)| *s).collect();
+        let domain: CircleDomain = group[0].0.0.domain;
+        if group.iter().all(|((c, _), _)| c.domain == domain)
+            && combines_sourced_columns(&polys, &group_samples)
+        {
+            for accumulation in
+                combined_sourced_accumulations(&polys, &group_samples, domain, twiddles)
+            {
+                add_accumulation(&mut accumulated_numerators_vec, accumulation);
+            }
+            continue;
+        }
+        let regrow =
+            |tree: usize, column: usize| sourced(tree, column).stripe0(twiddles).into_owned();
         for batch in group.chunks(REGROWN_BATCH) {
             #[cfg(feature = "parallel")]
             let stripes: Vec<_> =
@@ -256,6 +311,130 @@ pub fn compute_fri_quotients_with_regrowth<B: QuotientOps + AccumulationOps>(
         log_blowup_factor,
         twiddles,
     )
+}
+
+/// Whether the sourced columns of one size, `polys`, with the samples `samples`, are combined
+/// before their transforms by [`combined_sourced_accumulations`]: the backend supports it, every
+/// column is sourced and of the same log size, at least [`MIN_COMBINED_LOG_SIZE`], and the
+/// combination saves transforms. It interpolates and evaluates one column per coordinate and
+/// sample point, four per point, where the per-column path transforms each column once.
+fn combines_sourced_columns<B: Backend>(
+    polys: &[&Poly<B>],
+    samples: &[&Vec<(PointSample, SecureField)>],
+) -> bool {
+    if !B::COMBINES_SOURCED_COLUMNS || !polys.iter().all(|poly| poly.is_sourced()) {
+        return false;
+    }
+    let log_sizes: Vec<u32> = polys
+        .iter()
+        .filter_map(|poly| poly.source.as_ref().map(|source| source.log_size()))
+        .collect();
+    let Some(&log_size) = log_sizes.first() else {
+        return false;
+    };
+    if log_size < MIN_COMBINED_LOG_SIZE || log_sizes.iter().any(|&other| other != log_size) {
+        return false;
+    }
+    let n_points = ColumnSampleBatch::new_vec(samples).len();
+    polys.len() > SECURE_EXTENSION_DEGREE * n_points
+}
+
+/// The accumulated numerators of the sourced columns of one size, `polys`, sampled at `samples`,
+/// with their stripes 0 on `domain`, combined before their transforms. Per sample point the trace
+/// values are summed as `∑ cᵢ * vᵢ` over the point's columns, with the `c` line coefficients of
+/// [`QuotientOps::accumulate_numerators`], [`REGROWN_BATCH`] columns at a time; then each of the
+/// four coordinates of the sum is interpolated and evaluated on stripe 0 once (as
+/// [`Poly::stripe0`] regrows a sourced column), canonicalized, and offset by `-∑ bᵢ`.
+///
+/// Interpolation and evaluation are linear, so stripe 0 of the sum is `∑ cᵢ * fᵢ`, where `fᵢ` is
+/// column `i`'s stripe 0, modulo `P`. The per-column path reduces the same sums into `[0, P)`, so
+/// once canonical the values are those of that path word for word; the transforms may return the
+/// redundant `P` for zero, which is why they are canonicalized before the offset.
+///
+/// Mechanism: nadai2010 (rgr1_d04ed031, rgr1_d5852b0c), coefficient-domain combination of sourced
+/// quotient columns; canonicalization at the partial-numerator boundary from calcutatator's port
+/// (rgr1_d0601f81).
+fn combined_sourced_accumulations<B: Backend>(
+    polys: &[&Poly<B>],
+    samples: &[&Vec<(PointSample, SecureField)>],
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<B>,
+) -> Vec<AccumulatedNumerators<B>> {
+    let sample_batches: Vec<ColumnSampleBatch> = ColumnSampleBatch::new_vec(samples);
+    let line_coeffs: Vec<Vec<(SecureField, SecureField, SecureField)>> =
+        quotient_constants(&sample_batches).line_coeffs;
+    let mut trace_domain: Option<CircleDomain> = None;
+    let mut sums: Vec<Option<SecureColumnByCoords<B>>> =
+        sample_batches.iter().map(|_| None).collect();
+    for (chunk_index, chunk) in polys.chunks(REGROWN_BATCH).enumerate() {
+        let first = chunk_index * REGROWN_BATCH;
+        let source_evaluation =
+            |poly: &&Poly<B>| poly.source_evaluation().expect("combined columns are sourced");
+        #[cfg(feature = "parallel")]
+        let evaluations: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>> =
+            chunk.par_iter().map(source_evaluation).collect();
+        #[cfg(not(feature = "parallel"))]
+        let evaluations: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>> =
+            chunk.iter().map(source_evaluation).collect();
+        let chunk_domain = evaluations[0].domain;
+        assert!(evaluations.iter().all(|evaluation| evaluation.domain == chunk_domain));
+        assert_eq!(*trace_domain.get_or_insert(chunk_domain), chunk_domain);
+        for ((batch, coeffs), sum) in zip(zip(&sample_batches, &line_coeffs), &mut sums) {
+            let terms: Vec<(&Col<B, BaseField>, SecureField)> =
+                zip(&batch.cols_vals_randpows, coeffs)
+                    .filter(|(data, _)| (first..first + chunk.len()).contains(&data.column_index))
+                    .map(|(data, &(_, _, c))| (&evaluations[data.column_index - first].values, c))
+                    .collect();
+            if terms.is_empty() {
+                continue;
+            }
+            let sum = sum.get_or_insert_with(|| SecureColumnByCoords::zeros(chunk_domain.size()));
+            B::accumulate_weighted_columns(sum, &terms);
+        }
+    }
+    let trace_domain = trace_domain.expect("a group has columns");
+    zip(zip(sample_batches, line_coeffs), sums)
+        .map(|((batch, coeffs), sum)| {
+            let sum = sum.expect("every sample point has columns");
+            let mut partial_numerators_acc =
+                stripe0_of_coordinates(sum, trace_domain, domain, twiddles);
+            let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
+            B::canonicalize_and_subtract(&mut partial_numerators_acc, b_sum);
+            AccumulatedNumerators {
+                sample_point: batch.point,
+                partial_numerators_acc,
+                first_linear_term_acc: coeffs.iter().map(|(a, ..)| *a).sum(),
+            }
+        })
+        .collect()
+}
+
+/// Stripe 0 of `domain` of each coordinate of `values`, given on `trace_domain`: interpolated
+/// with the twiddles of `trace_domain` and evaluated on the first subdomain of `domain` with
+/// `twiddles`, as [`Poly::stripe0`] regrows a sourced column.
+fn stripe0_of_coordinates<B: PolyOps>(
+    values: SecureColumnByCoords<B>,
+    trace_domain: CircleDomain,
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<B>,
+) -> SecureColumnByCoords<B> {
+    let shared_trace_twiddles = B::subdomain_twiddles(trace_domain.half_coset);
+    let trace_twiddles: &TwiddleTree<B> = &shared_trace_twiddles;
+    let stripe0 = |column: Col<B, BaseField>| -> Col<B, BaseField> {
+        let coefficients: CircleCoefficients<B> =
+            CircleEvaluation::<B, BaseField, BitReversedOrder>::new(trace_domain, column)
+                .interpolate_with_twiddles(trace_twiddles);
+        let mut stripe = Col::<B, BaseField>::zeros(1 << coefficients.log_size());
+        B::evaluate_stripe_into(&coefficients, domain, twiddles, 0, &mut stripe);
+        stripe
+    };
+    #[cfg(feature = "parallel")]
+    let columns: Vec<Col<B, BaseField>> = values.columns.into_par_iter().map(stripe0).collect();
+    #[cfg(not(feature = "parallel"))]
+    let columns: Vec<Col<B, BaseField>> = values.columns.into_iter().map(stripe0).collect();
+    SecureColumnByCoords {
+        columns: columns.try_into().unwrap_or_else(|_| unreachable!("four coordinates")),
+    }
 }
 
 /// Adds `accumulation` to the accumulation in `accumulations` of the same sample point and size,

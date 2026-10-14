@@ -378,16 +378,33 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
             .map_cols(|(poly, shifted): (&&&Poly<SimdBackend>, &bool)| {
                 shifted.then(|| poly.get_evaluation_on_domain(eval_domain, &twiddles))
             });
+        // A block column kept without coefficients (a compact preprocessed column) is regrown
+        // once here for all the blocks instead of once per block: every block folds the same
+        // coefficients, so its values are unchanged.
+        let regrow = |(poly, whole): (&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>)| {
+            (whole.is_none() && poly.coeffs.is_none()).then(|| poly.regrown_coefficients())
+        };
+        #[cfg(not(feature = "parallel"))]
+        let regrown = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).map_cols(regrow);
+        #[cfg(feature = "parallel")]
+        let regrown = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).par_map_cols(regrow);
         // A block's column buffers are reused by the next block (no fresh pages).
         let spare = std::sync::Mutex::new(Vec::<BaseColumn>::new());
         for block in 0..1usize << log_n_blocks {
-            let fill = |(poly, whole): (&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>)| {
+            let fill = |((poly, whole), regrown): (
+                (&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>),
+                &Option<stwo::prover::poly::circle::CircleCoefficients<SimdBackend>>,
+            )| {
                 if whole.is_some() {
                     return None;
                 }
                 let mut values =
                     spare.lock().unwrap().pop().unwrap_or_else(|| BaseColumn::zeros(block_len));
-                evaluate_block_into(&coefficients(**poly), eval_domain, &twiddles, log_block, block, &mut values);
+                let coeffs = match regrown {
+                    Some(coeffs) => Cow::Borrowed(coeffs),
+                    None => coefficients(**poly),
+                };
+                evaluate_block_into(&coeffs, eval_domain, &twiddles, log_block, block, &mut values);
                 let mut evaluation = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
                     CanonicCoset::new(1).circle_domain(),
                     BaseColumn::zeros(2),
@@ -395,10 +412,12 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                 evaluation.values = values;
                 Some(evaluation)
             };
+            let inputs =
+                component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).zip_cols(regrown.as_cols_ref());
             #[cfg(not(feature = "parallel"))]
-            let blocks = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).map_cols(fill);
+            let blocks = inputs.map_cols(fill);
             #[cfg(feature = "parallel")]
-            let blocks = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).par_map_cols(fill);
+            let blocks = inputs.par_map_cols(fill);
             let columns = blocks
                 .as_cols_ref()
                 .zip_cols(whole.as_cols_ref())

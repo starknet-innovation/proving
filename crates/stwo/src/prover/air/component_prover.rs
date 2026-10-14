@@ -135,19 +135,26 @@ impl<B: Backend> Poly<B> {
         }
     }
 
+    /// The values of a sourced column on its trace domain (the canonic coset of its
+    /// coefficients' size), in bit-reversed order: the evaluation that
+    /// [`Self::regrown_coefficients`] interpolates. `None` unless the column
+    /// [is sourced](Self::is_sourced).
+    pub fn source_evaluation(&self) -> Option<CircleEvaluation<B, BaseField, BitReversedOrder>> {
+        if !self.is_sourced() {
+            return None;
+        }
+        let source: &dyn TraceSource = self.source.as_deref()?;
+        let domain: CircleDomain = CanonicCoset::new(source.log_size()).circle_domain();
+        Some(CircleEvaluation::new(domain, source_column::<B>(source)))
+    }
+
     /// The coefficients of a striped column that holds only stripe 0 (its evaluation on the
     /// first subdomain of the coefficients' size), interpolated from it.
     pub fn regrown_coefficients(&self) -> CircleCoefficients<B> {
-        if self.is_sourced() {
+        if let Some(evaluation) = self.source_evaluation() {
             // The trace values interpolate to the same polynomial as stripe 0 does.
-            let source = self.source.as_ref().unwrap();
-            let domain = CanonicCoset::new(source.log_size()).circle_domain();
-            let twiddles = B::subdomain_twiddles(domain.half_coset);
-            return CircleEvaluation::<B, BaseField, BitReversedOrder>::new(
-                domain,
-                source_column::<B>(source.as_ref()),
-            )
-            .interpolate_with_twiddles(&twiddles);
+            let twiddles = B::subdomain_twiddles(evaluation.domain.half_coset);
+            return evaluation.interpolate_with_twiddles(&twiddles);
         }
         let log_blowup_factor = self.evals.domain.log_size() - self.evals.values.len().ilog2();
         let subdomain = self.evals.domain.split(log_blowup_factor).0;

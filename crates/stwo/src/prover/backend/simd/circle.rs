@@ -1,6 +1,6 @@
 use std::iter::zip;
 use std::mem::transmute;
-use std::simd::Simd;
+use std::simd::{Simd, u64x8};
 
 use bytemuck::Zeroable;
 #[cfg(not(feature = "parallel"))]
@@ -16,7 +16,7 @@ use super::m31::{LOG_N_LANES, N_LANES, PackedBaseField};
 use super::qm31::PackedSecureField;
 use crate::core::circle::{CirclePoint, CirclePointIndex, Coset, M31_CIRCLE_LOG_ORDER};
 use crate::core::constraints::{coset_vanishing, coset_vanishing_derivative, point_vanishing};
-use crate::core::fields::m31::BaseField;
+use crate::core::fields::m31::{BaseField, P};
 use crate::core::fields::qm31::SecureField;
 use crate::core::fields::{Field, FieldExpOps, batch_inverse};
 use crate::core::poly::circle::{CanonicCoset, CircleDomain};
@@ -1057,102 +1057,109 @@ pub fn evaluate_block_into(
         return SimdBackend::evaluate_stripe_into(poly, domain, twiddles, block, dst);
     }
     let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
-    // Fold from the polynomial's size down to the block's.
-    let mut folded: Option<BaseColumn> = None;
-    let first_fold_level = if log_size - log_block == 2 && log_block > CACHED_FFT_LOG_SIZE {
-        // Fuse exactly two folds without distributing products or reassociating sums.
-        // Each local expression is the same lo + hi * t used by the staged path.
-        let signed_twiddle = |level: u32| {
+    // Keep each high-layer butterfly tree in bounded scratch, rather than a half-polynomial
+    // temporary, when the source coefficients are transposed and the tree fits in one tile.
+    let folded = if log_size > CACHED_FFT_LOG_SIZE && log_size - log_block <= 6 {
+        fold_block_coefficients_tiled(poly, log_block, block, &line_twiddles)
+    } else {
+        // Fold from the polynomial's size down to the block's.
+        let mut folded: Option<BaseColumn> = None;
+        let first_fold_level = if log_size - log_block == 2 && log_block > CACHED_FFT_LOG_SIZE {
+            // Fuse exactly two folds without distributing products or reassociating sums.
+            // Each local expression is the same lo + hi * t used by the staged path.
+            let signed_twiddle = |level: u32| {
+                let stripe = block >> (level - log_block);
+                let sign = (block >> (level - 1 - log_block)) & 1;
+                let t = BaseField::from_u32_unchecked(line_twiddles[(level - 2) as usize][stripe] / 2);
+                PackedBaseField::broadcast(if sign == 0 { t } else { -t })
+            };
+            let t0 = signed_twiddle(log_size);
+            let t1 = signed_twiddle(log_size - 1);
+            let src = &poly.coeffs.data;
+            let log_n_vecs = log_size - LOG_N_LANES;
+            let at = |v: usize| src[transposed_vec_index(v, log_n_vecs)];
+            let quarter_vecs = 1usize << (log_block - LOG_N_LANES);
+            let mut out = BaseColumn::zeros(1 << log_block);
+            #[cfg(not(feature = "parallel"))]
+            let iter = out.data.iter_mut();
+            #[cfg(feature = "parallel")]
+            let iter = out.data.par_iter_mut();
+            iter.enumerate().for_each(|(i, x)| {
+                let i = transposed_vec_index(i, log_block - LOG_N_LANES);
+                let lo = at(i) + at(i + 2 * quarter_vecs) * t0;
+                let hi = at(i + quarter_vecs) + at(i + 3 * quarter_vecs) * t0;
+                *x = lo + hi * t1;
+            });
+            folded = Some(out);
+            // The fused output is already at the final size and in the FFT layout.
+            log_block
+        } else {
+            log_size
+        };
+        for level in (log_block + 1..=first_fold_level).rev() {
             let stripe = block >> (level - log_block);
             let sign = (block >> (level - 1 - log_block)) & 1;
             let t = BaseField::from_u32_unchecked(line_twiddles[(level - 2) as usize][stripe] / 2);
-            PackedBaseField::broadcast(if sign == 0 { t } else { -t })
-        };
-        let t0 = signed_twiddle(log_size);
-        let t1 = signed_twiddle(log_size - 1);
-        let src = &poly.coeffs.data;
-        let log_n_vecs = log_size - LOG_N_LANES;
-        let at = |v: usize| src[transposed_vec_index(v, log_n_vecs)];
-        let quarter_vecs = 1usize << (log_block - LOG_N_LANES);
-        let mut out = BaseColumn::zeros(1 << log_block);
-        #[cfg(not(feature = "parallel"))]
-        let iter = out.data.iter_mut();
-        #[cfg(feature = "parallel")]
-        let iter = out.data.par_iter_mut();
-        iter.enumerate().for_each(|(i, x)| {
-            let i = transposed_vec_index(i, log_block - LOG_N_LANES);
-            let lo = at(i) + at(i + 2 * quarter_vecs) * t0;
-            let hi = at(i + quarter_vecs) + at(i + 3 * quarter_vecs) * t0;
-            *x = lo + hi * t1;
-        });
-        folded = Some(out);
-        // The fused output is already at the final size and in the FFT layout.
-        log_block
-    } else {
-        log_size
-    };
-    for level in (log_block + 1..=first_fold_level).rev() {
-        let stripe = block >> (level - log_block);
-        let sign = (block >> (level - 1 - log_block)) & 1;
-        let t = BaseField::from_u32_unchecked(line_twiddles[(level - 2) as usize][stripe] / 2);
-        let t = PackedBaseField::broadcast(if sign == 0 { t } else { -t });
-        let half_vecs = 1usize << (level - 1 - LOG_N_LANES);
-        match &mut folded {
-            None => {
-                // Large coefficients are stored transposed (see `split_at_mid`): read the vector of
-                // natural index `v` from where the transposition put it.
-                let src = &poly.coeffs.data;
-                let log_n_vecs = log_size - LOG_N_LANES;
-                let at = |v: usize| {
-                    if log_size <= CACHED_FFT_LOG_SIZE {
-                        return src[v];
-                    }
-                    src[transposed_vec_index(v, log_n_vecs)]
-                };
-                let mut out = BaseColumn::zeros(1 << (level - 1));
-                // The last fold writes the layout consumed by the FFT directly. Keeping the
-                // signed twiddle and the lo + hi * t expression preserves raw field words.
-                let final_transpose = level - 1 == log_block && log_block > CACHED_FFT_LOG_SIZE;
-                #[cfg(not(feature = "parallel"))]
-                let iter = out.data.iter_mut();
-                #[cfg(feature = "parallel")]
-                let iter = out.data.par_iter_mut();
-                iter.enumerate().for_each(|(i, x)| {
-                    let i = if final_transpose {
-                        transposed_vec_index(i, log_block - LOG_N_LANES)
-                    } else {
-                        i
+            let t = PackedBaseField::broadcast(if sign == 0 { t } else { -t });
+            let half_vecs = 1usize << (level - 1 - LOG_N_LANES);
+            match &mut folded {
+                None => {
+                    // Large coefficients are stored transposed (see `split_at_mid`): read the vector of
+                    // natural index `v` from where the transposition put it.
+                    let src = &poly.coeffs.data;
+                    let log_n_vecs = log_size - LOG_N_LANES;
+                    let at = |v: usize| {
+                        if log_size <= CACHED_FFT_LOG_SIZE {
+                            return src[v];
+                        }
+                        src[transposed_vec_index(v, log_n_vecs)]
                     };
-                    *x = at(i) + at(i + half_vecs) * t;
-                });
-                folded = Some(out);
-            }
-            Some(buf) => {
-                if level - 1 == log_block && log_block > CACHED_FFT_LOG_SIZE {
-                    let mut out = BaseColumn::zeros(1 << log_block);
+                    let mut out = BaseColumn::zeros(1 << (level - 1));
+                    // The last fold writes the layout consumed by the FFT directly. Keeping the
+                    // signed twiddle and the lo + hi * t expression preserves raw field words.
+                    let final_transpose = level - 1 == log_block && log_block > CACHED_FFT_LOG_SIZE;
                     #[cfg(not(feature = "parallel"))]
                     let iter = out.data.iter_mut();
                     #[cfg(feature = "parallel")]
                     let iter = out.data.par_iter_mut();
                     iter.enumerate().for_each(|(i, x)| {
-                        let i = transposed_vec_index(i, log_block - LOG_N_LANES);
-                        *x = buf.data[i] + buf.data[i + half_vecs] * t;
+                        let i = if final_transpose {
+                            transposed_vec_index(i, log_block - LOG_N_LANES)
+                        } else {
+                            i
+                        };
+                        *x = at(i) + at(i + half_vecs) * t;
                     });
-                    *buf = out;
-                } else {
-                    let (lo, hi) = buf.data[..2 * half_vecs].split_at_mut(half_vecs);
-                    #[cfg(not(feature = "parallel"))]
-                    let pairs = lo.iter_mut().zip(hi.iter());
-                    #[cfg(feature = "parallel")]
-                    let pairs = lo.par_iter_mut().zip(hi.par_iter());
-                    pairs.for_each(|(l, h)| *l = *l + *h * t);
-                    buf.data.truncate(half_vecs);
-                    buf.length = 1 << (level - 1);
+                    folded = Some(out);
+                }
+                Some(buf) => {
+                    if level - 1 == log_block && log_block > CACHED_FFT_LOG_SIZE {
+                        let mut out = BaseColumn::zeros(1 << log_block);
+                        #[cfg(not(feature = "parallel"))]
+                        let iter = out.data.iter_mut();
+                        #[cfg(feature = "parallel")]
+                        let iter = out.data.par_iter_mut();
+                        iter.enumerate().for_each(|(i, x)| {
+                            let i = transposed_vec_index(i, log_block - LOG_N_LANES);
+                            *x = buf.data[i] + buf.data[i + half_vecs] * t;
+                        });
+                        *buf = out;
+                    } else {
+                        let (lo, hi) = buf.data[..2 * half_vecs].split_at_mut(half_vecs);
+                        #[cfg(not(feature = "parallel"))]
+                        let pairs = lo.iter_mut().zip(hi.iter());
+                        #[cfg(feature = "parallel")]
+                        let pairs = lo.par_iter_mut().zip(hi.par_iter());
+                        pairs.for_each(|(l, h)| *l = *l + *h * t);
+                        buf.data.truncate(half_vecs);
+                        buf.length = 1 << (level - 1);
+                    }
                 }
             }
         }
-    }
-    let folded = CircleCoefficients::<SimdBackend>::new(folded.unwrap());
+        folded.unwrap()
+    };
+    let folded = CircleCoefficients::<SimdBackend>::new(folded);
     let stripe_twiddles = vec![
         (0..(log_block - 1))
             .map(|layer_i| {
@@ -1162,6 +1169,79 @@ pub fn evaluate_block_into(
             .collect::<Vec<_>>(),
     ];
     fft_subdomains_into(&folded, dst, &stripe_twiddles);
+}
+
+/// Folds the high coefficient layers in tiles of final packed vectors. Each tile uses exactly
+/// the same `lo + hi * t` operations, in the same tree order, as the full-column layer passes.
+/// In particular, this does not distribute products over sums: redundant zero representations
+/// are preserved too. The final coefficients are written in the layout the block FFT consumes.
+fn fold_block_coefficients_tiled(
+    poly: &CircleCoefficients<SimdBackend>,
+    log_block: u32,
+    block: usize,
+    line_twiddles: &[&[u32]],
+) -> BaseColumn {
+    const TILE: usize = 16;
+    let log_size = poly.log_size();
+    let n_layers = log_size - log_block;
+    assert!(log_size > CACHED_FFT_LOG_SIZE && (1..=6).contains(&n_layers));
+    let n_terms = 1usize << n_layers;
+    let block_vecs = 1usize << (log_block - LOG_N_LANES);
+    let source_log_vecs = log_size - LOG_N_LANES;
+    let block_log_vecs = log_block - LOG_N_LANES;
+    let fold_twiddles: Vec<_> = (log_block + 1..=log_size)
+        .rev()
+        .map(|level| {
+            let stripe = block >> (level - log_block);
+            let sign = (block >> (level - 1 - log_block)) & 1;
+            let t = BaseField::from_u32_unchecked(line_twiddles[(level - 2) as usize][stripe] / 2);
+            PackedBaseField::broadcast(if sign == 0 { t } else { -t })
+        })
+        .collect();
+    let mut folded = BaseColumn::zeros(1 << log_block);
+    // At most 64 KiB per active task; reused for successive destination tiles.
+    let scratch = || vec![PackedBaseField::zero(); TILE * n_terms];
+    let fill = |scratch: &mut Vec<PackedBaseField>,
+                (tile, dst): (usize, &mut [PackedBaseField])| {
+        let natural_indices: [usize; TILE] = std::array::from_fn(|i| {
+            let index = tile * TILE + i;
+            if log_block > CACHED_FFT_LOG_SIZE {
+                transposed_vec_index(index, block_log_vecs)
+            } else {
+                index
+            }
+        });
+        for term in 0..n_terms {
+            for (i, &natural) in natural_indices[..dst.len()].iter().enumerate() {
+                let source = transposed_vec_index(natural + term * block_vecs, source_log_vecs);
+                scratch[term * TILE + i] = poly.coeffs.data[source];
+            }
+        }
+        let mut active = n_terms;
+        for &twiddle in &fold_twiddles {
+            let half = active / 2;
+            let (lo, hi) = scratch[..active * TILE].split_at_mut(half * TILE);
+            for (lo, hi) in lo.iter_mut().zip(hi.iter()) {
+                *lo = *lo + *hi * twiddle;
+            }
+            active = half;
+        }
+        dst.copy_from_slice(&scratch[..dst.len()]);
+    };
+    #[cfg(feature = "parallel")]
+    folded
+        .data
+        .par_chunks_mut(TILE)
+        .enumerate()
+        .for_each_init(scratch, fill);
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut scratch = scratch();
+        for tile in folded.data.chunks_mut(TILE).enumerate() {
+            fill(&mut scratch, tile);
+        }
+    }
+    folded
 }
 
 fn compute_small_coset_twiddles(coset: Coset) -> TwiddleTree<SimdBackend> {
@@ -1290,23 +1370,60 @@ fn evaluate_from_prefix_mode(
     let tile = 1usize << plan.tile_bits;
     if bary {
         // Q722: one weighted accumulate per block, tile by tile so the column is read once.
-        let mut acc = vec![[PackedBaseField::zero(); 2]; plan.blocks.len()];
+        // The sums are kept exact in 64-bit lanes and reduced once per block. Every source word is
+        // at most P and every weight below 2^31, so a product is below 2^62 and four products fit
+        // in a u64 lane; after each group of four, `x = hi * 2^31 + lo` is folded to `hi + lo`
+        // (equal modulo P, below 2^34), so a block's sum stays below 2^(n + 27) (2^50 at n = 23).
+        // Its canonical residue is the one the reduced per-term arithmetic gives.
+        assert!(n <= 36 && tile % 4 == 0);
+        let low_half = u64x8::splat(0xFFFF_FFFF);
+        let modulus = u64x8::splat(u64::from(P));
+        let fold64 = |x: u64x8| (x & modulus) + (x >> 31);
+        let split = |v: PackedBaseField| {
+            let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(v));
+            [w & low_half, w >> 32]
+        };
+        let mut acc = vec![[u64x8::splat(0); 4]; plan.blocks.len()];
+        // A tile's source vectors as even and odd u64 lanes, split once for all the blocks.
+        let mut lanes = vec![[u64x8::splat(0); 4]; tile];
         for t in 0..n_chunks >> plan.tile_bits {
             let src = &unfolded[2 * t * tile..2 * (t + 1) * tile];
-            for (block, acc) in plan.blocks.iter().zip(acc.iter_mut()) {
-                let [mut s0, mut s1] = *acc;
-                for (j, &w) in block.weights[t * tile..(t + 1) * tile].iter().enumerate() {
-                    let w = PackedBaseField::broadcast(w);
-                    s0 += src[2 * j] * w;
-                    s1 += src[2 * j + 1] * w;
+            for (j, lane) in lanes.iter_mut().enumerate() {
+                let [e0, o0] = split(src[2 * j]);
+                let [e1, o1] = split(src[2 * j + 1]);
+                *lane = [e0, o0, e1, o1];
+            }
+            let tile_weights = &plan.tile_weights[t * plan.blocks.len() * tile..][..plan.blocks.len() * tile];
+            for (weights, acc) in tile_weights.chunks_exact(tile).zip(acc.iter_mut()) {
+                for (group, weights) in lanes.chunks_exact(4).zip(weights.chunks_exact(4)) {
+                    let mut sum = [u64x8::splat(0); 4];
+                    for (lane, &w) in group.iter().zip(weights) {
+                        let w = u64x8::splat(u64::from(w));
+                        for k in 0..4 {
+                            // The mask is a no-op on these lanes (their upper halves are zero); it
+                            // lets the compiler see a 32 x 32 -> 64-bit multiply (one vpmuludq).
+                            sum[k] += (lane[k] & low_half) * w;
+                        }
+                    }
+                    for k in 0..4 {
+                        acc[k] += fold64(sum[k]);
+                    }
                 }
-                *acc = [s0, s1];
             }
         }
+        // Each folded sum is below 2^31 + 2^19 < 2P: one more fold, then reduce to [0, P).
+        let pack = |even: u64x8, odd: u64x8| {
+            let packed = fold64(even) | (fold64(odd) << 32);
+            let lanes = bytemuck::cast::<[u64; 8], PackedBaseField>(packed.to_array());
+            PackedBaseField::reduce_simd(lanes.into_simd())
+        };
         let mut out: Vec<Vec<BaseField>> =
             targets.iter().map(|(_, rows)| vec![BaseField::zero(); rows.len()]).collect();
         for (block, acc) in plan.blocks.iter().zip(acc) {
-            let values: Vec<BaseField> = acc.iter().flat_map(|p| p.to_array()).collect();
+            let values: Vec<BaseField> = [pack(acc[0], acc[1]), pack(acc[2], acc[3])]
+                .iter()
+                .flat_map(|p| p.to_array())
+                .collect();
             for (k, own) in block.rows.clone().zip(&block.own) {
                 out[block.target][k] = fold(&values, own) * plan.scale;
             }
@@ -1388,6 +1505,9 @@ struct PrefixPlan {
     subdomain: CircleDomain,
     tile_bits: u32,
     blocks: Vec<PrefixBlock>,
+    /// The blocks' bary weights, tile-major (`[tile][block][j]`), so a tile's pass over every
+    /// block reads one sequential stream. Empty unless the bary tail is on.
+    tile_weights: Vec<u32>,
     scale: BaseField,
 }
 
@@ -1455,10 +1575,16 @@ impl PrefixPlan {
         let subdomain = domain.split(domain.log_size() - n).0;
         let sub_twiddles = SimdBackend::subdomain_twiddles(subdomain.half_coset);
         let twiddles = domain_line_twiddles_from_tree(subdomain, &sub_twiddles.itwiddles);
-        let mut blocks = vec![];
+        // The blocks are independent: built in parallel, collected in target and row order.
+        let mut specs: Vec<(usize, usize, usize, &[usize])> = vec![];
         for (target, (stripe, rows)) in targets.iter().enumerate() {
             let mut start = 0;
             for block in rows.chunk_by(|a, b| a >> low == b >> low) {
+                specs.push((target, *stripe, start, block));
+                start += block.len();
+            }
+        }
+        let make_block = |&(target, stripe, start, block): &(usize, usize, usize, &[usize])| {
                 let factors = block
                     .iter()
                     .map(|&row| {
@@ -1483,22 +1609,48 @@ impl PrefixPlan {
                     })
                     .collect();
                 let weights = if bary_tail() { fold_weights(&coeffs) } else { vec![] };
-                blocks.push(PrefixBlock {
+                PrefixBlock {
                     target,
                     rows: start..start + block.len(),
                     weights,
                     coeffs,
                     own: factors.iter().map(|f| [f[4], f[3], f[2], f[1], f[0]]).collect(),
-                });
-                start += block.len();
-            }
-        }
+                }
+        };
+        #[cfg(feature = "parallel")]
+        let mut blocks: Vec<PrefixBlock> = specs.par_iter().map(make_block).collect();
+        #[cfg(not(feature = "parallel"))]
+        let mut blocks: Vec<PrefixBlock> = specs.iter().map(make_block).collect();
         drop(twiddles);
+        let tile_bits = 6.min(n - low);
+        let tile = 1usize << tile_bits;
+        let tile_weights = if bary_tail() {
+            let n_blocks = blocks.len();
+            let mut tile_weights = vec![0u32; n_blocks << (n - low)];
+            let transpose = |(t, dst): (usize, &mut [u32])| {
+                for (block, dst) in blocks.iter().zip(dst.chunks_exact_mut(tile)) {
+                    for (dst, w) in dst.iter_mut().zip(&block.weights[t * tile..(t + 1) * tile]) {
+                        *dst = w.0;
+                    }
+                }
+            };
+            #[cfg(feature = "parallel")]
+            tile_weights.par_chunks_mut(n_blocks * tile).enumerate().for_each(transpose);
+            #[cfg(not(feature = "parallel"))]
+            tile_weights.chunks_mut(n_blocks * tile).enumerate().for_each(transpose);
+            for block in &mut blocks {
+                block.weights = vec![];
+            }
+            tile_weights
+        } else {
+            vec![]
+        };
         Self {
             sub_twiddles,
             subdomain,
-            tile_bits: 6.min(n - low),
+            tile_bits,
             blocks,
+            tile_weights,
             scale: BaseField::from(1u32 << n).inverse(),
         }
     }

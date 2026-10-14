@@ -51,8 +51,13 @@ pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out
 
 /// The version prefix and the compressed recursive proof.
 fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]) -> Result<(Vec<u8>, Vec<u8>)> {
-    let precomputes = prepare_recursive_prover_precomputes().map_err(|e| anyhow!("{e}"))?;
-    let prover_input: ProverInput = serde_json::from_slice(&input[witness_start..])?;
+    // The input is parsed beside the precomputes: the two are independent.
+    let (precomputes, prover_input) = rayon::join(
+        || prepare_recursive_prover_precomputes().map_err(|e| anyhow!("{e}")),
+        || serde_json::from_slice::<ProverInput>(&input[witness_start..]),
+    );
+    let precomputes = precomputes?;
+    let prover_input: ProverInput = prover_input?;
     drop(input);
     // The circuit's preprocessing and its committed tree (both built on first use, see
     // `LazyPreprocessedCircuit`) are independent of the Cairo proof and are needed only by the

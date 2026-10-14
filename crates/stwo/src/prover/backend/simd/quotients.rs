@@ -5,11 +5,11 @@ use itertools::{Itertools, zip_eq};
 use num_traits::Zero;
 #[cfg(feature = "parallel")]
 use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 
 use super::SimdBackend;
-use super::column::{BaseColumn, CM31Column};
+use super::column::{BaseColumn, CM31Column, SecureColumnByCoordsMutSlice};
 use super::domain::CircleDomainBitRevIterator;
 use super::m31::{LOG_N_LANES, PackedBaseField};
 use super::qm31::PackedSecureField;
@@ -20,9 +20,9 @@ use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::quotients::{ColumnSampleBatch, quotient_constants};
 use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::prover::QuotientOps;
-use crate::prover::backend::CpuBackend;
 use crate::prover::backend::simd::cm31::PackedCM31;
 use crate::prover::backend::simd::utils::to_lifted_simd;
+use crate::prover::backend::{Column, CpuBackend};
 use crate::prover::pcs::quotient_ops::AccumulatedNumerators;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::poly::circle::{CircleEvaluation, PolyOps, SecureEvaluation};
@@ -239,6 +239,53 @@ impl QuotientOps for SimdBackend {
 
         SecureEvaluation::new(eval_domain, evals)
     }
+
+    const COMBINES_SOURCED_COLUMNS: bool = true;
+
+    fn accumulate_weighted_columns(
+        acc: &mut SecureColumnByCoords<Self>,
+        terms: &[(&BaseColumn, SecureField)],
+    ) {
+        accumulate_weighted_columns(acc, terms);
+    }
+
+    fn canonicalize_and_subtract(numerators: &mut SecureColumnByCoords<Self>, b_sum: SecureField) {
+        canonicalize_and_subtract(numerators, b_sum);
+    }
+}
+
+/// The deferred accumulation of a packed row: per coordinate, the even and the odd `u32` lanes of
+/// the row as `u64` lanes.
+type RowAcc = [[u64x8; 2]; 4];
+
+/// Adds `∑ coeffs[g] * cols[g][r]` to the packed row `acc[r]` of every row `r`, the exact 64-bit
+/// products of the `G <= 4` terms summed and folded once (`x = hi * 2^31 + lo == hi + lo` modulo
+/// `P`).
+#[inline(always)]
+fn accumulate_group<const G: usize>(
+    acc: &mut [RowAcc],
+    cols: [&[PackedBaseField]; G],
+    coeffs: &[[u32; 4]; G],
+) {
+    for (r, row_acc) in acc.iter_mut().enumerate() {
+        let mut even = [u64x8::splat(0); G];
+        let mut odd = [u64x8::splat(0); G];
+        for g in 0..G {
+            let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(cols[g][r]));
+            even[g] = w & u64x8::splat(0xFFFF_FFFF);
+            odd[g] = w >> 32;
+        }
+        for k in 0..4 {
+            let mut pe = even[0] * u64x8::splat(u64::from(coeffs[0][k]));
+            let mut po = odd[0] * u64x8::splat(u64::from(coeffs[0][k]));
+            for g in 1..G {
+                pe += even[g] * u64x8::splat(u64::from(coeffs[g][k]));
+                po += odd[g] * u64x8::splat(u64::from(coeffs[g][k]));
+            }
+            row_acc[k][0] += (pe & u64x8::splat(u64::from(P))) + (pe >> 31);
+            row_acc[k][1] += (po & u64x8::splat(u64::from(P))) + (po >> 31);
+        }
+    }
 }
 
 /// Performs the pointwise accumulation of the numerators on `subdomain`.
@@ -264,35 +311,6 @@ fn accumulate_numerators_on_subdomain(
     const NUMERATORS_CHUNK_SIZE: usize = 1 << 6;
     // Number of packed rows accumulated together in a pass over all the terms.
     const ROW_BLOCK: usize = 16;
-
-    type RowAcc = [[u64x8; 2]; 4];
-
-    #[inline(always)]
-    fn accumulate_group<const G: usize>(
-        acc: &mut [RowAcc],
-        cols: [&[PackedBaseField]; G],
-        coeffs: &[[u32; 4]; G],
-    ) {
-        for (r, row_acc) in acc.iter_mut().enumerate() {
-            let mut even = [u64x8::splat(0); G];
-            let mut odd = [u64x8::splat(0); G];
-            for g in 0..G {
-                let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(cols[g][r]));
-                even[g] = w & u64x8::splat(0xFFFF_FFFF);
-                odd[g] = w >> 32;
-            }
-            for k in 0..4 {
-                let mut pe = even[0] * u64x8::splat(coeffs[0][k] as u64);
-                let mut po = odd[0] * u64x8::splat(coeffs[0][k] as u64);
-                for g in 1..G {
-                    pe += even[g] * u64x8::splat(coeffs[g][k] as u64);
-                    po += odd[g] * u64x8::splat(coeffs[g][k] as u64);
-                }
-                row_acc[k][0] += (pe & u64x8::splat(P as u64)) + (pe >> 31);
-                row_acc[k][1] += (po & u64x8::splat(P as u64)) + (po >> 31);
-            }
-        }
-    }
 
     let mut values =
         unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(subdomain.size()) };
@@ -380,6 +398,116 @@ fn accumulate_numerators_on_subdomain(
         }
     });
     values
+}
+
+/// The four coordinates of `value`, as `u32` coefficients of [`accumulate_group`].
+fn coordinates(value: SecureField) -> [u32; 4] {
+    [value.0.0.0, value.0.1.0, value.1.0.0, value.1.1.0]
+}
+
+/// Adds `∑ cᵢ * columnᵢ` to `acc` row by row, over `terms` = `(columnᵢ, cᵢ)`, with the deferred
+/// reduction of [`accumulate_numerators_on_subdomain`]: the column values are in `[0, P]`, and
+/// every value of `acc` stays in (or is brought into) `[0, P)`.
+fn accumulate_weighted_columns(
+    acc: &mut SecureColumnByCoords<SimdBackend>,
+    terms: &[(&BaseColumn, SecureField)],
+) {
+    // Packed rows per task, and packed rows accumulated together in a pass over all the terms,
+    // as in `accumulate_numerators_on_subdomain`.
+    const CHUNK_SIZE: usize = 1 << 6;
+    const ROW_BLOCK: usize = 16;
+
+    let len: usize = acc.len();
+    let terms: Vec<(&[PackedBaseField], [u32; 4])> = terms
+        .iter()
+        .map(|&(column, c)| {
+            assert_eq!(column.len(), len, "the columns have the accumulator's length");
+            (&column.data[..], coordinates(c))
+        })
+        .collect();
+
+    let accumulate_chunk = |(chunk_index, mut dst): (usize, SecureColumnByCoordsMutSlice<'_>)| {
+        let chunk_start = chunk_index * CHUNK_SIZE;
+        let packed_chunk_len = dst.0[0].0.len();
+        for block_start in (0..packed_chunk_len).step_by(ROW_BLOCK) {
+            let n_rows = ROW_BLOCK.min(packed_chunk_len - block_start);
+            let mut acc_rows = [[[u64x8::splat(0); 2]; 4]; ROW_BLOCK];
+            let acc_rows = &mut acc_rows[..n_rows];
+            accumulate_terms(acc_rows, &terms, chunk_start + block_start);
+            for (r, row_acc) in acc_rows.iter().enumerate() {
+                for (k, coordinate) in dst.0.iter_mut().enumerate() {
+                    let value = &mut coordinate.0[block_start + r];
+                    *value = *value + fold_row(row_acc[k]);
+                }
+            }
+        }
+    };
+    #[cfg(feature = "parallel")]
+    acc.par_chunks_mut(CHUNK_SIZE).enumerate().for_each(accumulate_chunk);
+    #[cfg(not(feature = "parallel"))]
+    acc.chunks_mut(CHUNK_SIZE).enumerate().for_each(accumulate_chunk);
+}
+
+/// Accumulates every term of `terms` on the packed rows `first..first + acc.len()`, four terms at
+/// a time.
+#[inline(always)]
+fn accumulate_terms(acc: &mut [RowAcc], terms: &[(&[PackedBaseField], [u32; 4])], first: usize) {
+    let rows = first..first + acc.len();
+    let mut quads = terms.chunks_exact(4);
+    for q in &mut quads {
+        accumulate_group::<4>(
+            acc,
+            [
+                &q[0].0[rows.clone()],
+                &q[1].0[rows.clone()],
+                &q[2].0[rows.clone()],
+                &q[3].0[rows.clone()],
+            ],
+            &[q[0].1, q[1].1, q[2].1, q[3].1],
+        );
+    }
+    match quads.remainder() {
+        [a, b, c] => accumulate_group::<3>(
+            acc,
+            [&a.0[rows.clone()], &b.0[rows.clone()], &c.0[rows]],
+            &[a.1, b.1, c.1],
+        ),
+        [a, b] => accumulate_group::<2>(acc, [&a.0[rows.clone()], &b.0[rows]], &[a.1, b.1]),
+        [a] => accumulate_group::<1>(acc, [&a.0[rows]], &[a.1]),
+        _ => {}
+    }
+}
+
+/// The deferred sums of one coordinate of a packed row (its even and odd lanes), folded and
+/// reduced into `[0, P)`.
+#[inline(always)]
+fn fold_row(sums: [u64x8; 2]) -> PackedBaseField {
+    let modulus = u64x8::splat(u64::from(P));
+    let fold = |x: u64x8| (x & modulus) + (x >> 31);
+    let packed = fold(sums[0]) | (fold(sums[1]) << 32);
+    let lanes = bytemuck::cast::<[u64; 8], PackedBaseField>(packed.to_array());
+    PackedBaseField::reduce_simd(lanes.into_simd())
+}
+
+/// Maps every value of `numerators` to its canonical representative in `[0, P)` (the transforms
+/// may return `P` for zero), then adds `-b_sum` to every row, as
+/// [`accumulate_numerators_on_subdomain`] offsets its reduced sums.
+fn canonicalize_and_subtract(
+    numerators: &mut SecureColumnByCoords<SimdBackend>,
+    b_sum: SecureField,
+) {
+    let neg_b_sum: SecureField = -b_sum;
+    let neg_b: [BaseField; 4] = [neg_b_sum.0.0, neg_b_sum.0.1, neg_b_sum.1.0, neg_b_sum.1.1];
+    for (column, neg_b) in zip(&mut numerators.columns, neg_b) {
+        let neg_b = PackedBaseField::broadcast(neg_b);
+        let offset = |value: &mut PackedBaseField| {
+            *value = PackedBaseField::reduce_simd(value.into_simd()) + neg_b;
+        };
+        #[cfg(feature = "parallel")]
+        column.data.par_iter_mut().for_each(offset);
+        #[cfg(not(feature = "parallel"))]
+        column.data.iter_mut().for_each(offset);
+    }
 }
 
 #[cfg(test)]

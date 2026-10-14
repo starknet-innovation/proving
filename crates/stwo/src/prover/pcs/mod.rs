@@ -3,7 +3,7 @@ use std::array;
 use hashbrown::HashMap;
 use itertools::Itertools;
 #[cfg(feature = "parallel")]
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use tracing::{Level, info, span};
 
 use crate::core::ColumnVec;
@@ -292,18 +292,18 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 }
             }
         }
-        for ((_, point), members) in coefficient_groups {
+        // Every group's values are independent and land in fixed slots: the groups are evaluated
+        // concurrently (each group alone is parallel only across its few columns).
+        let eval_coefficient_group = |((_, point), members): ((u32, CirclePoint<SecureField>), Vec<(usize, usize, usize)>)| {
             let polys = members
                 .iter()
                 .map(|&(tree, column, _)| polynomials[tree][column].coeffs.as_ref().unwrap())
                 .collect_vec();
             let values = B::eval_at_point_group(&polys, point);
-            for ((tree, column, sample), value) in members.into_iter().zip(values) {
-                samples[tree][column][sample].value = value;
-            }
-        }
+            (members, values)
+        };
         let log_blowup = self.config.fri_config.log_blowup_factor;
-        for ((log_size, point), members) in groups {
+        let eval_value_group = |((log_size, point), members): ((u32, CirclePoint<SecureField>), Vec<(usize, usize, usize)>)| {
             let evaluations = members
                 .iter()
                 .map(|&(tree, column, _)| &polynomials[tree][column].evals)
@@ -315,6 +315,24 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 &evaluations,
             );
             assert_eq!(members.len(), values.len());
+            (members, values)
+        };
+        #[cfg(feature = "parallel")]
+        let results: Vec<(Vec<(usize, usize, usize)>, Vec<SecureField>)> = {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let (coefficient_results, value_results) = rayon::join(
+                || coefficient_groups.into_iter().collect_vec().into_par_iter().map(eval_coefficient_group).collect::<Vec<_>>(),
+                || groups.into_iter().collect_vec().into_par_iter().map(eval_value_group).collect::<Vec<_>>(),
+            );
+            coefficient_results.into_iter().chain(value_results).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let results: Vec<(Vec<(usize, usize, usize)>, Vec<SecureField>)> = coefficient_groups
+            .into_iter()
+            .map(eval_coefficient_group)
+            .chain(groups.into_iter().map(eval_value_group))
+            .collect();
+        for (members, values) in results {
             for ((tree, column, sample), value) in members.into_iter().zip(values) {
                 samples[tree][column][sample].value = value;
             }
@@ -488,12 +506,11 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         channel.mix_felts(&sampled_values.clone().flatten_cols());
 
         let columns = self.evaluations();
-        // Columns that store no values regrow their stripe 0 in bounded batches.
+        // Columns that store no values are reproduced from their sources: their stripes 0 in
+        // bounded batches, or their combination per size (see
+        // `compute_fri_quotients_with_regrowth`).
         let polynomials = self.polynomials();
-        let quotient_twiddles = self.twiddles;
-        let regrow = |tree: usize, column: usize| {
-            polynomials[tree][column].stripe0(quotient_twiddles).into_owned()
-        };
+        let sourced = |tree: usize, column: usize| -> &Poly<B> { polynomials[tree][column] };
         print_column_size_histogram::<B, MC>(&columns);
         // Proof of work before the coefficient that batches the quotients.
         grind_smallest(channel, self.config.grinding.batching_bits);
@@ -501,7 +518,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Compute oods quotients for boundary constraints on the sampled points.
         let quotients = compute_fri_quotients_with_regrowth(
             &columns,
-            Some(&regrow),
+            Some(&sourced),
             &samples,
             batching_coeff,
             lifting_log_size,
@@ -1154,35 +1171,24 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .zip(&self.polynomials)
             .sorted_by_key(|(_, poly)| poly.evals.domain.log_size())
             .collect_vec();
-        // The size groups and their 16-column chunks, once; every leaf then hashes the same
-        // sequence of updates as before, the leaves in parallel.
-        let mut chunks: Vec<(usize, usize)> = vec![];
+        // Preserve the existing stable size order and its separate updates of up to 16
+        // columns. The backend hashes the gathered rows without regenerating any column.
+        let mut column_chunks = Vec::new();
         let mut start = 0;
         while start < by_size.len() {
             let log_size = by_size[start].1.evals.domain.log_size();
-            let mut end = start;
+            let mut end = start + 1;
             while end < by_size.len() && by_size[end].1.evals.domain.log_size() == log_size {
                 end += 1;
             }
-            let mut from = start;
-            while from < end {
-                chunks.push((from, (from + 16).min(end)));
-                from += 16;
-            }
+            column_chunks.extend((start..end).step_by(16).map(|i| i..(i + 16).min(end)));
             start = end;
         }
-        let hash_leaf = |i: usize| {
-            let mut hasher = MC::H::default();
-            for &(from, to) in &chunks {
-                let values = by_size[from..to].iter().map(|(rows, _)| rows[queries.len() + i]).collect_vec();
-                hasher.update_leaf(&values);
-            }
-            hasher.finalize()
-        };
-        #[cfg(feature = "parallel")]
-        let hashes: Vec<_> = (0..leaf_positions.len()).into_par_iter().map(hash_leaf).collect();
-        #[cfg(not(feature = "parallel"))]
-        let hashes: Vec<_> = (0..leaf_positions.len()).map(hash_leaf).collect();
+        let leaf_columns = by_size
+            .iter()
+            .map(|(rows, _)| &rows[queries.len()..])
+            .collect_vec();
+        let hashes = B::hash_sampled_leaves(&leaf_columns, &column_chunks, leaf_positions.len());
         let leaves: HashMap<usize, <MC::H as MerkleHasherLifted>::Hash> =
             leaf_positions.iter().copied().zip(hashes).collect();
         self.commitment.decommit_from(queries, queried_values, |positions| {
