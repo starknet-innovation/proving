@@ -148,7 +148,7 @@ where
 
     // Base trace.
     let mut tree_builder = commitment_scheme.tree_builder();
-    let (claim, component_log_sizes, interaction_generator) = write_trace(
+    let (claim, component_log_sizes, interaction_generator, _blake_g_gate_columns) = write_trace(
         values,
         preprocessed_trace.clone(),
         *n_outputs,

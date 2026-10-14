@@ -34,7 +34,7 @@ pub fn write_trace<MC: MerkleChannel>(
     tree_builder: &mut TreeBuilder<'_, '_, SimdBackend, MC>,
     trace_generator: &TraceGenerator,
     twiddles: &TwiddleTree<SimdBackend>,
-) -> (CircuitClaim, PerComponent<u32>, CircuitInteractionClaimGenerator)
+) -> (CircuitClaim, PerComponent<u32>, CircuitInteractionClaimGenerator, std::ops::Range<usize>)
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -65,7 +65,9 @@ where
     let mut m_31_to_u_32_claim_icg = MaybeUninit::uninit();
     let mut m_31_to_u_32_polys_result = MaybeUninit::uninit();
     scope(|s| {
-        // Eq and qm31_ops traces run for the full duration of the parent scope.
+        // Eq and qm31_ops traces (with their interpolation) run first, in a subscope of their own:
+        // their temporaries do not overlap the gate components' inputs and lookup data.
+        scope(|s| {
         s.spawn(|_| {
             let (trace, log_size, lookup_data) = qm31_ops::write_trace(
                 context_values,
@@ -80,6 +82,7 @@ where
                 eq::write_trace(context_values, preprocessed_trace_ref);
             let polys = SimdBackend::interpolate_columns(trace.to_evals(), twiddles);
             eq_result.write((polys, log_size, lookup_data));
+        });
         });
 
         // Initialize claim generators in a subscope.
@@ -270,8 +273,16 @@ where
         verify_bitwise_xor_9_polys,
         range_check_16_polys,
     ];
-    for polys in component_trace_polys {
-        tree_builder.extend_polys(polys);
+    // The columns of blake_g_gate, the component whose composition reads the most of them.
+    let mut blake_g_gate_columns = 0..0;
+    let mut qm31_ops_columns = 0..0;
+    for (index, polys) in component_trace_polys.into_iter().enumerate() {
+        let span = tree_builder.extend_polys(polys);
+        match index {
+            1 => qm31_ops_columns = span.col_start..span.col_end,
+            4 => blake_g_gate_columns = span.col_start..span.col_end,
+            _ => {}
+        }
     }
 
     let output_values = ((U_VAR_IDX + 1)..(U_VAR_IDX + 1 + n_outputs))
@@ -284,6 +295,8 @@ where
         CircuitInteractionClaimGenerator {
             eq_lookup_data,
             qm31_ops_lookup_data,
+            qm31_ops_columns,
+            preprocessed_trace: preprocessed_trace.clone(),
             triple_xor: triple_xor_interaction_claim_gen,
             m_31_to_u_32: m_31_to_u_32_interaction_claim_gen,
             blake_g_gate: blake_g_gate_interaction_claim_gen,
@@ -294,12 +307,16 @@ where
             verify_bitwise_xor_9: verify_bitwise_xor_9_interaction_claim_gen,
             range_check_16: range_check_16_interaction_claim_gen,
         },
+        blake_g_gate_columns,
     )
 }
 
 pub struct CircuitInteractionClaimGenerator {
     pub eq_lookup_data: eq::LookupData,
     pub qm31_ops_lookup_data: qm31_ops::LookupData,
+    /// The base tree's columns of qm31_ops, which its interaction write reads back.
+    pub qm31_ops_columns: std::ops::Range<usize>,
+    pub preprocessed_trace: Arc<PreProcessedTrace>,
     pub triple_xor: triple_xor::InteractionClaimGenerator,
     pub m_31_to_u_32: m_31_to_u_32::InteractionClaimGenerator,
     pub blake_g_gate: blake_g_gate::InteractionClaimGenerator,
@@ -334,6 +351,8 @@ where
     let CircuitInteractionClaimGenerator {
         eq_lookup_data,
         qm31_ops_lookup_data,
+        qm31_ops_columns,
+        preprocessed_trace,
         triple_xor,
         m_31_to_u_32,
         blake_g_gate,
@@ -350,8 +369,9 @@ where
         blake_g_gate.write_interaction_trace(&interaction_elements.common_lookup_elements);
     all_polys.blake_g_gate = SimdBackend::interpolate_columns(trace, twiddles);
     claimed_sums.blake_g_gate = claim.claimed_sum;
-    scope(|s| {
-
+    // The other components write their interaction traces in parallel (each writer is parallel
+    // inside too): with the gate tuples kept narrow, their lookup data no longer sets a peak here.
+    rayon::scope(|s| {
         s.spawn(|_| {
             let (trace, claimed_sum) = eq::write_interaction_trace(
                 eq_log_size,
@@ -362,9 +382,15 @@ where
             claimed_sums.eq = claimed_sum;
         });
         s.spawn(|_| {
+            let start = qm31_ops_columns.start;
+            let read = |columns: std::ops::Range<usize>| {
+                tree_builder.committed_trace_values(1, start + columns.start..start + columns.end)
+            };
             let (trace, claimed_sum) = qm31_ops::write_interaction_trace(
                 qm31_ops_log_size,
                 qm31_ops_lookup_data,
+                &read,
+                &preprocessed_trace,
                 &interaction_elements.common_lookup_elements,
             );
             all_polys.qm31_ops = SimdBackend::interpolate_columns(trace, twiddles);

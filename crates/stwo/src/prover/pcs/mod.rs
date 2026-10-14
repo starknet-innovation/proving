@@ -673,6 +673,41 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
         TreeSubspan { tree_index: self.tree_index, col_start, col_end }
     }
 
+    /// The values, on its trace domain (in bit-reversed order), of every column `columns` of the
+    /// committed tree `tree`: exactly the values it was interpolated from. A writer that kept a
+    /// copy of them reads them back instead.
+    pub fn committed_trace_values(
+        &self,
+        tree: usize,
+        columns: std::ops::Range<usize>,
+    ) -> Vec<Col<B, BaseField>> {
+        let twiddles = self.commitment_scheme.twiddles;
+        let log_blowup_factor = self.commitment_scheme.config.fri_config.log_blowup_factor;
+        let read = |poly: &Poly<B>| {
+            let log_size = poly.evals.domain.log_size() - log_blowup_factor;
+            let mut coeffs = match &poly.coeffs {
+                Some(coeffs) => std::borrow::Cow::Borrowed(coeffs),
+                None => std::borrow::Cow::Owned(poly.regrown_coefficients()),
+            };
+            if coeffs.log_size() > log_size {
+                // A column that stores its whole extension regrows its coefficients at the
+                // extension's size; the ones past the trace's size are zero.
+                let low = coeffs.coeffs.to_cpu()[..1 << log_size].iter().copied().collect();
+                coeffs = std::borrow::Cow::Owned(CircleCoefficients::new(low));
+            }
+            let domain = CanonicCoset::new(log_size).circle_domain();
+            coeffs.evaluate_with_twiddles(domain, twiddles).values
+        };
+        let polynomials = &self.commitment_scheme.trees[tree].polynomials[columns];
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            polynomials.par_iter().map(read).collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        polynomials.iter().map(read).collect()
+    }
+
     pub fn commit(self, channel: &mut MC::C) {
         let _span = span!(Level::INFO, "Commitment").entered();
         self.commitment_scheme.commit(self.polys, channel);
@@ -826,8 +861,15 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         crate::prover::backend::simd::column::trim_heap();
         // Each stripe is committed as `2^sub` blocks, so that the scratch of every column is a
         // block, not a stripe. The tree is the same: its leaves are rows.
-        let sub = 1u32
-            .min(polynomials.iter().map(|poly| poly.log_size()).min().unwrap() - 4);
+        // A tree that keeps its coefficients evaluates whole stripes: every block folds all of a
+        // column's coefficients again, which made its fill (at 2^23 circuit rows) about twice as
+        // slow as one FFT per stripe, and with the circuit's lookup data kept narrow its stripe
+        // scratch fits under the proof's peak.
+        let sub = if keep_coef {
+            0
+        } else {
+            1u32.min(polynomials.iter().map(|poly| poly.log_size()).min().unwrap() - 4)
+        };
         let n_stripes = 1usize << (log_blowup_factor + sub);
         let stripe_lifting_log_size = lifting_log_size - log_blowup_factor - sub;
         let domains = polynomials

@@ -61,7 +61,7 @@ pub fn write_trace(
 
     let preprocessed_columns = [in0_address, in1_address]
         .into_iter()
-        .map(|col| Col::<SimdBackend, M31>::from_iter(col.iter().map(|&x| M31::from(x))).data)
+        .map(|col| crate::witness::utils::pack_usize_column(&col))
         .collect_vec();
 
     let (trace, lookup_data) = write_trace_simd(packed_inputs, preprocessed_columns);

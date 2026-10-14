@@ -14,3 +14,22 @@ where
     );
     values.par_chunks_exact(N_LANES).map(|c| T::pack(c.try_into().unwrap())).collect()
 }
+
+/// A preprocessed column's values as packed field elements: what
+/// `Col::<SimdBackend, M31>::from_iter` of their `M31::from` holds (the last packed word padded
+/// with zeros), converted in parallel instead of one value after the other. At 2^23 rows the
+/// qm31_ops writer converted eight such columns in series.
+pub fn pack_usize_column(
+    values: &[usize],
+) -> Vec<stwo::prover::backend::simd::m31::PackedM31> {
+    use stwo::core::fields::m31::M31;
+    use stwo::prover::backend::simd::m31::PackedM31;
+    values
+        .par_chunks(N_LANES)
+        .map(|chunk| {
+            PackedM31::from_array(std::array::from_fn(|i| {
+                chunk.get(i).map_or(M31::from(0u32), |&value| M31::from(value))
+            }))
+        })
+        .collect()
+}

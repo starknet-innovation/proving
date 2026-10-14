@@ -54,7 +54,7 @@ pub fn write_trace(
 
     let preprocessed_columns = [input_addr_col, output_addr_col, multiplicity_col]
         .into_iter()
-        .map(|col| Col::<SimdBackend, M31>::from_iter(col.iter().map(|&x| M31::from(x))).data)
+        .map(|col| crate::witness::utils::pack_usize_column(&col))
         .collect_vec();
 
     let (trace, lookup_data, sub_component_inputs) =

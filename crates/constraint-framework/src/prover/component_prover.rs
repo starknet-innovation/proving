@@ -143,7 +143,7 @@ const LOG_N_BLOCKS: u32 = 2;
 /// blocks. Every block folds each column's coefficients again: at 2^23 circuit rows the first
 /// season's 96 MiB took the circuit's components to 32 blocks, and its composition to 9.3 of the
 /// proof's 23 s; at 512 MiB it takes 3.6 s, and its memory stays under the decommitment's peak.
-const BLOCK_COLUMNS_BYTES: usize = 512 << 20;
+const BLOCK_COLUMNS_BYTES: usize = 768 << 20;
 /// At most `2^MAX_LOG_N_BLOCKS` blocks: each block folds every column's coefficients again.
 const MAX_LOG_N_BLOCKS: u32 = 5;
 
