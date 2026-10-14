@@ -54,15 +54,26 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
     let precomputes = prepare_recursive_prover_precomputes().map_err(|e| anyhow!("{e}"))?;
     let prover_input: ProverInput = serde_json::from_slice(&input[witness_start..])?;
     drop(input);
-    let cairo_proof = prove_cairo_with_precompute(
-        &precomputes.base_column_pool,
-        &precomputes.twiddles,
-        precomputes.cairo_preprocessed_trace.clone(),
-        MaybeOwned::Borrowed(&precomputes.cairo_preprocessed_tree),
-        prover_input,
-        CAIRO_PROVER_PARAMS,
-    )
-    .map_err(|e| anyhow!("cairo proof failed: {e:?}"))?;
+    // The circuit's preprocessing and its committed tree (both built on first use, see
+    // `LazyPreprocessedCircuit`) are independent of the Cairo proof and are needed only by the
+    // circuit proof: they are built beside the Cairo proof, whose witness windows leave workers
+    // idle, instead of beside the verifier-circuit fill, which they outlast.
+    let (cairo_proof, ()) = rayon::join(
+        || {
+            prove_cairo_with_precompute(
+                &precomputes.base_column_pool,
+                &precomputes.twiddles,
+                precomputes.cairo_preprocessed_trace.clone(),
+                MaybeOwned::Borrowed(&precomputes.cairo_preprocessed_tree),
+                prover_input,
+                CAIRO_PROVER_PARAMS,
+            )
+        },
+        || {
+            let _ = &**precomputes.circuit_preprocessed_tree;
+        },
+    );
+    let cairo_proof = cairo_proof.map_err(|e| anyhow!("cairo proof failed: {e:?}"))?;
     let component_enable_bits = cairo_proof.claim.flatten_claim().component_enable_bits;
     let zk_blinding_seed = cairo_proof.extended_stark_proof.proof.commitments.0[1].0;
     let (proof, aux) = prepare_cairo_proof_for_circuit_verifier(&cairo_proof, &component_enable_bits);

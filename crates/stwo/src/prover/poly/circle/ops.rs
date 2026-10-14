@@ -70,6 +70,16 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         point: CirclePoint<SecureField>,
     ) -> SecureField;
 
+    /// The values at `point` of several polynomials of one log size: the same field products as
+    /// [`Self::eval_at_point`] per polynomial, reassociated so that the twiddle factors are built
+    /// once for the group. Backends may override it with a shared basis.
+    fn eval_at_point_group(
+        polys: &[&CircleCoefficients<Self>],
+        point: CirclePoint<SecureField>,
+    ) -> Vec<SecureField> {
+        polys.iter().map(|poly| Self::eval_at_point(poly, point)).collect()
+    }
+
     /// Log size of the barycentric weights for a domain of `log_size` with `log_blowup`.
     fn barycentric_log_size(log_size: u32, _log_blowup: u32) -> u32 {
         log_size

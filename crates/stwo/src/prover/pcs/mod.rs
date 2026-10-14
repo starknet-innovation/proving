@@ -3,7 +3,7 @@ use std::array;
 use hashbrown::HashMap;
 use itertools::Itertools;
 #[cfg(feature = "parallel")]
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use tracing::{Level, info, span};
 
 use crate::core::ColumnVec;
@@ -167,9 +167,14 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 let to_stripe = |poly: &mut Poly<B>| {
                     if poly.evals.values.len() == 0 {
                         let coeffs = poly.coeffs.take().unwrap();
-                        let mut stripe = pool.take_or_alloc(coeffs.log_size());
+                        let log_size = coeffs.log_size();
+                        let mut stripe = pool.take_or_alloc(log_size);
                         B::evaluate_stripe_into(&coeffs, poly.evals.domain, twiddles, 0, &mut stripe);
                         poly.evals.values = stripe;
+                        // The coefficients are dead once stripe 0 is back. Their buffer is
+                        // resident, so it serves as the next column's stripe instead of a fresh
+                        // allocation whose pages the kernel would zero first.
+                        pool.give_back(log_size, coeffs.coeffs);
                     }
                 };
                 #[cfg(feature = "parallel")]
@@ -256,6 +261,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             HashMap::new();
         // Columns that store no values are sampled from their source (see below).
         let mut sourced: Vec<(usize, usize)> = vec![];
+        // Columns that keep coefficients: one shared basis per (log size, point).
+        let mut coefficient_groups: HashMap<(u32, CirclePoint<SecureField>), Vec<(usize, usize, usize)>> =
+            HashMap::new();
         assert_eq!(polynomials.len(), sampled_points.len());
         for (tree_index, columns) in polynomials.iter().enumerate() {
             assert_eq!(columns.len(), sampled_points[tree_index].len());
@@ -269,9 +277,11 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                     sampled_points[tree_index][column_index].iter().enumerate()
                 {
                     let projected_point = point.repeated_double(lifting_log_size - log_size);
-                    if let Some(coefficients) = &poly.coeffs {
-                        samples[tree_index][column_index][sample_index].value =
-                            coefficients.eval_at_point(projected_point);
+                    if poly.coeffs.is_some() {
+                        coefficient_groups
+                            .entry((poly.coeffs.as_ref().unwrap().log_size(), projected_point))
+                            .or_default()
+                            .push((tree_index, column_index, sample_index));
                     } else {
                         groups.entry((log_size, projected_point)).or_default().push((
                             tree_index,
@@ -280,6 +290,16 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                         ));
                     }
                 }
+            }
+        }
+        for ((_, point), members) in coefficient_groups {
+            let polys = members
+                .iter()
+                .map(|&(tree, column, _)| polynomials[tree][column].coeffs.as_ref().unwrap())
+                .collect_vec();
+            let values = B::eval_at_point_group(&polys, point);
+            for ((tree, column, sample), value) in members.into_iter().zip(values) {
+                samples[tree][column][sample].value = value;
             }
         }
         let log_blowup = self.config.fri_config.log_blowup_factor;
@@ -380,7 +400,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             span!(Level::INFO, "Evaluate columns out of domain", class = "EvaluateOutOfDomain")
                 .entered();
 
-        if !self.store_polynomials_coefficients {
+        if !self.store_polynomials_coefficients
+            || self.polynomials().iter().flatten().all(|poly| poly.coeffs.is_some() || poly.is_sourced())
+        {
             return self.compute_grouped_samples(sampled_points, lifting_log_size);
         }
 
@@ -442,10 +464,11 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Evaluate polynomials on open points.
         let samples = self.compute_samples(&sampled_points, lifting_log_size);
 
-        // Interpolation weights are complete; quotient and opening paths own their buffers.
-        self.base_column_pool.release_all_idle();
-
+        // The regrown stripes take the idle weight buffers and each other's dead coefficient
+        // buffers; the pool is emptied once they are back. Quotient and opening paths own their
+        // buffers.
         self.coefficients_to_striped();
+        self.base_column_pool.release_all_idle();
         crate::prover::backend::simd::column::trim_heap();
         // Point samples are complete; subsequent quotient and opening paths use evaluations.
         for tree in &mut self.trees.0 {
@@ -531,17 +554,16 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         let commitments = self.roots();
         let twiddles = self.twiddles;
         let pool: &BaseColumnPool<B> = &self.base_column_pool;
-        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = self
-            .trees
-            .as_ref()
-            .zip_eq(query_positions_tree)
-            .map(|(tree, query_positions)| {
-                tree.decommit(query_positions, twiddles, pool, self.config.fri_config.log_blowup_factor)
-            })
-            .0
-            .into_iter()
-            .map(|(v, x)| (v, x.decommitment, x.aux))
-            .multiunzip();
+        let log_blowup_factor = self.config.fri_config.log_blowup_factor;
+        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = map_in_pairs(
+            self.trees.as_ref().zip_eq(query_positions_tree).0,
+            |(tree, query_positions)| {
+                tree.decommit(query_positions, twiddles, pool, log_blowup_factor)
+            },
+        )
+        .into_iter()
+        .map(|(v, x)| (v, x.decommitment, x.aux))
+        .multiunzip();
 
         // Return evaluation buffers to the memory pool for reuse (owned trees only).
         for tree in &mut self.trees.0 {
@@ -577,6 +599,29 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             },
         }
     }
+}
+
+/// Maps adjacent tree openings together, preserving order and finishing each pair before starting
+/// the next. A pair can retain both trees' scratch and cold-cache plans until its nested work
+/// joins.
+fn map_in_pairs<T: Send, R: Send>(
+    items: impl IntoIterator<Item = T>,
+    f: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    let mut items = items.into_iter();
+    let mut results = Vec::with_capacity(items.size_hint().0);
+    while let Some(first) = items.next() {
+        let Some(second) = items.next() else {
+            results.push(f(first));
+            break;
+        };
+        #[cfg(feature = "parallel")]
+        let (first, second) = rayon::join(|| f(first), || f(second));
+        #[cfg(not(feature = "parallel"))]
+        let (first, second) = (f(first), f(second));
+        results.extend([first, second]);
+    }
+    results
 }
 
 /// Helper struct for aggregating polynomials and evaluations for a commitment tree.
@@ -1109,24 +1154,35 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .zip(&self.polynomials)
             .sorted_by_key(|(_, poly)| poly.evals.domain.log_size())
             .collect_vec();
-        // Preserve the existing stable size order and its separate updates of up to 16
-        // columns. The backend hashes the gathered rows without regenerating any column.
-        let mut column_chunks = Vec::new();
+        // The size groups and their 16-column chunks, once; every leaf then hashes the same
+        // sequence of updates as before, the leaves in parallel.
+        let mut chunks: Vec<(usize, usize)> = vec![];
         let mut start = 0;
         while start < by_size.len() {
             let log_size = by_size[start].1.evals.domain.log_size();
-            let mut end = start + 1;
+            let mut end = start;
             while end < by_size.len() && by_size[end].1.evals.domain.log_size() == log_size {
                 end += 1;
             }
-            column_chunks.extend((start..end).step_by(16).map(|i| i..(i + 16).min(end)));
+            let mut from = start;
+            while from < end {
+                chunks.push((from, (from + 16).min(end)));
+                from += 16;
+            }
             start = end;
         }
-        let leaf_columns = by_size
-            .iter()
-            .map(|(rows, _)| &rows[queries.len()..])
-            .collect_vec();
-        let hashes = B::hash_sampled_leaves(&leaf_columns, &column_chunks, leaf_positions.len());
+        let hash_leaf = |i: usize| {
+            let mut hasher = MC::H::default();
+            for &(from, to) in &chunks {
+                let values = by_size[from..to].iter().map(|(rows, _)| rows[queries.len() + i]).collect_vec();
+                hasher.update_leaf(&values);
+            }
+            hasher.finalize()
+        };
+        #[cfg(feature = "parallel")]
+        let hashes: Vec<_> = (0..leaf_positions.len()).into_par_iter().map(hash_leaf).collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashes: Vec<_> = (0..leaf_positions.len()).map(hash_leaf).collect();
         let leaves: HashMap<usize, <MC::H as MerkleHasherLifted>::Hash> =
             leaf_positions.iter().copied().zip(hashes).collect();
         self.commitment.decommit_from(queries, queried_values, |positions| {
@@ -1178,5 +1234,203 @@ fn print_column_size_histogram<B: BackendForChannel<MC>, MC: MerkleChannel>(
     }
     for (log_size, count) in log_size_histogram {
         info!("Log size {log_size}: {count}");
+    }
+}
+
+#[test]
+fn paired_decommit_matches_sequential_raw() {
+    use crate::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
+    use crate::prover::air::component_prover::TraceSource;
+    use crate::prover::backend::simd::SimdBackend;
+
+    type Tree = CommitmentTreeProver<SimdBackend, Blake2sMerkleChannel>;
+    type Opening =
+        (ColumnVec<Vec<BaseField>>, ExtendedMerkleDecommitmentLifted<Blake2sMerkleHasher>);
+    type RawOpening = (Vec<Vec<u32>>, Vec<[u8; 32]>, Vec<Vec<(usize, [u8; 32])>>);
+
+    fn raw((values, opening): Opening) -> RawOpening {
+        (
+            values
+                .into_iter()
+                .map(|column| column.into_iter().map(|value| value.0).collect())
+                .collect(),
+            opening.decommitment.hash_witness.into_iter().map(|hash| hash.0).collect(),
+            opening
+                .aux
+                .all_node_values
+                .into_iter()
+                .map(|layer| {
+                    layer
+                        .into_iter()
+                        .map(|(index, hash)| (index, hash.0))
+                        .sorted_by_key(|x| x.0)
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
+    fn coefficients(seed: u32, sizes: &[u32]) -> Vec<CircleCoefficients<SimdBackend>> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(column, &log_size)| {
+                CircleCoefficients::new(
+                    (0..1 << log_size)
+                        .map(|i| BaseField::from(seed + 37 * column as u32 + 13 * i))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    struct ValuesSource(Vec<BaseField>);
+    impl TraceSource for ValuesSource {
+        fn log_size(&self) -> u32 {
+            self.0.len().ilog2()
+        }
+        fn write_values(&self, dst: &mut [BaseField]) {
+            dst.copy_from_slice(&self.0);
+        }
+    }
+
+    let log_blowup_factor = 2;
+    let twiddles =
+        SimdBackend::precompute_twiddles(CanonicCoset::new(12).circle_domain().half_coset);
+    let pool = BaseColumnPool::new();
+    let make_tree = |seed, sizes: &[u32], lifting_log_size, keep_coefficients| {
+        Tree::new_ex(
+            coefficients(seed, sizes),
+            log_blowup_factor,
+            &twiddles,
+            false,
+            lifting_log_size,
+            &pool,
+            keep_coefficients,
+        )
+    };
+    // The first pair has matching prefix-plan keys but distinct values. The second pair mixes
+    // whole evaluations with coefficient-backed stripes, and the odd tail regrows a source.
+    let mut trees = vec![
+        make_tree(11, &[10, 8, 10, 4], 12, false),
+        make_tree(29, &[10, 8, 10, 4], 12, false),
+        make_tree(43, &[7, 5], 9, false),
+        make_tree(61, &[10, 8], 12, true),
+    ];
+    let sourced_coefficients = coefficients(79, &[10, 4]);
+    let source: SharedTraceSource = std::sync::Arc::new(ValuesSource(
+        sourced_coefficients[0]
+            .evaluate_with_twiddles(CanonicCoset::new(10).circle_domain(), &twiddles)
+            .values
+            .to_cpu(),
+    ));
+    trees.push(Tree::new_with_sources(
+        sourced_coefficients,
+        log_blowup_factor,
+        &twiddles,
+        false,
+        12,
+        &pool,
+        vec![Some(source), None],
+    ));
+    assert_eq!(trees.iter().map(Tree::is_striped).collect_vec(), [true, true, false, true, true]);
+    assert!(trees[4].polynomials[0].is_sourced());
+
+    // Unsorted and repeated queries exercise both raw query ordering and Merkle deduplication.
+    let queries = trees
+        .iter()
+        .map(|tree| {
+            let size = 1usize << (tree.commitment.layers.len() - 1);
+            vec![size - 1, 0, size / 2 + 1, 3, size - 1, size / 4]
+        })
+        .collect_vec();
+    let open = |(tree, queries): (&Tree, &Vec<usize>)| {
+        raw(tree.decommit(queries, &twiddles, &pool, log_blowup_factor))
+    };
+    let first_paired = map_in_pairs(trees.iter().zip(&queries), open);
+    let sequential = trees.iter().zip(&queries).map(open).collect_vec();
+    assert_eq!(first_paired, sequential);
+    assert_ne!(sequential[0], sequential[1]);
+    for count in 0..=trees.len() {
+        let paired = map_in_pairs(trees[..count].iter().zip(&queries[..count]), open);
+        assert_eq!(paired, sequential[..count], "tree count {count}");
+    }
+    // Also join sourced regrowth with a coefficient-backed striped opening.
+    let reversed = map_in_pairs(trees.iter().zip(&queries).rev(), open);
+    assert_eq!(reversed, sequential.into_iter().rev().collect_vec());
+}
+
+#[test]
+fn paired_decommit_order_and_pair_boundary() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for count in 0..=9 {
+        let finished = (0..count).map(|_| AtomicUsize::new(0)).collect_vec();
+        let active = AtomicUsize::new(0);
+        let opened = map_in_pairs(0..count, |index| {
+            // A later pair must not start while any opening from an earlier pair is unfinished.
+            for prior in &finished[..index / 2 * 2] {
+                assert_eq!(prior.load(Ordering::SeqCst), 1);
+            }
+            assert!(active.fetch_add(1, Ordering::SeqCst) < 2);
+            std::thread::yield_now();
+            active.fetch_sub(1, Ordering::SeqCst);
+            assert_eq!(finished[index].fetch_add(1, Ordering::SeqCst), 0);
+            index
+        });
+        assert_eq!(opened, (0..count).collect_vec());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(finished.iter().all(|done| done.load(Ordering::SeqCst) == 1));
+    }
+}
+
+#[test]
+fn paired_decommit_parallel_join() {
+    #[cfg(feature = "parallel")]
+    {
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+
+        let state = Mutex::new((false, false));
+        let ready = Condvar::new();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let opened = pool.install(|| {
+            map_in_pairs(0..3, |index| {
+                let mut state = state.lock().unwrap();
+                if index == 0 {
+                    state.0 = true;
+                    ready.notify_all();
+                    let (state, _) = ready
+                        .wait_timeout_while(state, Duration::from_secs(5), |state| !state.1)
+                        .unwrap();
+                    assert!(state.1, "second opening did not join");
+                } else if index == 1 {
+                    let (mut state, _) = ready
+                        .wait_timeout_while(state, Duration::from_secs(5), |state| !state.0)
+                        .unwrap();
+                    assert!(state.0, "first opening did not join");
+                    state.1 = true;
+                    ready.notify_all();
+                } else {
+                    assert_eq!(*state, (true, true));
+                }
+                index
+            })
+        });
+        // The first opening depends on the second, but results retain input order.
+        assert_eq!(opened, [0, 1, 2]);
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let next = AtomicUsize::new(0);
+        assert_eq!(
+            map_in_pairs(0..3, |index| {
+                assert_eq!(next.fetch_add(1, Ordering::SeqCst), index);
+                index
+            }),
+            [0, 1, 2]
+        );
     }
 }

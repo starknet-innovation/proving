@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use circuits::circuit::{
-    Add, BlakeGGate, Circuit, Eq, M31ToU32, Mul, Permutation, PointwiseMul, Sub, TripleXor,
+    Add, BlakeGGate, Circuit, Eq, Gate, M31ToU32, Mul, Permutation, PointwiseMul, Sub, TripleXor,
 };
 use circuits::context::FinalizedContext;
 use circuits::ivalue::IValue;
@@ -235,14 +235,16 @@ enum OpCode {
 }
 
 /// Adds the binary operation gates to the qm31 ops preprocessed trace.
-fn fill_binary_op_columns(
-    gates: impl IntoIterator<Item = (usize, usize, usize)>,
+fn fill_binary_op_columns<G: Gate>(
+    gates: &[G],
     op_code: OpCode,
     multiplicities: &[usize],
     columns: &mut [Vec<usize>; N_QM31_OPS_PP_COLUMNS],
 ) {
     let op_code_idx = op_code as usize;
-    for (in0, in1, out) in gates {
+    for gate in gates.iter() {
+        let [in0, in1] = gate.uses()[..] else { panic!("Expected 2 uses for gate") };
+        let [out] = gate.yields()[..] else { panic!("Expected 1 yield for gate") };
         (0..N_OP_CODES).for_each(|i| {
             columns[i].push(if i == op_code_idx { 1 } else { 0 });
         });
@@ -273,8 +275,8 @@ fn fill_permutation_columns(
     let add_op_code_idx = OpCode::Add as usize;
     let mut permutation_address = first_unused_address;
     for gate in gates.iter() {
-        let inputs = &gate.inputs;
-        let outputs = &gate.outputs;
+        let inputs = gate.uses();
+        let outputs = gate.yields();
 
         // Set flag to Add opcode.
         (0..N_OP_CODES).for_each(|i| {
@@ -285,7 +287,7 @@ fn fill_permutation_columns(
         });
 
         // TODO(alonf): Parallelize, and insert the above loop inside.
-        for (&input, &output) in zip_eq(inputs, outputs) {
+        for (input, output) in zip_eq(inputs, outputs) {
             // Input row.
             columns[4].push(0);
             columns[5].push(input);
@@ -324,33 +326,12 @@ fn qm31_ops_preprocessed_columns(
     multiplicities: &[usize],
 ) -> (Qm31OpsColumns, Qm31OpsTraceGenerator) {
     let Qm31OpsGates { add, sub, mul, pointwise_mul, permutation } = gates;
-    let n_rows = add.len()
-        + sub.len()
-        + mul.len()
-        + pointwise_mul.len()
-        + permutation.iter().map(|gate| gate.inputs.len() + gate.outputs.len()).sum::<usize>();
-    let mut qm31_ops_columns: [_; N_QM31_OPS_PP_COLUMNS] =
-        std::array::from_fn(|_| Vec::with_capacity(n_rows));
+    let mut qm31_ops_columns: [_; N_QM31_OPS_PP_COLUMNS] = std::array::from_fn(|_| vec![]);
+    fill_binary_op_columns(add, OpCode::Add, multiplicities, &mut qm31_ops_columns);
+    fill_binary_op_columns(sub, OpCode::Sub, multiplicities, &mut qm31_ops_columns);
+    fill_binary_op_columns(mul, OpCode::Mul, multiplicities, &mut qm31_ops_columns);
     fill_binary_op_columns(
-        add.iter().map(|gate| (gate.in0, gate.in1, gate.out)),
-        OpCode::Add,
-        multiplicities,
-        &mut qm31_ops_columns,
-    );
-    fill_binary_op_columns(
-        sub.iter().map(|gate| (gate.in0, gate.in1, gate.out)),
-        OpCode::Sub,
-        multiplicities,
-        &mut qm31_ops_columns,
-    );
-    fill_binary_op_columns(
-        mul.iter().map(|gate| (gate.in0, gate.in1, gate.out)),
-        OpCode::Mul,
-        multiplicities,
-        &mut qm31_ops_columns,
-    );
-    fill_binary_op_columns(
-        pointwise_mul.iter().map(|gate| (gate.in0, gate.in1, gate.out)),
+        pointwise_mul,
         OpCode::PointwiseMul,
         multiplicities,
         &mut qm31_ops_columns,
@@ -779,7 +760,8 @@ impl PreprocessedCircuit {
 
         // Adjust multiplicities to account for the use of the constant 0 in the permutation gate
         // implementation. See `fill_permutation_columns` for details.
-        let mut multiplicities = circuit.count_uses();
+        // Only the uses are read; they are counted on this thread (see the components below).
+        let mut multiplicities = circuit.compute_uses();
         let additional_zero_multiplicity: usize =
             circuit.permutation.iter().map(|gate| gate.inputs.len() + gate.outputs.len()).sum();
         multiplicities[0] += additional_zero_multiplicity;
@@ -801,53 +783,39 @@ impl PreprocessedCircuit {
         // Add Eq columns.
         // The components' columns are built independently and pushed in the fixed order.
         let multiplicities = &multiplicities;
-        let (
-            (eq_columns, (qm31_ops_columns, qm31_ops_trace_generator)),
-            (triple_xor_columns, (m31_to_u32_columns, blake_g_gate_columns)),
-        ) = rayon::join(
-            || {
-                rayon::join(
-                    || {
-                        let mut trace = PreProcessedTrace::default();
-                        eq_preprocessed_columns(eq).push_to(&mut trace);
-                        trace
-                    },
-                    || {
-                        let (columns, generator) = qm31_ops_preprocessed_columns(
-                            Qm31OpsGates { add, sub, mul, pointwise_mul, permutation },
-                            *n_vars,
-                            multiplicities,
-                        );
-                        let mut trace = PreProcessedTrace::default();
-                        columns.push_to(&mut trace);
-                        (trace, generator)
-                    },
-                )
-            },
-            || {
-                rayon::join(
-                    || {
-                                let mut trace = PreProcessedTrace::default();
-                                triple_xor_preprocessed_columns(triple_xor, multiplicities).push_to(&mut trace);
-                                trace
-                            },
-                    || {
-                        rayon::join(
-                            || {
-                                let mut trace = PreProcessedTrace::default();
-                                m31_to_u32_preprocessed_columns(m31_to_u32, multiplicities).push_to(&mut trace);
-                                trace
-                            },
-                            || {
-                                let mut trace = PreProcessedTrace::default();
-                                blake_g_gate_preprocessed_columns(blake_g_gate, multiplicities).push_to(&mut trace);
-                                trace
-                            },
-                        )
-                    },
-                )
-            },
-        );
+        // The components are built one after the other on this thread. This runs beside the Cairo
+        // proof: a long branch handed to the pool would be picked up by a Cairo worker waiting in
+        // its own join, which then holds up the Cairo commitment until the branch finishes.
+        let eq_columns = {
+            let mut trace = PreProcessedTrace::default();
+            eq_preprocessed_columns(eq).push_to(&mut trace);
+            trace
+        };
+        let (qm31_ops_columns, qm31_ops_trace_generator) = {
+            let (columns, generator) = qm31_ops_preprocessed_columns(
+                Qm31OpsGates { add, sub, mul, pointwise_mul, permutation },
+                *n_vars,
+                multiplicities,
+            );
+            let mut trace = PreProcessedTrace::default();
+            columns.push_to(&mut trace);
+            (trace, generator)
+        };
+        let triple_xor_columns = {
+            let mut trace = PreProcessedTrace::default();
+            triple_xor_preprocessed_columns(triple_xor, multiplicities).push_to(&mut trace);
+            trace
+        };
+        let m31_to_u32_columns = {
+            let mut trace = PreProcessedTrace::default();
+            m31_to_u32_preprocessed_columns(m31_to_u32, multiplicities).push_to(&mut trace);
+            trace
+        };
+        let blake_g_gate_columns = {
+            let mut trace = PreProcessedTrace::default();
+            blake_g_gate_preprocessed_columns(blake_g_gate, multiplicities).push_to(&mut trace);
+            trace
+        };
         // Compact within each joined task, then merge by the original component order.
         // A completed component no longer retains its full-width staging columns while
         // another component is still being built.

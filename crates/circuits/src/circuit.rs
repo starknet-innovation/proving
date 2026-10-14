@@ -486,8 +486,12 @@ impl Circuit {
         rayon::join(|| self.count_uses(), || self.count_yields())
     }
 
-    /// Returns the number of uses of each variable, without constructing the yield histogram.
-    pub fn count_uses(&self) -> Vec<usize> {
+    /// The number of uses of each variable (the first half of [`Self::compute_multiplicities`]).
+    pub fn compute_uses(&self) -> Vec<usize> {
+        self.count_uses()
+    }
+
+    fn count_uses(&self) -> Vec<usize> {
         let mut n_uses = vec![0; self.n_vars];
         for Add { in0, in1, out: _ } in &self.add {
             n_uses[*in0] += 1;

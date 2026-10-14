@@ -1,5 +1,3 @@
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::core::fields::m31::BaseField;
@@ -85,31 +83,6 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
             });
         let leaves = Self::build_leaves(&packed.iter().collect::<Vec<_>>(), len.ilog2());
         (0..positions.len()).map(|i| leaves.at(i)).collect()
-    }
-
-    /// Hashes already-lifted sampled rows. `columns[col][row]` holds the field element
-    /// appended for that column and leaf. Each range in `column_chunks` is passed to
-    /// `update_leaf` separately, in range order, preserving the caller's size-group boundaries.
-    /// Returns one hash per row, in row order, without building any Merkle inner layers.
-    fn hash_sampled_leaves(
-        columns: &[&[BaseField]],
-        column_chunks: &[core::ops::Range<usize>],
-        n_rows: usize,
-    ) -> Vec<H::Hash> {
-        assert!(columns.iter().all(|column| column.len() == n_rows));
-        crate::parallel_iter!(0..n_rows)
-            .map(|row| {
-                let mut hasher = H::default();
-                for range in column_chunks {
-                    let values: Vec<_> = columns[range.clone()]
-                        .iter()
-                        .map(|column| column[row])
-                        .collect();
-                    hasher.update_leaf(&values);
-                }
-                hasher.finalize()
-            })
-            .collect()
     }
 
     /// The leaves at `positions` of the tree that [`Self::build_leaves`] builds for `columns`
