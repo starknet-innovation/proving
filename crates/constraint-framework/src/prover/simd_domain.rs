@@ -160,7 +160,9 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
                         self.eval_domain_log_size,
                         off,
                     );
-                    VeryPackedBaseField::from_array(std::array::from_fn(|i| col.at(rows[i] as usize)))
+                    blended_rows(&col.values.data, &rows).unwrap_or_else(|| {
+                        VeryPackedBaseField::from_array(std::array::from_fn(|i| col.at(rows[i] as usize)))
+                    })
                 }
             }
         })
@@ -239,6 +241,31 @@ fn mul_numerator(d: VeryPackedSecureField, n: &VeryPackedSecureField) -> VeryPac
         Some(n) => d * n,
         None => d * *n,
     }
+}
+
+/// The values at `rows` (32 consecutive evaluation rows moved by a mask offset) when they keep
+/// their lanes and come from two aligned pairs of packed rows: the even lanes from one pair, the
+/// odd lanes from the other, which is where an offset of one trace row sends all but a few
+/// blocks of a bit-reversed circle domain at log expansion 1. Four packed loads and a blend
+/// instead of 32 scalar reads; the values are reduced into `[0, P)`, as `Column::at` returns
+/// them. Mechanism: starkience's packed shifted constraint masks (lead rgr1_231c008f).
+#[inline(always)]
+fn blended_rows(data: &[stwo::prover::backend::simd::m31::PackedBaseField], rows: &[u32; 32]) -> Option<VeryPackedBaseField> {
+    let even = rows[0] as usize;
+    let odd = (rows[1] as usize).wrapping_sub(1);
+    if even % 32 != 0 || odd % 32 != 0 {
+        return None;
+    }
+    if !rows.iter().enumerate().all(|(i, &row)| row as usize == if i % 2 == 0 { even + i } else { odd + i }) {
+        return None;
+    }
+    let lanes = std::simd::Mask::<i32, 16>::from_array(std::array::from_fn(|l| l % 2 == 0));
+    use stwo::prover::backend::simd::m31::PackedBaseField;
+    let blend = |a: PackedBaseField, b: PackedBaseField| {
+        PackedBaseField::reduce_simd(lanes.select(a.into_simd(), b.into_simd()))
+    };
+    let (even, odd) = (even / 16, odd / 16);
+    Some(VeryPackedBaseField::from([blend(data[even], data[odd]), blend(data[even + 1], data[odd + 1])]))
 }
 
 #[inline(always)]

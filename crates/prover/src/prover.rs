@@ -267,8 +267,6 @@ where
         prover_params,
         pcs_config,
     );
-    // The proof's temporaries are freed: return the small ones to the kernel before the next leg.
-    stwo::prover::backend::simd::column::trim_heap();
     proof
 }
 

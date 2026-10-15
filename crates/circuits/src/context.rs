@@ -161,6 +161,24 @@ impl<Value: IValue> Context<Value> {
         self.values.reserve(n);
     }
 
+    /// Reserves room for `counts` more gates of each kind, in the order add, sub, mul,
+    /// pointwise_mul, eq, triple_xor, m31_to_u32, blake_g_gate, permutation, output: a gate vector
+    /// filled to that size is then written once instead of being copied at every growth.
+    pub fn reserve_gates(&mut self, counts: &[usize; 10]) {
+        let [add, sub, mul, pointwise_mul, eq, triple_xor, m31_to_u32, blake_g_gate, permutation, output] =
+            *counts;
+        self.circuit.add.reserve(add);
+        self.circuit.sub.reserve(sub);
+        self.circuit.mul.reserve(mul);
+        self.circuit.pointwise_mul.reserve(pointwise_mul);
+        self.circuit.eq.reserve(eq);
+        self.circuit.triple_xor.reserve(triple_xor);
+        self.circuit.m31_to_u32.reserve(m31_to_u32);
+        self.circuit.blake_g_gate.reserve(blake_g_gate);
+        self.circuit.permutation.reserve(permutation);
+        self.circuit.output.reserve(output);
+    }
+
     /// Returns the value of a variable.
     pub fn get(&self, var: Var) -> Value {
         assert!(!self.reserved_vars.contains(&var.idx), "read of reserved variable",);

@@ -171,22 +171,36 @@ pub fn write_trace(
     .collect_vec();
 
     let (trace, lookup_data) = write_trace_simd(packed_inputs, preprocessed_columns);
-    verify_bitwise_xor_8_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_8_0), 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_8_1), 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_8_2), 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_8_3), 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_8_4), 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_8_5), 0);
-    verify_bitwise_xor_8_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_8_b_0), 1);
-    verify_bitwise_xor_8_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_8_b_1), 1);
+    // The small xor tables count their rows per task from the narrow tuples, every column of a
+    // table in one pass (see `count_table_rows`); the 2^24-row xor_12 table keeps its atomic adds.
+    let d = &lookup_data;
+    verify_bitwise_xor_8_state.add_counted_inputs(
+        &[
+            (&d.verify_bitwise_xor_8_0[..], 0),
+            (&d.verify_bitwise_xor_8_1[..], 0),
+            (&d.verify_bitwise_xor_8_2[..], 0),
+            (&d.verify_bitwise_xor_8_3[..], 0),
+            (&d.verify_bitwise_xor_8_4[..], 0),
+            (&d.verify_bitwise_xor_8_5[..], 0),
+            (&d.verify_bitwise_xor_8_b_0[..], 1),
+            (&d.verify_bitwise_xor_8_b_1[..], 1),
+        ],
+        Widen::widen,
+    );
     verify_bitwise_xor_12_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_12_0), 0);
     verify_bitwise_xor_12_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_12_1), 0);
-    verify_bitwise_xor_4_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_4_0), 0);
-    verify_bitwise_xor_4_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_4_1), 0);
-    verify_bitwise_xor_9_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_9_0), 0);
-    verify_bitwise_xor_9_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_9_1), 0);
-    verify_bitwise_xor_7_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_7_0), 0);
-    verify_bitwise_xor_7_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_7_1), 0);
+    verify_bitwise_xor_4_state.add_counted_inputs(
+        &[(&d.verify_bitwise_xor_4_0[..], 0), (&d.verify_bitwise_xor_4_1[..], 0)],
+        Widen::widen,
+    );
+    verify_bitwise_xor_9_state.add_counted_inputs(
+        &[(&d.verify_bitwise_xor_9_0[..], 0), (&d.verify_bitwise_xor_9_1[..], 0)],
+        Widen::widen,
+    );
+    verify_bitwise_xor_7_state.add_counted_inputs(
+        &[(&d.verify_bitwise_xor_7_0[..], 0), (&d.verify_bitwise_xor_7_1[..], 0)],
+        Widen::widen,
+    );
 
     (trace, Claim { log_size }, InteractionClaimGenerator { log_size, lookup_data })
 }

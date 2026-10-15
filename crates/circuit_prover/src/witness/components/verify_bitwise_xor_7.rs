@@ -11,6 +11,8 @@ pub struct ClaimGenerator {
     pub mults: [AtomicMultiplicityColumn; 1],
     input_to_row: InputToRow<3>,
     preprocessed_trace: Arc<PreProcessedTrace>,
+    /// Row counts added in bulk (see [`Self::add_counted_inputs`]), per relation; empty until then.
+    counts: std::sync::Mutex<Vec<Vec<u32>>>,
 }
 
 impl ClaimGenerator {
@@ -26,17 +28,44 @@ impl ClaimGenerator {
             mults,
             input_to_row: make_input_to_row(&preprocessed_trace, column_ids),
             preprocessed_trace,
+            counts: std::sync::Mutex::new(vec![]),
         }
     }
 
     pub fn write_trace(
         self,
     ) -> (ComponentTrace<N_TRACE_COLUMNS>, Claim, InteractionClaimGenerator) {
-        let mults = self.mults.into_iter().map(|v| v.into_simd_vec()).collect::<Vec<_>>();
+        let mut mults = self.mults.into_iter().map(|v| v.into_simd_vec()).collect::<Vec<_>>();
+        for (column, counts) in mults.iter_mut().zip(self.counts.into_inner().unwrap()) {
+            add_row_counts(column, &counts);
+        }
 
         let (trace, lookup_data) = write_trace_simd(&self.preprocessed_trace, mults);
 
         (trace, Claim {}, InteractionClaimGenerator { lookup_data })
+    }
+
+    /// [`Self::add_packed_inputs`] for several columns at once, each with its relation, counted
+    /// per task (see `count_table_rows`) from tuples that `widen` turns into packed inputs.
+    pub fn add_counted_inputs<T: Sync>(
+        &self,
+        columns: &[(&[T], usize)],
+        widen: impl Fn(&T) -> PackedInputType + Sync,
+    ) {
+        let input_to_row = &self.input_to_row;
+        let counts = count_table_rows(columns, self.mults.len(), 1 << LOG_SIZE, |tuple| {
+            input_to_row.rows_packed(&widen(tuple))
+        });
+        let mut stored = self.counts.lock().unwrap();
+        if stored.is_empty() {
+            *stored = counts;
+        } else {
+            for (stored, counts) in stored.iter_mut().zip(counts) {
+                for (stored, count) in stored.iter_mut().zip(counts) {
+                    *stored += count;
+                }
+            }
+        }
     }
 
     pub fn add_input(&self, input: &InputType, relation_index: usize) {

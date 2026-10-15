@@ -801,6 +801,10 @@ pub struct PreprocessedCircuit {
     /// The number of variables of the padded circuit: a context filling it can reserve its values
     /// once instead of growing them (each growth copied all the values so far).
     pub n_vars: usize,
+    /// The number of gates of each kind in the padded circuit, in the order of
+    /// [`circuits::context::Context::reserve_gates`]: a context filling it reserves its gate
+    /// vectors once, as it does its values.
+    pub gate_counts: [usize; 10],
 }
 
 impl PreprocessedCircuit {
@@ -923,6 +927,18 @@ impl PreprocessedCircuit {
             // Discard the output gate of the `u` wire.
             n_outputs: output.len() - 1,
             n_vars: circuit.n_vars,
+            gate_counts: [
+                add.len(),
+                sub.len(),
+                mul.len(),
+                pointwise_mul.len(),
+                eq.len(),
+                triple_xor.len(),
+                m31_to_u32.len(),
+                blake_g_gate.len(),
+                permutation.len(),
+                output.len(),
+            ],
         }
     }
 }

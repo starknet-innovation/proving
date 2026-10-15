@@ -144,7 +144,15 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
                     self.random_coeff_powers.split_off(self.random_coeff_powers.len() - n_cols);
                 ColumnAccumulator {
                     random_coeff_powers: random_coeffs,
-                    col: col.get_or_insert_with(|| SecureColumnByCoords::zeros(1 << log_size)),
+                    // Zeroed on the workers: a zeroed column of up to 2^24 rows per coordinate is
+                    // otherwise written by one thread before the component's evaluation starts.
+                    col: col.get_or_insert_with(|| SecureColumnByCoords {
+                        columns: std::array::from_fn(|_| {
+                            Col::<B, BaseField>::from_rows(1 << log_size, &|_, dst: &mut [BaseField]| {
+                                dst.fill(BaseField::from(0u32))
+                            })
+                        }),
+                    }),
                 }
             })
             .collect_vec()

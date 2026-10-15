@@ -89,7 +89,9 @@ pub fn fri_decommit<Value: IValue>(
         );
 
         // Check merkle decommitment.
-        for (query_idx, witness) in witness_per_query.iter().enumerate() {
+        let bits_now = bits;
+        let check_query = |context: &mut Context<Value>, query_idx: usize| {
+            let witness = &witness_per_query[query_idx];
             let pack_leaves = log_layer_size >= LOG_PACKED_LEAF_SIZE as usize && step > 1;
             // Compute the leaves.
             let (mut leaves, n_folds): (Vec<HashValue<Var>>, usize) = if pack_leaves {
@@ -116,8 +118,21 @@ pub fn fri_decommit<Value: IValue>(
             };
             // Verify the rest of the authentication path.
             let auth_path = auth_paths.at(tree_idx, query_idx);
-            let bits_for_query = bits.iter().map(|b| b[query_idx]).collect_vec();
+            let bits_for_query = bits_now.iter().map(|b| b[query_idx]).collect_vec();
             verify_merkle_path(context, witness_root, &bits_for_query, root, auth_path);
+        };
+        // As in the trace decommitment (`decommit_eval_domain_samples`): the first query creates
+        // the constants the hashing uses, and the others, independent of each other, are built on
+        // rayon's workers and appended in query order, the gates and variables of the loop over
+        // the queries (most of the FRI decommitment's gates, built on one core before).
+        let n_queries = witness_per_query.len();
+        if n_queries > 0 {
+            check_query(context, 0);
+            if !context.build_in_parallel(n_queries - 1, |context, i| check_query(context, i + 1)) {
+                for query_idx in 1..n_queries {
+                    check_query(context, query_idx);
+                }
+            }
         }
 
         // Compute alpha, alpha^2, ..., alpha^(2^(step - 1));

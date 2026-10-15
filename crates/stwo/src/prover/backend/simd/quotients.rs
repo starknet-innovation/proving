@@ -251,7 +251,15 @@ impl QuotientOps for SimdBackend {
         acc: &mut SecureColumnByCoords<Self>,
         terms: &[(&BaseColumn, SecureField)],
     ) {
-        accumulate_weighted_columns(acc, terms);
+        accumulate_weighted_columns::<true>(acc, terms);
+    }
+
+    fn weighted_columns(log_size: u32, terms: &[(&BaseColumn, SecureField)]) -> SecureColumnByCoords<Self> {
+        // Every value is written below: taken as the pool's FFT buffers are, not zeroed.
+        let pool = crate::prover::mempool::BaseColumnPool::<SimdBackend>::new();
+        let mut acc = SecureColumnByCoords { columns: std::array::from_fn(|_| pool.take_or_alloc(log_size)) };
+        accumulate_weighted_columns::<false>(&mut acc, terms);
+        acc
     }
 
     fn canonicalize_and_subtract(numerators: &mut SecureColumnByCoords<Self>, b_sum: SecureField) {
@@ -413,7 +421,9 @@ fn coordinates(value: SecureField) -> [u32; 4] {
 /// Adds `∑ cᵢ * columnᵢ` to `acc` row by row, over `terms` = `(columnᵢ, cᵢ)`, with the deferred
 /// reduction of [`accumulate_numerators_on_subdomain`]: the column values are in `[0, P]`, and
 /// every value of `acc` stays in (or is brought into) `[0, P)`.
-fn accumulate_weighted_columns(
+/// With `ADD == false`, `acc`'s values are not read: each row is written as the sum alone, the
+/// value a zeroed accumulator gets (`fold_row` is already in `[0, P)`, where adding zero keeps it).
+fn accumulate_weighted_columns<const ADD: bool>(
     acc: &mut SecureColumnByCoords<SimdBackend>,
     terms: &[(&BaseColumn, SecureField)],
 ) {
@@ -442,7 +452,7 @@ fn accumulate_weighted_columns(
             for (r, row_acc) in acc_rows.iter().enumerate() {
                 for (k, coordinate) in dst.0.iter_mut().enumerate() {
                     let value = &mut coordinate.0[block_start + r];
-                    *value = *value + fold_row(row_acc[k]);
+                    *value = if ADD { *value + fold_row(row_acc[k]) } else { fold_row(row_acc[k]) };
                 }
             }
         }

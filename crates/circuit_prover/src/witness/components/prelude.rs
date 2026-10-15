@@ -233,3 +233,56 @@ impl<const N: usize> InputToRow<N> {
         }
     }
 }
+
+/// Per relation, how many lanes of `columns` (each a column of packed tuples and the relation it
+/// feeds) fall on each of the `size` rows of a lookup table, with `rows` giving a packed tuple's
+/// 16 rows. Each task counts a chunk of a column into its own histograms, which are summed at
+/// the end: one plain add per lane instead of one atomic add on a table every worker shares (the
+/// small xor tables have 2^8 to 2^18 rows, so the shared adds contended), and the narrow tuples
+/// are read in place, with no widened copy of each column. Counts are exact, so the
+/// multiplicities are those of the atomic path. Mechanism: starkience's per-task XOR histograms
+/// (lead rgr1_418bd2c6), after ryun1's profile of the xor adds (rgr1_2a0aa1af).
+pub fn count_table_rows<T: Sync>(
+    columns: &[(&[T], usize)],
+    n_relations: usize,
+    size: usize,
+    rows: impl Fn(&T) -> [u32; 16] + Sync,
+) -> Vec<Vec<u32>> {
+    const CHUNK: usize = 1 << 12;
+    let tasks = columns
+        .iter()
+        .enumerate()
+        .flat_map(|(c, (column, _))| (0..column.len()).step_by(CHUNK).map(move |start| (c, start)))
+        .collect_vec();
+    let zeros = || vec![vec![0u32; size]; n_relations];
+    tasks
+        .into_par_iter()
+        .fold(zeros, |mut counts, (c, start)| {
+            let (column, relation) = columns[c];
+            let counts_r = &mut counts[relation];
+            for tuple in &column[start..(start + CHUNK).min(column.len())] {
+                for row in rows(tuple) {
+                    counts_r[row as usize] += 1;
+                }
+            }
+            counts
+        })
+        .reduce(zeros, |mut a, b| {
+            for (a, b) in a.iter_mut().zip(b) {
+                for (a, b) in a.iter_mut().zip(b) {
+                    *a += b;
+                }
+            }
+            a
+        })
+}
+
+/// Adds `counts` (per row) to a multiplicity column of packed rows (the column of an atomic
+/// multiplicity column, whose lanes hold the counts themselves).
+pub fn add_row_counts(column: &mut [PackedM31], counts: &[u32]) {
+    use rayon::slice::ParallelSlice;
+    column.par_iter_mut().zip(counts.par_chunks(N_LANES)).for_each(|(packed, counts): (&mut PackedM31, &[u32])| {
+        let lanes = packed.to_array();
+        *packed = PackedM31::from_array(std::array::from_fn(|i| M31::from(lanes[i].0 + counts[i])));
+    });
+}

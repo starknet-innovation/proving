@@ -74,9 +74,6 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     tree_builder.extend_polys(right_comp_poly_half.into_coordinate_polys());
     tree_builder.commit(channel);
     span.exit();
-    // Composition's freed block temporaries stay in glibc's arenas under the samples and the
-    // quotients unless they are handed back.
-    crate::prover::backend::simd::column::trim_heap();
 
     // Proof of work before the OODS point, then draw it.
     grind_smallest(channel, commitment_scheme.config.grinding.deep_bits);

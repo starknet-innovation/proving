@@ -72,6 +72,16 @@ pub trait QuotientOps: PolyOps {
         unimplemented!("combined sourced columns are not supported by this backend")
     }
 
+    /// `∑ cᵢ * columnᵢ` row by row as a new accumulator of `2^log_size` rows, the values
+    /// [`Self::accumulate_weighted_columns`] leaves in a zeroed accumulator: every row is written
+    /// once, so the accumulator is neither zeroed first nor read back.
+    fn weighted_columns(
+        _log_size: u32,
+        _terms: &[(&Col<Self, BaseField>, SecureField)],
+    ) -> SecureColumnByCoords<Self> {
+        unimplemented!("combined sourced columns are not supported by this backend")
+    }
+
     /// Maps every value of `numerators` to its canonical representative in `[0, P)` (a
     /// transform may return `P` for zero), then subtracts `b_sum` from every row.
     fn canonicalize_and_subtract(
@@ -448,8 +458,10 @@ fn combined_sourced_accumulations<B: Backend>(
             if terms.is_empty() {
                 continue;
             }
-            let sum = sum.get_or_insert_with(|| zeroed_in_parallel::<B>(chunk_domain.size()));
-            B::accumulate_weighted_columns(sum, &terms);
+            match sum {
+                Some(sum) => B::accumulate_weighted_columns(sum, &terms),
+                None => *sum = Some(B::weighted_columns(chunk_domain.log_size(), &terms)),
+            }
         }
     }
     let trace_domain = trace_domain.expect("a group has columns");
@@ -517,8 +529,7 @@ fn combined_coefficient_accumulations<B: Backend>(
                     (&polys[data.column_index].coeffs.as_ref().unwrap().coeffs, c)
                 })
                 .collect();
-            let mut sum = zeroed_in_parallel::<B>(1 << log_size);
-            B::accumulate_weighted_columns(&mut sum, &terms);
+            let sum = B::weighted_columns(log_size, &terms);
             let evaluate = |column: Col<B, BaseField>| {
                 // Every value is written by the FFT: taken as the pool's FFT buffers are, not zeroed.
                 let mut stripe =
@@ -547,16 +558,6 @@ fn combined_coefficient_accumulations<B: Backend>(
             }
         })
         .collect()
-}
-
-/// A zero secure column of `len` rows, written by the workers: a zeroed column is written by a
-/// single thread (tens of milliseconds per sum at 2^23 rows, every core but one idle).
-fn zeroed_in_parallel<B: Backend>(len: usize) -> SecureColumnByCoords<B> {
-    SecureColumnByCoords {
-        columns: std::array::from_fn(|_| {
-            Col::<B, BaseField>::from_rows(len, &|_, dst: &mut [BaseField]| dst.fill(BaseField::from(0u32)))
-        }),
-    }
 }
 
 /// Stripe 0 of `domain` of each coordinate of `values`, given on `trace_domain`: interpolated

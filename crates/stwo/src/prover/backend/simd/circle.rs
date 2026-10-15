@@ -564,37 +564,50 @@ impl PolyOps for SimdBackend {
                     p_0,
                 ));
 
+        let vn_p: SecureField = coset_vanishing(CanonicCoset::new(log_size).coset, p);
+
+        // S_i(i) is invariant under G_(n−1) and alternate under J, meaning the S_i(i) values are
+        // the same for each half coset, and the second half coset values are the conjugate
+        // of the first half coset values.
+        // weights_vec_len is even because domain.size() is a power of 2 (we already dealt with the
+        // case where domain.size() < N_LANES).
+        let si_i_vn_p = PackedSecureField::from_array(std::array::from_fn(|i| {
+            if i.is_multiple_of(2) { si_0 * vn_p } else { -si_0 * vn_p }
+        }));
+
         // The inverse of `point_vanishing(d, p) = h.y / (1 + h.x)` with `h = p - d` is
         // `(1 + h.x) * inv(h.y)`: the points come from the bit-reversed domain iterator (packed,
         // incremental) and the `h.y` of a chunk are inverted by one batch inversion, so no
-        // element takes a scalar point multiplication or its own division. Same field elements.
+        // element takes a scalar point multiplication or its own division. Each chunk's weights
+        // are written into its rows of the buffer as they are computed (no column of the
+        // inverses, gathered on one thread, then read again). Same field elements.
         #[cfg(feature = "parallel")]
-        let vi_p_inverse: Vec<PackedSecureField> = {
+        {
             const CHUNK: usize = 1 << 9;
             let (px, py) = (PackedSecureField::broadcast(p.x), PackedSecureField::broadcast(p.y));
             let one = PackedBaseField::broadcast(BaseField::one());
             let iterator = super::domain::CircleDomainBitRevIterator::new(domain);
-            (0..weights_vec_len.div_ceil(CHUNK))
-                .into_par_iter()
-                .flat_map_iter(|c| {
-                    let start = c * CHUNK;
-                    let len = CHUNK.min(weights_vec_len - start);
-                    let points: Vec<_> = iterator.start_at(start).take(len).collect();
-                    let (mut num, mut den) = (Vec::with_capacity(len), Vec::with_capacity(len));
-                    for d in &points {
-                        let hx = px * d.x + py * d.y;
-                        let hy = py * d.x - px * d.y;
-                        num.push(hx + one);
-                        den.push(hy);
-                    }
-                    let mut inv = vec![PackedSecureField::zeroed(); len];
-                    super::qm31::batch_inverse_packed_qm31(&den, &mut inv);
-                    zip(num, inv).map(|(n, i)| n * i).collect::<Vec<_>>()
-                })
-                .collect()
-        };
+            buffer.par_chunks_mut(CHUNK).enumerate().for_each(|(c, mut chunk)| {
+                let start = c * CHUNK;
+                let len = CHUNK.min(weights_vec_len - start);
+                let points: Vec<_> = iterator.start_at(start).take(len).collect();
+                let (mut num, mut den) = (Vec::with_capacity(len), Vec::with_capacity(len));
+                for d in &points {
+                    let hx = px * d.x + py * d.y;
+                    let hy = py * d.x - px * d.y;
+                    num.push(hx + one);
+                    den.push(hy);
+                }
+                let mut inv = vec![PackedSecureField::zeroed(); len];
+                super::qm31::batch_inverse_packed_qm31(&den, &mut inv);
+                for (i, (n, inv)) in zip(num, inv).enumerate() {
+                    // Safety: the chunk holds `len` packed elements.
+                    unsafe { chunk.set_packed(i, (n * inv) * si_i_vn_p) };
+                }
+            });
+        }
         #[cfg(not(feature = "parallel"))]
-        let vi_p_inverse = {
+        {
             let vi_p = (0..weights_vec_len)
                 .map(|i| {
                     PackedSecureField::from_array(std::array::from_fn(|j| {
@@ -607,37 +620,10 @@ impl PolyOps for SimdBackend {
                     }))
                 })
                 .collect_vec();
-            batch_inverse(&vi_p)
-        };
-
-        let vn_p: SecureField = coset_vanishing(CanonicCoset::new(log_size).coset, p);
-
-        // S_i(i) is invariant under G_(n−1) and alternate under J, meaning the S_i(i) values are
-        // the same for each half coset, and the second half coset values are the conjugate
-        // of the first half coset values.
-        // weights_vec_len is even because domain.size() is a power of 2 (we already dealt with the
-        // case where domain.size() < N_LANES).
-        let si_i_vn_p = PackedSecureField::from_array(std::array::from_fn(|i| {
-            if i.is_multiple_of(2) { si_0 * vn_p } else { -si_0 * vn_p }
-        }));
-
-        #[cfg(not(feature = "parallel"))]
-        for (i, vi_p_inverse) in vi_p_inverse.iter().enumerate() {
-            // Safety: the buffer holds `weights_vec_len` packed elements.
-            unsafe { buffer.set_packed(i, *vi_p_inverse * si_i_vn_p) };
-        }
-
-        #[cfg(feature = "parallel")]
-        {
-            const CHUNK_SIZE: usize = 1 << 10;
-            buffer.par_chunks_mut(CHUNK_SIZE).zip(vi_p_inverse.par_chunks(CHUNK_SIZE)).for_each(
-                |(mut chunk, vi_p_inverse_chunk)| {
-                    for (i, vi_p_inverse) in vi_p_inverse_chunk.iter().enumerate() {
-                        // Safety: the chunks are of equal length.
-                        unsafe { chunk.set_packed(i, *vi_p_inverse * si_i_vn_p) };
-                    }
-                },
-            );
+            for (i, vi_p_inverse) in batch_inverse(&vi_p).iter().enumerate() {
+                // Safety: the buffer holds `weights_vec_len` packed elements.
+                unsafe { buffer.set_packed(i, *vi_p_inverse * si_i_vn_p) };
+            }
         }
 
         buffer

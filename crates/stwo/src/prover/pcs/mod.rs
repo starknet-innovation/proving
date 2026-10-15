@@ -457,7 +457,6 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // decommitment evaluates their rows from the coefficients. Quotient and opening paths
         // own their buffers.
         self.base_column_pool.release_all_idle();
-        crate::prover::backend::simd::column::trim_heap();
         // Point samples are complete; subsequent quotient and opening paths use evaluations.
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
@@ -495,14 +494,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             self.twiddles,
             self.config.fri_config.log_blowup_factor,
         );
-        // The quotients' freed accumulations stay in glibc's arenas under FRI and the
-        // decommitment unless they are handed back.
-        crate::prover::backend::simd::column::trim_heap();
 
         // Run FRI commitment phase on the oods quotients.
         let fri_prover =
             FriProver::<B, MC>::commit(channel, self.config.fri_config, &quotients, self.twiddles);
-        crate::prover::backend::simd::column::trim_heap();
 
         // Proof of work.
         let span1 = span!(Level::INFO, "Grind", class = "Queries POW").entered();

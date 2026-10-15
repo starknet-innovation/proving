@@ -13,9 +13,20 @@ use crate::prover::secure_column::SecureColumnByCoords;
 
 impl AccumulationOps for SimdBackend {
     fn accumulate(column: &mut SecureColumnByCoords<Self>, other: &SecureColumnByCoords<Self>) {
-        for i in 0..column.packed_len() {
-            let res_coeff = unsafe { column.packed_at(i) + other.packed_at(i) };
-            unsafe { column.set_packed(i, res_coeff) };
+        // Coordinate by coordinate, rows in chunks on the workers (one thread took tens of
+        // milliseconds at 2^23 rows, every other core idle): the same additions, row by row.
+        const CHUNK_SIZE: usize = 1 << 12;
+        for (dst, src) in column.columns.iter_mut().zip(&other.columns) {
+            assert_eq!(dst.data.len(), src.data.len());
+            let add = |(dst, src): (&mut [PackedM31], &[PackedM31])| {
+                for (a, b) in dst.iter_mut().zip(src) {
+                    *a += *b;
+                }
+            };
+            #[cfg(feature = "parallel")]
+            dst.data.par_chunks_mut(CHUNK_SIZE).zip(src.data.par_chunks(CHUNK_SIZE)).for_each(add);
+            #[cfg(not(feature = "parallel"))]
+            dst.data.chunks_mut(CHUNK_SIZE).zip(src.data.chunks(CHUNK_SIZE)).for_each(add);
         }
     }
 

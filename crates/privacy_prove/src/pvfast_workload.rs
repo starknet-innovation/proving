@@ -101,6 +101,7 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
                 aux,
                 output_hash,
                 precomputes.preprocessed_circuit.n_vars,
+                &precomputes.preprocessed_circuit.gate_counts,
             )
         },
         || {

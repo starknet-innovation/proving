@@ -115,6 +115,7 @@ where
         n_outputs,
         trace_log_size: _,
         n_vars: _,
+        gate_counts: _,
     } = preprocessed_circuit;
     let trace_generator = TraceGenerator {
         qm31_ops_trace_generator: Qm31OpsTraceGenerator {
