@@ -226,37 +226,31 @@ pub fn write_interaction_trace(
             columns[first + 3].data[row],
         ]
     };
-    let rows = 0..in0_address.len();
     let inputs = read_trace_columns(0..8);
 
-    // Sum logup terms in pairs.
-    let mut col_gen = logup_gen.new_col();
-    (col_gen.par_iter_mut(), rows.clone().into_par_iter()).into_par_iter().for_each(
-        |(writer, row)| {
-            let (values0, values1) =
-                (tuple(&inputs, &in0_address, 0, row), tuple(&inputs, &in1_address, 4, row));
-            let denom0: PackedQM31 = common_lookup_elements
-                .combine(&[tag, values0[0], values0[1], values0[2], values0[3], values0[4]]);
-            let denom1: PackedQM31 = common_lookup_elements
-                .combine(&[tag, values1[0], values1[1], values1[2], values1[3], values1[4]]);
-            writer.write_frac(denom0 + denom1, denom0 * denom1);
-        },
-    );
-    col_gen.finalize_col();
+    // Sum logup terms in pairs, in one pass per column (fractions, inverses and the running sum
+    // per chunk of rows).
+    logup_gen.write_frac_cols(1, |_, row| {
+        let (values0, values1) =
+            (tuple(&inputs, &in0_address, 0, row), tuple(&inputs, &in1_address, 4, row));
+        let denom0: PackedQM31 = common_lookup_elements
+            .combine(&[tag, values0[0], values0[1], values0[2], values0[3], values0[4]]);
+        let denom1: PackedQM31 = common_lookup_elements
+            .combine(&[tag, values1[0], values1[1], values1[2], values1[3], values1[4]]);
+        (denom0 + denom1, denom0 * denom1)
+    });
     drop(inputs);
 
     // Sum last logup term.
     let outputs = read_trace_columns(8..12);
-    let mut col_gen = logup_gen.new_col();
-    (col_gen.par_iter_mut(), rows.into_par_iter(), lookup_data.mults).into_par_iter().for_each(
-        |(writer, row, mults)| {
-            let values = tuple(&outputs, &out_address, 0, row);
-            let denom = common_lookup_elements
-                .combine(&[tag, values[0], values[1], values[2], values[3], values[4]]);
-            writer.write_frac(-PackedQM31::one() * mults, denom);
-        },
-    );
-    col_gen.finalize_col();
+    let mults = &lookup_data.mults;
+    logup_gen.write_frac_cols(1, |_, row| {
+        let values = tuple(&outputs, &out_address, 0, row);
+        let denom = common_lookup_elements
+            .combine(&[tag, values[0], values[1], values[2], values[3], values[4]]);
+        (-PackedQM31::one() * mults[row], denom)
+    });
+    drop(outputs);
 
     let (trace, claimed_sum) = logup_gen.finalize_last();
 

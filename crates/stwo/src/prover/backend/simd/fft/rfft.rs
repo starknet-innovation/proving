@@ -219,6 +219,11 @@ thread_local! {
 /// # Arguments
 ///
 /// * `src`: A pointer to the values to transform, aligned to 64 bytes.
+/// * `load`: If given, the values to transform are not read from `src` (which is then not read
+///   at all) but computed: `load(first, vecs)` writes the vectors `first..first + vecs.len()` of
+///   the values, as stored. Each block of the first phase is loaded once, just before it is read,
+///   instead of being written to memory whole first and read back. Only for `log_n_elements`
+///   above `CACHED_FFT_LOG_SIZE`.
 /// * `dst`: A pointer to the destination arrays, aligned to 64 bytes. Must not alias `src`.
 /// * `subdomain_twiddles`: For each subdomain, the doubles of the twiddle factors.
 /// * `log_n_elements`: The log of the number of elements of the transformed values.
@@ -233,10 +238,12 @@ thread_local! {
 /// or if `dst` does not have room for `subdomain_twiddles.len() << log_n_elements` elements.
 pub unsafe fn fft_subdomains(
     src: *const u32,
+    load: Option<&(dyn Fn(usize, &mut [u32x16]) + Sync)>,
     dst: *mut u32,
     subdomain_twiddles: &[Vec<&[u32]>],
     log_n_elements: usize,
 ) {
+    assert!(load.is_none() || log_n_elements > CACHED_FFT_LOG_SIZE as usize);
     if log_n_elements <= CACHED_FFT_LOG_SIZE as usize {
         for (i, twiddle_dbl) in subdomain_twiddles.iter().enumerate() {
             fft(src, dst.add(i << log_n_elements), twiddle_dbl, log_n_elements);
@@ -281,8 +288,19 @@ pub unsafe fn fft_subdomains(
         let a0 = (task >> log_n_b) << group_log;
         PHASE1_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
-            if scratch.len() < group_size * block_vecs {
-                scratch.resize(group_size * block_vecs, u32x16::splat(0));
+            let n_group_vecs = group_size * block_vecs;
+            let n_scratch_vecs = if load.is_some() { 2 * n_group_vecs } else { n_group_vecs };
+            if scratch.len() < n_scratch_vecs {
+                scratch.resize(n_scratch_vecs, u32x16::splat(0));
+            }
+            if let Some(load) = load {
+                // The group's blocks of the values, loaded after the first phase's buffer, once
+                // for all the subdomains.
+                let loaded = &mut scratch[n_group_vecs..2 * n_group_vecs];
+                for i in 0..group_size {
+                    let index_h = ((a0 + i) << log_n_b) | b;
+                    load(index_h * block_vecs, &mut loaded[i * block_vecs..(i + 1) * block_vecs]);
+                }
             }
             let scr = scratch.as_mut_ptr() as *mut u32;
             for (dst, twiddle_dbl) in dsts.iter().zip(subdomain_twiddles) {
@@ -292,7 +310,10 @@ pub unsafe fn fft_subdomains(
                     // The block (a, b) of the first phase: the layers of
                     // `fft_lower_without_vecwise`.
                     let index_h = ((a0 + i) << log_n_b) | b;
-                    let mut from = src.add(index_h * block_elems);
+                    let mut from = match load {
+                        Some(_) => scr.add((group_size + i) * block_elems) as *const u32,
+                        None => src.add(index_h * block_elems),
+                    };
                     let to = scr.add(i * block_elems);
                     for layer in (0..post).step_by(3).rev() {
                         let fixed_layer = layer + LOG_N_LANES as usize;
