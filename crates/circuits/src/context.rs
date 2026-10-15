@@ -148,12 +148,18 @@ impl<Value: IValue> Context<Value> {
     /// is padded: the values and the variable numbering are exactly those that `count` more
     /// padding gates producing `pattern` each would have left.
     pub fn append_released_padding_values(&mut self, pattern: &[Value], count: usize) {
+        use rayon::prelude::*;
         assert!(self.release_on_padding, "only a context released at padding drops its gates");
-        self.values.reserve(pattern.len() * count);
-        for _ in 0..count {
-            self.values.extend_from_slice(pattern);
+        let len = pattern.len();
+        if len == 0 {
+            return;
         }
-        self.circuit.n_vars += pattern.len() * count;
+        // Written on rayon's workers, each value into its place (the padding is millions of
+        // values, appended on one core before).
+        self.values.par_extend(
+            (0..len * count).into_par_iter().with_min_len(1 << 16).map(|i| pattern[i % len]),
+        );
+        self.circuit.n_vars += len * count;
     }
 
     /// Reserves room for `n` more variables' values.
@@ -204,11 +210,27 @@ impl<Value: IValue> Context<Value> {
         n: usize,
         build: impl Fn(&mut Context<Value>, usize) + Sync,
     ) -> bool {
+        self.build_in_parallel_with_outputs(n, |context, i| {
+            build(context, i);
+            vec![]
+        })
+        .is_some()
+    }
+
+    /// [Self::build_in_parallel], where each call also returns variables (its own or the
+    /// context's): they are returned per call, renumbered as its piece is, so they are the
+    /// variables the calls one after the other would have returned. `None` where
+    /// [Self::build_in_parallel] returns `false` (nothing appended).
+    pub fn build_in_parallel_with_outputs(
+        &mut self,
+        n: usize,
+        build: impl Fn(&mut Context<Value>, usize) -> Vec<Var> + Sync,
+    ) -> Option<Vec<Vec<Var>>> {
         use rayon::prelude::*;
         let n_base = self.circuit.n_vars;
         let base = Arc::new(std::mem::take(&mut self.values));
         let this = &*self;
-        let pieces: Vec<Context<Value>> = (0..n)
+        let (pieces, outputs): (Vec<Context<Value>>, Vec<Vec<Var>>) = (0..n)
             .into_par_iter()
             .map(|i| {
                 let mut piece = Context {
@@ -225,14 +247,14 @@ impl<Value: IValue> Context<Value> {
                     release_on_padding: false,
                     base: Some(base.clone()),
                 };
-                build(&mut piece, i);
+                let outputs = build(&mut piece, i);
                 piece.base = None;
-                piece
+                (piece, outputs)
             })
-            .collect();
+            .unzip();
         self.values = Arc::try_unwrap(base).unwrap_or_else(|_| unreachable!("every piece dropped its base"));
         if pieces.iter().any(|piece| piece.constants.len() != self.constants.len()) {
-            return false;
+            return None;
         }
         // Renumber each piece's variables to follow the pieces before it, and append the pieces in
         // order. The values and gates are copied on rayon's workers, each into its place: a
@@ -273,7 +295,15 @@ impl<Value: IValue> Context<Value> {
         assert_eq!(self.circuit.n_vars, n_base);
         self.circuit.n_vars = n_vars;
         assert_eq!(self.values.len(), n_vars);
-        true
+        Some(
+            outputs
+                .into_iter()
+                .zip(&offsets)
+                .map(|(vars, &offset)| {
+                    vars.into_iter().map(|var| Var { idx: shift_by(offset)(var.idx) }).collect()
+                })
+                .collect(),
+        )
     }
 
     /// Allocates a fresh variable with no concrete value yet.

@@ -1819,12 +1819,51 @@ pub struct CairoInteractionClaimGenerator {
     pub verify_bitwise_xor_9: Option<verify_bitwise_xor_9::InteractionClaimGenerator>,
 }
 
+/// The interaction columns of one component, as its writer returns them.
+type InteractionColumns = Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>;
+
+/// A component's interaction writer output whose columns are handed to `finish` as soon as the
+/// writer returns, inside its own task (see
+/// [`CairoInteractionClaimGenerator::write_interaction_trace_with`]).
+trait MapTraces<T> {
+    type Mapped;
+    fn map_traces(self, finish: &(dyn Fn(InteractionColumns) -> Vec<T> + Sync)) -> Self::Mapped;
+}
+
+impl<T, C> MapTraces<T> for (InteractionColumns, C) {
+    type Mapped = (Vec<T>, C);
+    fn map_traces(self, finish: &(dyn Fn(InteractionColumns) -> Vec<T> + Sync)) -> Self::Mapped {
+        (finish(self.0), self.1)
+    }
+}
+
+// memory_id_to_big: its big tables' traces, its small table's trace and their claims.
+impl<T, C1, C2> MapTraces<T> for (Vec<InteractionColumns>, InteractionColumns, C1, C2) {
+    type Mapped = (Vec<Vec<T>>, Vec<T>, C1, C2);
+    fn map_traces(self, finish: &(dyn Fn(InteractionColumns) -> Vec<T> + Sync)) -> Self::Mapped {
+        let (big, small, big_claim, small_claim) = self;
+        (big.into_iter().map(finish).collect(), finish(small), big_claim, small_claim)
+    }
+}
+
 impl CairoInteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,
         common_lookup_elements: &CommonLookupElements,
     ) -> (Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>, CairoInteractionClaim)
     {
+        self.write_interaction_trace_with(common_lookup_elements, &|columns| columns)
+    }
+
+    /// [`Self::write_interaction_trace`], with every component's columns passed through `finish`
+    /// in the component's own task as soon as its writer returns (the prover interpolates them
+    /// there, on the workers the slowest writers leave idle, instead of all at once after the
+    /// last writer). The columns are returned in the same order.
+    pub fn write_interaction_trace_with<T: Send>(
+        self,
+        common_lookup_elements: &CommonLookupElements,
+        finish: &(dyn Fn(InteractionColumns) -> Vec<T> + Sync),
+    ) -> (Vec<T>, CairoInteractionClaim) {
         let mut evals = Vec::new();
         let mut add_opcode_result = None;
         let mut add_opcode_small_result = None;
@@ -1898,403 +1937,403 @@ impl CairoInteractionClaimGenerator {
             if let Some(generator) = self.add_opcode {
                 s.spawn(|_| {
                     add_opcode_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.add_opcode_small {
                 s.spawn(|_| {
                     add_opcode_small_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.add_ap_opcode {
                 s.spawn(|_| {
                     add_ap_opcode_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.assert_eq_opcode {
                 s.spawn(|_| {
                     assert_eq_opcode_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.assert_eq_opcode_imm {
                 s.spawn(|_| {
                     assert_eq_opcode_imm_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.assert_eq_opcode_double_deref {
                 s.spawn(|_| {
                     assert_eq_opcode_double_deref_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.blake_compress_opcode {
                 s.spawn(|_| {
                     blake_compress_opcode_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.call_opcode_abs {
                 s.spawn(|_| {
                     call_opcode_abs_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.call_opcode_rel_imm {
                 s.spawn(|_| {
                     call_opcode_rel_imm_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.generic_opcode {
                 s.spawn(|_| {
                     generic_opcode_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.jnz_opcode_non_taken {
                 s.spawn(|_| {
                     jnz_opcode_non_taken_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.jnz_opcode_taken {
                 s.spawn(|_| {
                     jnz_opcode_taken_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.jump_opcode_abs {
                 s.spawn(|_| {
                     jump_opcode_abs_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.jump_opcode_double_deref {
                 s.spawn(|_| {
                     jump_opcode_double_deref_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.jump_opcode_rel {
                 s.spawn(|_| {
                     jump_opcode_rel_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.jump_opcode_rel_imm {
                 s.spawn(|_| {
                     jump_opcode_rel_imm_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.mul_opcode {
                 s.spawn(|_| {
                     mul_opcode_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.mul_opcode_small {
                 s.spawn(|_| {
                     mul_opcode_small_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.qm_31_add_mul_opcode {
                 s.spawn(|_| {
                     qm_31_add_mul_opcode_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.ret_opcode {
                 s.spawn(|_| {
                     ret_opcode_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.verify_instruction {
                 s.spawn(|_| {
                     verify_instruction_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.blake_round {
                 s.spawn(|_| {
                     blake_round_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.blake_g {
                 s.spawn(|_| {
                     blake_g_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.blake_round_sigma {
                 s.spawn(|_| {
                     blake_round_sigma_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.triple_xor_32 {
                 s.spawn(|_| {
                     triple_xor_32_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.verify_bitwise_xor_12 {
                 s.spawn(|_| {
                     verify_bitwise_xor_12_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.add_mod_builtin {
                 s.spawn(|_| {
                     add_mod_builtin_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.bitwise_builtin {
                 s.spawn(|_| {
                     bitwise_builtin_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.mul_mod_builtin {
                 s.spawn(|_| {
                     mul_mod_builtin_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.pedersen_builtin {
                 s.spawn(|_| {
                     pedersen_builtin_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.pedersen_builtin_narrow_windows {
                 s.spawn(|_| {
                     pedersen_builtin_narrow_windows_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.poseidon_builtin {
                 s.spawn(|_| {
                     poseidon_builtin_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check96_builtin {
                 s.spawn(|_| {
                     range_check96_builtin_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_builtin {
                 s.spawn(|_| {
                     range_check_builtin_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.ec_op_builtin {
                 s.spawn(|_| {
                     ec_op_builtin_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.partial_ec_mul_generic {
                 s.spawn(|_| {
                     partial_ec_mul_generic_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.pedersen_aggregator_window_bits_18 {
                 s.spawn(|_| {
                     pedersen_aggregator_window_bits_18_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.partial_ec_mul_window_bits_18 {
                 s.spawn(|_| {
                     partial_ec_mul_window_bits_18_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.pedersen_points_table_window_bits_18 {
                 s.spawn(|_| {
                     pedersen_points_table_window_bits_18_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.pedersen_aggregator_window_bits_9 {
                 s.spawn(|_| {
                     pedersen_aggregator_window_bits_9_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.partial_ec_mul_window_bits_9 {
                 s.spawn(|_| {
                     partial_ec_mul_window_bits_9_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.pedersen_points_table_window_bits_9 {
                 s.spawn(|_| {
                     pedersen_points_table_window_bits_9_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.poseidon_aggregator {
                 s.spawn(|_| {
                     poseidon_aggregator_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.poseidon_3_partial_rounds_chain {
                 s.spawn(|_| {
                     poseidon_3_partial_rounds_chain_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.poseidon_full_round_chain {
                 s.spawn(|_| {
                     poseidon_full_round_chain_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.cube_252 {
                 s.spawn(|_| {
                     cube_252_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.poseidon_round_keys {
                 s.spawn(|_| {
                     poseidon_round_keys_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_252_width_27 {
                 s.spawn(|_| {
                     range_check_252_width_27_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.memory_address_to_id {
                 s.spawn(|_| {
                     memory_address_to_id_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.memory_id_to_big {
                 s.spawn(|_| {
                     memory_id_to_big_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_6 {
                 s.spawn(|_| {
                     range_check_6_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_8 {
                 s.spawn(|_| {
                     range_check_8_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_11 {
                 s.spawn(|_| {
                     range_check_11_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_12 {
                 s.spawn(|_| {
                     range_check_12_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_18 {
                 s.spawn(|_| {
                     range_check_18_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_20 {
                 s.spawn(|_| {
                     range_check_20_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_4_3 {
                 s.spawn(|_| {
                     range_check_4_3_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_4_4 {
                 s.spawn(|_| {
                     range_check_4_4_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_9_9 {
                 s.spawn(|_| {
                     range_check_9_9_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_7_2_5 {
                 s.spawn(|_| {
                     range_check_7_2_5_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_3_6_6_3 {
                 s.spawn(|_| {
                     range_check_3_6_6_3_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_4_4_4_4 {
                 s.spawn(|_| {
                     range_check_4_4_4_4_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.range_check_3_3_3_3_3 {
                 s.spawn(|_| {
                     range_check_3_3_3_3_3_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.verify_bitwise_xor_4 {
                 s.spawn(|_| {
                     verify_bitwise_xor_4_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.verify_bitwise_xor_7 {
                 s.spawn(|_| {
                     verify_bitwise_xor_7_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.verify_bitwise_xor_8 {
                 s.spawn(|_| {
                     verify_bitwise_xor_8_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
             if let Some(generator) = self.verify_bitwise_xor_9 {
                 s.spawn(|_| {
                     verify_bitwise_xor_9_result =
-                        Some(generator.write_interaction_trace(common_lookup_elements));
+                        Some(generator.write_interaction_trace(common_lookup_elements).map_traces(finish));
                 });
             }
         });

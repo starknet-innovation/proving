@@ -24,12 +24,9 @@ use crate::witness::components::{
 };
 
 /// The preprocessed columns the eq and qm31_ops writers materialize first: those writers run
-/// alone at the start of the base trace, one column after the other.
-const WRITER_FIRST_COLUMNS: [&str; 10] = [
-    "qm31_ops_add_flag",
-    "qm31_ops_sub_flag",
-    "qm31_ops_mul_flag",
-    "qm31_ops_pointwise_mul_flag",
+/// alone at the start of the base trace, one column after the other. (The qm31_ops flags are not
+/// read by its writer: warming them would leave them in the take-once cache.)
+const WRITER_FIRST_COLUMNS: [&str; 6] = [
     "qm31_ops_in0_address",
     "qm31_ops_in1_address",
     "qm31_ops_out_address",

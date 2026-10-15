@@ -49,32 +49,40 @@ pub fn write_trace(
     let in1_address =
         preprocessed_trace.get_column(&PreProcessedColumnId { id: "eq_in1_address".to_owned() });
 
-    let inputs = extract_component_inputs(&in0_address, &in1_address, context_values);
-
-    let n_rows = inputs.len();
+    let n_rows = in0_address.len();
+    assert_eq!(n_rows, in1_address.len());
     assert_ne!(n_rows, 0);
     assert!(n_rows >= N_LANES);
     assert!(n_rows.is_power_of_two());
     let log_size = n_rows.ilog2();
 
-    let packed_inputs = pack_values(&inputs);
+    // Sanity check that the inputs are equal
+    #[cfg(debug_assertions)]
+    (in0_address.par_iter(), in1_address.par_iter()).into_par_iter().for_each(
+        |(in0_address, in1_address)| {
+            assert_eq!(
+                context_values[*in0_address], context_values[*in1_address],
+                "Eq gate: in0 and in1 must have equal values"
+            );
+        },
+    );
 
-    let preprocessed_columns = [in0_address, in1_address]
-        .into_iter()
-        .map(|col| crate::witness::utils::pack_usize_column(&col))
-        .collect_vec();
-
-    let (trace, lookup_data) = write_trace_simd(packed_inputs, preprocessed_columns);
+    let (trace, lookup_data) = write_trace_simd(context_values, &in0_address, &in1_address);
 
     (trace, log_size, lookup_data)
 }
 
+/// Writes the trace straight from the context values: each packed row gathers its rows' values
+/// as [`extract_component_inputs`] would and packs them and the two address columns as
+/// `pack_values` and `pack_usize_column` would, in place, instead of through three intermediate
+/// vectors.
 fn write_trace_simd(
-    inputs: Vec<PackedInputType>,
-    preprocessed_columns: Vec<Vec<PackedM31>>,
+    context_values: &[QM31],
+    in0_address: &[usize],
+    in1_address: &[usize],
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData) {
     let m31_gate_relation_id = PackedM31::broadcast(M31::from(378353459));
-    let log_n_packed_rows = inputs.len().ilog2();
+    let log_n_packed_rows = (in0_address.len() / N_LANES).ilog2();
     let log_size = log_n_packed_rows + LOG_N_LANES;
     let (mut trace, mut lookup_data) = unsafe {
         (
@@ -83,14 +91,19 @@ fn write_trace_simd(
         )
     };
 
-    let [in0_address, in1_address] = preprocessed_columns.try_into().unwrap();
+    let pack_addresses = |addresses: &[usize], row_index: usize| {
+        PackedM31::from_array(from_fn(|lane| M31::from(addresses[row_index * N_LANES + lane])))
+    };
 
-    (trace.par_iter_mut(), lookup_data.par_iter_mut(), inputs.into_par_iter())
+    (trace.par_iter_mut(), lookup_data.par_iter_mut())
         .into_par_iter()
         .enumerate()
-        .for_each(|(row_index, (row, lookup_data, input))| {
-            let in0_address = in0_address[row_index];
-            let in1_address = in1_address[row_index];
+        .for_each(|(row_index, (row, lookup_data))| {
+            let input: PackedInputType = <InputType as Pack>::pack(from_fn(|lane| {
+                context_values[in0_address[row_index * N_LANES + lane]].to_m31_array()
+            }));
+            let in0_address = pack_addresses(in0_address, row_index);
+            let in1_address = pack_addresses(in1_address, row_index);
 
             let in_col0 = input[0];
             *row[0] = in_col0;

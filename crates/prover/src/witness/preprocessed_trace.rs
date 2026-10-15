@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::poly::circle::CanonicCoset;
@@ -51,8 +52,12 @@ where
     commitment_scheme.commitment.root()
 }
 
+/// The columns are generated one per task: each is a short serial loop (at most 2^20 values), and
+/// the indexed collect keeps them in column order, so the evaluations are the ones the serial map
+/// produced. The serial map was the single-core head (about 0.17 s) of the preprocessed
+/// commitment that runs beside the base-trace writers.
 pub fn gen_trace(
     preprocessed_trace: Arc<PreProcessedTrace>,
 ) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
-    preprocessed_trace.columns.iter().map(|c| c.gen_column_simd()).collect()
+    preprocessed_trace.columns.par_iter().map(|c| c.gen_column_simd()).collect()
 }

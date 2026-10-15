@@ -329,9 +329,15 @@ where
     let interaction_elements = CommonLookupElements::draw(channel);
 
     // Interaction trace.
+    // Each component's columns are interpolated in its writer's task as soon as it returns (the
+    // same per-column interpolation `TreeBuilder::extend_evals` runs, in the same column order),
+    // on the workers the slowest writers leave idle.
     let span = span!(Level::INFO, "Write interaction trace").entered();
-    let (interaction_trace_evals, interaction_claim) =
-        interaction_generator.write_interaction_trace(&interaction_elements);
+    let interpolate = |columns: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>| {
+        SimdBackend::interpolate_columns_pooled(columns, twiddles, base_column_pool)
+    };
+    let (interaction_trace_polys, interaction_claim) =
+        interaction_generator.write_interaction_trace_with(&interaction_elements, &interpolate);
     span.exit();
 
     tracing::info!("Witness trace cells: {:?}", witness_trace_cells(&claim, &preprocessed_trace));
@@ -344,7 +350,7 @@ where
 
     let span = span!(Level::INFO, "Compute interaction trace commitment").entered();
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(interaction_trace_evals);
+    tree_builder.extend_polys(interaction_trace_polys);
     tree_builder.commit(channel);
     span.exit();
 

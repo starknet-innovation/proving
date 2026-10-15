@@ -228,133 +228,179 @@ pub fn compute_fri_quotients_with_regrowth<B: Backend>(
         B::accumulate_numerators(columns, std::slice::from_ref(batch), &mut acc, log_blowup_factor);
         acc
     };
-    #[cfg(feature = "parallel")]
-    let accumulations: Vec<Vec<AccumulatedNumerators<B>>> = groups
-        .par_iter()
-        .flat_map(|(columns, batches)| {
-            batches.par_iter().map(|batch| accumulate_batch(columns, batch))
-        })
-        .collect();
-    #[cfg(not(feature = "parallel"))]
-    let accumulations: Vec<Vec<AccumulatedNumerators<B>>> = groups
-        .iter()
-        .flat_map(|(columns, batches)| batches.iter().map(|batch| accumulate_batch(columns, batch)))
-        .collect();
-    accumulated_numerators_vec.extend(accumulations.into_iter().flatten());
+    // The stored columns' accumulations. They are computed beside the small regrown groups below
+    // (each into its own buffers) and added first, as before.
+    let stored_accumulations = || -> Vec<Vec<AccumulatedNumerators<B>>> {
+        #[cfg(feature = "parallel")]
+        let accumulations = groups
+            .par_iter()
+            .flat_map(|(columns, batches)| {
+                batches.par_iter().map(|batch| accumulate_batch(columns, batch))
+            })
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let accumulations = groups
+            .iter()
+            .flat_map(|(columns, batches)| {
+                batches.iter().map(|batch| accumulate_batch(columns, batch))
+            })
+            .collect();
+        accumulations
+    };
 
     // The columns that store no values, a bounded batch of regrown stripes at a time, or combined
-    // before their transforms.
-    for group in regrown_groups {
-        let sourced = sourced.unwrap();
-        // The columns that keep their coefficients (no stripe) and those with a source.
-        let (coefficient_group, group): (Vec<_>, Vec<_>) = group
-            .into_iter()
-            .partition(|&(_, &(tree, column))| sourced(tree, column).coeffs.is_some());
-        if !coefficient_group.is_empty() {
-            let polys: Vec<&Poly<B>> =
-                coefficient_group.iter().map(|&(_, &(tree, column))| sourced(tree, column)).collect();
-            let group_samples: Vec<&Vec<(PointSample, SecureField)>> =
-                coefficient_group.iter().map(|((_, s), _)| *s).collect();
-            let domain: CircleDomain = coefficient_group[0].0.0.domain;
-            if coefficient_group.iter().all(|((c, _), _)| c.domain == domain)
-                && combines_coefficient_columns(&polys, &group_samples)
-            {
-                for accumulation in
-                    combined_coefficient_accumulations(&polys, &group_samples, domain, twiddles)
+    // before their transforms. The groups of different sizes are independent, each computed into
+    // its own accumulations, which are then added in the sequential (size) order. The groups of
+    // at most 2^CONCURRENT_GROUP_MAX_LOG_SIZE trace rows run concurrently (a small size alone leaves
+    // most workers idle between its short fork-joins), before the larger ones, which run one at a
+    // time as before: the concurrent transients are those of the small sizes only, early in the
+    // step, below the largest group's own.
+    type GroupMember<'c, Bk> = (
+        (&'c &'c CircleEvaluation<Bk, BaseField, BitReversedOrder>, &'c Vec<(PointSample, SecureField)>),
+        &'c (usize, usize),
+    );
+    let process_group = |group: Vec<GroupMember<'_, B>>| -> Vec<AccumulatedNumerators<B>> {
+            let mut accumulated: Vec<AccumulatedNumerators<B>> = vec![];
+            let sourced = sourced.unwrap();
+            // The columns that keep their coefficients (no stripe) and those with a source.
+            let (coefficient_group, group): (Vec<_>, Vec<_>) = group
+                .into_iter()
+                .partition(|&(_, &(tree, column))| sourced(tree, column).coeffs.is_some());
+            if !coefficient_group.is_empty() {
+                let polys: Vec<&Poly<B>> =
+                    coefficient_group.iter().map(|&(_, &(tree, column))| sourced(tree, column)).collect();
+                let group_samples: Vec<&Vec<(PointSample, SecureField)>> =
+                    coefficient_group.iter().map(|((_, s), _)| *s).collect();
+                let domain: CircleDomain = coefficient_group[0].0.0.domain;
+                if coefficient_group.iter().all(|((c, _), _)| c.domain == domain)
+                    && combines_coefficient_columns(&polys, &group_samples)
                 {
-                    add_accumulation(&mut accumulated_numerators_vec, accumulation);
-                }
-            } else {
-                // Too few columns to save transforms: each one's stripe 0, a batch at a time.
-                let stripe0 = |poly: &Poly<B>| {
-                    let coeffs = poly.coeffs.as_ref().unwrap();
-                    let mut values = Col::<B, BaseField>::zeros(1 << coeffs.log_size());
-                    B::evaluate_stripe_into(coeffs, poly.evals.domain, twiddles, 0, &mut values);
-                    let mut evals = CircleEvaluation::new(
-                        CanonicCoset::new(coeffs.log_size()).circle_domain(),
-                        values,
-                    );
-                    evals.domain = poly.evals.domain;
-                    evals
-                };
-                for batch in coefficient_group.chunks(REGROWN_BATCH) {
-                    #[cfg(feature = "parallel")]
-                    let stripes: Vec<_> = batch
-                        .par_iter()
-                        .map(|&(_, &(tree, column))| stripe0(sourced(tree, column)))
-                        .collect();
-                    #[cfg(not(feature = "parallel"))]
-                    let stripes: Vec<_> =
-                        batch.iter().map(|&(_, &(tree, column))| stripe0(sourced(tree, column))).collect();
-                    let stripes = stripes.iter().collect_vec();
-                    let samples_with_randomness = batch.iter().map(|((_, s), _)| *s).collect_vec();
-                    let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
-                    #[cfg(feature = "parallel")]
-                    let accumulations: Vec<Vec<AccumulatedNumerators<B>>> = sample_batches
-                        .par_iter()
-                        .map(|batch| accumulate_batch(&stripes, batch))
-                        .collect();
-                    #[cfg(not(feature = "parallel"))]
-                    let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
-                        sample_batches.iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
-                    for accumulation in accumulations.into_iter().flatten() {
-                        add_accumulation(&mut accumulated_numerators_vec, accumulation);
+                    for accumulation in
+                        combined_coefficient_accumulations(&polys, &group_samples, domain, twiddles)
+                    {
+                        add_accumulation(&mut accumulated, accumulation);
+                    }
+                } else {
+                    // Too few columns to save transforms: each one's stripe 0, a batch at a time.
+                    let stripe0 = |poly: &Poly<B>| {
+                        let coeffs = poly.coeffs.as_ref().unwrap();
+                        let mut values = Col::<B, BaseField>::zeros(1 << coeffs.log_size());
+                        B::evaluate_stripe_into(coeffs, poly.evals.domain, twiddles, 0, &mut values);
+                        let mut evals = CircleEvaluation::new(
+                            CanonicCoset::new(coeffs.log_size()).circle_domain(),
+                            values,
+                        );
+                        evals.domain = poly.evals.domain;
+                        evals
+                    };
+                    for batch in coefficient_group.chunks(REGROWN_BATCH) {
+                        #[cfg(feature = "parallel")]
+                        let stripes: Vec<_> = batch
+                            .par_iter()
+                            .map(|&(_, &(tree, column))| stripe0(sourced(tree, column)))
+                            .collect();
+                        #[cfg(not(feature = "parallel"))]
+                        let stripes: Vec<_> =
+                            batch.iter().map(|&(_, &(tree, column))| stripe0(sourced(tree, column))).collect();
+                        let stripes = stripes.iter().collect_vec();
+                        let samples_with_randomness = batch.iter().map(|((_, s), _)| *s).collect_vec();
+                        let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
+                        #[cfg(feature = "parallel")]
+                        let accumulations: Vec<Vec<AccumulatedNumerators<B>>> = sample_batches
+                            .par_iter()
+                            .map(|batch| accumulate_batch(&stripes, batch))
+                            .collect();
+                        #[cfg(not(feature = "parallel"))]
+                        let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+                            sample_batches.iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
+                        for accumulation in accumulations.into_iter().flatten() {
+                            add_accumulation(&mut accumulated, accumulation);
+                        }
                     }
                 }
             }
-        }
-        if group.is_empty() {
-            continue;
-        }
-        let polys: Vec<&Poly<B>> =
-            group.iter().map(|&(_, &(tree, column))| sourced(tree, column)).collect();
-        let group_samples: Vec<&Vec<(PointSample, SecureField)>> =
-            group.iter().map(|((_, s), _)| *s).collect();
-        let domain: CircleDomain = group[0].0.0.domain;
-        if group.iter().all(|((c, _), _)| c.domain == domain)
-            && combines_sourced_columns(&polys, &group_samples)
-        {
-            for accumulation in
-                combined_sourced_accumulations(&polys, &group_samples, domain, twiddles)
+            if group.is_empty() {
+                return accumulated;
+            }
+            let polys: Vec<&Poly<B>> =
+                group.iter().map(|&(_, &(tree, column))| sourced(tree, column)).collect();
+            let group_samples: Vec<&Vec<(PointSample, SecureField)>> =
+                group.iter().map(|((_, s), _)| *s).collect();
+            let domain: CircleDomain = group[0].0.0.domain;
+            if group.iter().all(|((c, _), _)| c.domain == domain)
+                && combines_sourced_columns(&polys, &group_samples)
             {
-                add_accumulation(&mut accumulated_numerators_vec, accumulation);
+                for accumulation in
+                    combined_sourced_accumulations(&polys, &group_samples, domain, twiddles)
+                {
+                    add_accumulation(&mut accumulated, accumulation);
+                }
+                return accumulated;
             }
-            continue;
-        }
-        let regrow =
-            |tree: usize, column: usize| sourced(tree, column).stripe0(twiddles).into_owned();
-        for batch in group.chunks(REGROWN_BATCH) {
-            #[cfg(feature = "parallel")]
-            let stripes: Vec<_> =
-                batch.par_iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
-            #[cfg(not(feature = "parallel"))]
-            let stripes: Vec<_> =
-                batch.iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
-            let stripes = stripes.iter().collect_vec();
-            let samples_with_randomness = batch.iter().map(|((_, s), _)| *s).collect_vec();
-            let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
-            #[cfg(feature = "parallel")]
-            let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
-                sample_batches.par_iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
-            #[cfg(not(feature = "parallel"))]
-            let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
-                sample_batches.iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
-            for accumulation in accumulations.into_iter().flatten() {
-                add_accumulation(&mut accumulated_numerators_vec, accumulation);
+            let regrow =
+                |tree: usize, column: usize| sourced(tree, column).stripe0(twiddles).into_owned();
+            for batch in group.chunks(REGROWN_BATCH) {
+                #[cfg(feature = "parallel")]
+                let stripes: Vec<_> =
+                    batch.par_iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
+                #[cfg(not(feature = "parallel"))]
+                let stripes: Vec<_> =
+                    batch.iter().map(|&(_, &(tree, column))| regrow(tree, column)).collect();
+                let stripes = stripes.iter().collect_vec();
+                let samples_with_randomness = batch.iter().map(|((_, s), _)| *s).collect_vec();
+                let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
+                #[cfg(feature = "parallel")]
+                let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+                    sample_batches.par_iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
+                #[cfg(not(feature = "parallel"))]
+                let accumulations: Vec<Vec<AccumulatedNumerators<B>>> =
+                    sample_batches.iter().map(|batch| accumulate_batch(&stripes, batch)).collect();
+                for accumulation in accumulations.into_iter().flatten() {
+                    add_accumulation(&mut accumulated, accumulation);
+                }
             }
+            accumulated
+    };
+    let (small_groups, large_groups): (Vec<_>, Vec<_>) = regrown_groups.into_iter().partition(
+        |group| {
+            group[0].0.0.domain.log_size() <= CONCURRENT_GROUP_MAX_LOG_SIZE + log_blowup_factor
+        },
+    );
+    // The stored columns and the small regrown groups are independent (each fills its own
+    // accumulations): they run together, so that neither's short fork-joins leave the workers
+    // idle. Their accumulations are added in the sequential order: stored, then by size.
+    let small_accumulations =
+        || -> Vec<Vec<AccumulatedNumerators<B>>> {
+            crate::parallel_iter!(small_groups).map(&process_group).collect()
+        };
+    #[cfg(feature = "parallel")]
+    let (stored, mut group_accumulations) =
+        rayon::join(stored_accumulations, small_accumulations);
+    #[cfg(not(feature = "parallel"))]
+    let (stored, mut group_accumulations) = (stored_accumulations(), small_accumulations());
+    accumulated_numerators_vec.extend(stored.into_iter().flatten());
+    group_accumulations.extend(large_groups.into_iter().map(&process_group));
+    for accumulations in group_accumulations {
+        for accumulation in accumulations {
+            add_accumulation(&mut accumulated_numerators_vec, accumulation);
         }
     }
 
     // Group and accumulate the numerators per sample point: the accumulations (of different
     // lengths) get lifted and accumulated to a single vector. After this step, there is a single
     // accumulation per sample point.
-    let accumulations_per_sample_point = accumulated_numerators_vec
-        .into_iter()
-        .sorted_by_key(|c| (c.sample_point.x, c.sample_point.y))
-        .group_by(|c| c.sample_point)
-        .into_iter()
-        .map(|(sample_point, accumulations_per_log_size)| {
-            let accumulations_per_log_size = accumulations_per_log_size.collect_vec();
+    // The points are independent and each lift adds into its own largest accumulation in place:
+    // they are lifted concurrently, in their order.
+    let points_accumulations: Vec<(CirclePoint<SecureField>, Vec<AccumulatedNumerators<B>>)> =
+        accumulated_numerators_vec
+            .into_iter()
+            .sorted_by_key(|c| (c.sample_point.x, c.sample_point.y))
+            .group_by(|c| c.sample_point)
+            .into_iter()
+            .map(|(sample_point, accumulations)| (sample_point, accumulations.collect_vec()))
+            .collect();
+    let accumulations_per_sample_point: Vec<AccumulatedNumerators<B>> =
+        crate::parallel_iter!(points_accumulations).map(|(sample_point, accumulations_per_log_size)| {
             // Accumulate the `a` coefficients.
             let first_linear_term_acc: SecureField =
                 accumulations_per_log_size.iter().map(|x| x.first_linear_term_acc).sum();
@@ -373,7 +419,7 @@ pub fn compute_fri_quotients_with_regrowth<B: Backend>(
                 first_linear_term_acc,
             }
         })
-        .collect_vec();
+        .collect();
 
     B::compute_quotients_and_combine(
         accumulations_per_sample_point,
@@ -522,43 +568,58 @@ fn combined_coefficient_accumulations<B: Backend>(
     let line_coeffs: Vec<Vec<(SecureField, SecureField, SecureField)>> =
         quotient_constants(&sample_batches).line_coeffs;
     let log_size = polys[0].coeffs.as_ref().expect("coefficient columns").log_size();
-    zip(sample_batches, line_coeffs)
-        .map(|(batch, coeffs)| {
-            let terms: Vec<(&Col<B, BaseField>, SecureField)> = zip(&batch.cols_vals_randpows, &coeffs)
-                .map(|(data, &(_, _, c))| {
-                    (&polys[data.column_index].coeffs.as_ref().unwrap().coeffs, c)
-                })
-                .collect();
-            let sum = B::weighted_columns(log_size, &terms);
-            let evaluate = |column: Col<B, BaseField>| {
-                // Every value is written by the FFT: taken as the pool's FFT buffers are, not zeroed.
-                let mut stripe =
-                    crate::prover::mempool::BaseColumnPool::<B>::new().take_or_alloc(log_size);
-                B::evaluate_stripe_into(&CircleCoefficients::new(column), domain, twiddles, 0, &mut stripe);
-                stripe
-            };
-            let [c0, c1, c2, c3] = sum.columns;
-            #[cfg(feature = "parallel")]
-            let columns = {
-                let ((s0, s1), (s2, s3)) = rayon::join(
-                    || rayon::join(|| evaluate(c0), || evaluate(c1)),
-                    || rayon::join(|| evaluate(c2), || evaluate(c3)),
-                );
-                [s0, s1, s2, s3]
-            };
-            #[cfg(not(feature = "parallel"))]
-            let columns = [evaluate(c0), evaluate(c1), evaluate(c2), evaluate(c3)];
-            let mut partial_numerators_acc = SecureColumnByCoords { columns };
-            let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
-            B::canonicalize_and_subtract(&mut partial_numerators_acc, b_sum);
-            AccumulatedNumerators {
-                sample_point: batch.point,
-                partial_numerators_acc,
-                first_linear_term_acc: coeffs.iter().map(|(a, ..)| *a).sum(),
-            }
-        })
-        .collect()
+    let per_point = |(batch, coeffs): (ColumnSampleBatch, Vec<(SecureField, SecureField, SecureField)>)| {
+        let terms: Vec<(&Col<B, BaseField>, SecureField)> = zip(&batch.cols_vals_randpows, &coeffs)
+            .map(|(data, &(_, _, c))| {
+                (&polys[data.column_index].coeffs.as_ref().unwrap().coeffs, c)
+            })
+            .collect();
+        let sum = B::weighted_columns(log_size, &terms);
+        let evaluate = |column: Col<B, BaseField>| {
+            // Every value is written by the FFT: taken as the pool's FFT buffers are, not zeroed.
+            let mut stripe =
+                crate::prover::mempool::BaseColumnPool::<B>::new().take_or_alloc(log_size);
+            B::evaluate_stripe_into(&CircleCoefficients::new(column), domain, twiddles, 0, &mut stripe);
+            stripe
+        };
+        let [c0, c1, c2, c3] = sum.columns;
+        #[cfg(feature = "parallel")]
+        let columns = {
+            let ((s0, s1), (s2, s3)) = rayon::join(
+                || rayon::join(|| evaluate(c0), || evaluate(c1)),
+                || rayon::join(|| evaluate(c2), || evaluate(c3)),
+            );
+            [s0, s1, s2, s3]
+        };
+        #[cfg(not(feature = "parallel"))]
+        let columns = [evaluate(c0), evaluate(c1), evaluate(c2), evaluate(c3)];
+        let mut partial_numerators_acc = SecureColumnByCoords { columns };
+        let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
+        B::canonicalize_and_subtract(&mut partial_numerators_acc, b_sum);
+        AccumulatedNumerators {
+            sample_point: batch.point,
+            partial_numerators_acc,
+            first_linear_term_acc: coeffs.iter().map(|(a, ..)| *a).sum(),
+        }
+    };
+    let points = zip(sample_batches, line_coeffs).collect_vec();
+    // The sample points of a size are independent: up to `CONCURRENT_GROUP_MAX_LOG_SIZE` they
+    // are computed concurrently (each point's sum and its four transforms are short fork-joins
+    // that leave workers idle), in their order. Larger sizes keep one point's transient at a time.
+    #[cfg(feature = "parallel")]
+    {
+        if log_size <= CONCURRENT_GROUP_MAX_LOG_SIZE {
+            return points.into_par_iter().map(&per_point).collect();
+        }
+    }
+    points.into_iter().map(&per_point).collect()
 }
+
+/// The largest trace log size of the regrown quotient groups that [`compute_fri_quotients_with_regrowth`]
+/// computes concurrently, and of the coefficient columns whose sample points are combined concurrently
+/// by [`combined_coefficient_accumulations`]: a point's transient is a weighted sum and its four
+/// transforms, `32 << log_size` bytes, 64 MiB at 2^21.
+const CONCURRENT_GROUP_MAX_LOG_SIZE: u32 = 21;
 
 /// Stripe 0 of `domain` of each coordinate of `values`, given on `trace_domain`: interpolated
 /// with the twiddles of `trace_domain` and evaluated on the first subdomain of `domain` with

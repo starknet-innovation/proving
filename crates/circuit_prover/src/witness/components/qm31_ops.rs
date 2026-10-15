@@ -67,64 +67,47 @@ pub fn write_trace(
     preprocessed_trace: &PreProcessedTrace,
     trace_generator: &Qm31OpsTraceGenerator,
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, ComponentLogSize, LookupData) {
-    let add_flag =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "qm31_ops_add_flag".to_owned() });
-    let sub_flag =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "qm31_ops_sub_flag".to_owned() });
-    let mul_flag =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "qm31_ops_mul_flag".to_owned() });
-    let pointwise_mul_flag = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "qm31_ops_pointwise_mul_flag".to_owned() });
-    let in0_address = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "qm31_ops_in0_address".to_owned() });
-    let in1_address = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "qm31_ops_in1_address".to_owned() });
-    let out_address = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "qm31_ops_out_address".to_owned() });
-    let mults =
-        preprocessed_trace.get_column(&PreProcessedColumnId { id: "qm31_ops_mults".to_owned() });
+    // Only the addresses and the multiplicities are read: the four flag columns are not part of
+    // this component's base trace (its AIR reads them from the preprocessed tree).
+    let column = |id: &str| preprocessed_trace.get_column(&PreProcessedColumnId { id: id.to_owned() });
+    let in0_address = column("qm31_ops_in0_address");
+    let in1_address = column("qm31_ops_in1_address");
+    let out_address = column("qm31_ops_out_address");
+    let mults = crate::witness::utils::pack_usize_column(&column("qm31_ops_mults"));
 
-    let inputs = extract_component_inputs(
-        &in0_address,
-        &in1_address,
-        &out_address,
-        context_values,
-        trace_generator,
-    );
-
-    let n_rows = inputs.len();
+    let n_rows = in0_address.len();
+    assert_eq!(n_rows, in1_address.len());
+    assert_eq!(n_rows, out_address.len());
     assert_ne!(n_rows, 0);
     assert!(n_rows >= N_LANES);
     assert!(n_rows.is_power_of_two());
+    let first_permutation_row = trace_generator.first_permutation_row;
+    assert!(first_permutation_row <= n_rows);
+    // The permutation rows come in pairs (see `extract_component_inputs`).
+    assert!((n_rows - first_permutation_row).is_multiple_of(2));
     let log_size = n_rows.ilog2();
 
-    let packed_inputs = pack_values(&inputs);
-    drop(inputs);
-
-    let preprocessed_columns = [
-        add_flag,
-        sub_flag,
-        mul_flag,
-        pointwise_mul_flag,
-        in0_address,
-        in1_address,
-        out_address,
+    let (trace, lookup_data) = write_trace_simd(
+        context_values,
+        [&*in0_address, &*in1_address, &*out_address],
+        first_permutation_row,
         mults,
-    ]
-    .into_iter()
-    .map(|col| crate::witness::utils::pack_usize_column(&col))
-    .collect_vec();
-
-    let (trace, lookup_data) = write_trace_simd(packed_inputs, preprocessed_columns);
+    );
 
     (trace, log_size, lookup_data)
 }
 
+/// Writes the trace straight from the context values: each packed row gathers the operands of its
+/// rows exactly as [`extract_component_inputs`] would, packs them as `pack_values` would, and
+/// writes them in place, instead of collecting every row's operands into a vector and packing it
+/// into another (two copies of the 2^23-row component, 384 MiB each).
 fn write_trace_simd(
-    inputs: Vec<PackedInputType>,
-    preprocessed_columns: Vec<Vec<PackedM31>>,
+    context_values: &[QM31],
+    [in0_address, in1_address, out_address]: [&[usize]; 3],
+    first_permutation_row: usize,
+    mults: Vec<PackedM31>,
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData) {
-    let log_n_packed_rows = inputs.len().ilog2();
+    let log_n_packed_rows = (in0_address.len() / N_LANES).ilog2();
     let log_size = log_n_packed_rows + LOG_N_LANES;
     let (mut trace, mut lookup_data) = unsafe {
         (
@@ -133,58 +116,35 @@ fn write_trace_simd(
         )
     };
 
-    let [
-        add_flag,
-        sub_flag,
-        mul_flag,
-        pointwise_mul_flag,
-        in0_address,
-        in1_address,
-        out_address,
-        mults,
-    ] = preprocessed_columns.try_into().unwrap();
+    let zero = QM31::zero().to_m31_array();
+    // The operands of a row, as `extract_component_inputs` takes them: a permutation row (from
+    // `first_permutation_row` on, in pairs) holds `[0, v, v]` with `v` the value at its pair's
+    // first in1 address on the pair's first row and at its second out address on the second.
+    let operands = |row: usize| -> InputType {
+        if row < first_permutation_row {
+            [in0_address[row], in1_address[row], out_address[row]]
+                .map(|address| context_values[address].to_m31_array())
+        } else {
+            let address = if (row - first_permutation_row).is_multiple_of(2) {
+                in1_address[row]
+            } else {
+                out_address[row]
+            };
+            let value = context_values[address].to_m31_array();
+            [zero, value, value]
+        }
+    };
 
-    (trace.par_iter_mut(), lookup_data.par_iter_mut(), inputs.into_par_iter())
+    (trace.par_iter_mut(), lookup_data.par_iter_mut())
         .into_par_iter()
         .enumerate()
-        .for_each(|(row_index, (row, lookup_data, qm_31_ops_input))| {
-            let _add_flag = add_flag[row_index];
-            let _sub_flag = sub_flag[row_index];
-            let _mul_flag = mul_flag[row_index];
-            let _pointwise_mul_flag = pointwise_mul_flag[row_index];
-            let in0_address = in0_address[row_index];
-            let in1_address = in1_address[row_index];
-            let out_address = out_address[row_index];
-            let mults = mults[row_index];
-
-            let in0_col0 = qm_31_ops_input[0][0];
-            *row[0] = in0_col0;
-            let in0_col1 = qm_31_ops_input[0][1];
-            *row[1] = in0_col1;
-            let in0_col2 = qm_31_ops_input[0][2];
-            *row[2] = in0_col2;
-            let in0_col3 = qm_31_ops_input[0][3];
-            *row[3] = in0_col3;
-            let in1_col4 = qm_31_ops_input[1][0];
-            *row[4] = in1_col4;
-            let in1_col5 = qm_31_ops_input[1][1];
-            *row[5] = in1_col5;
-            let in1_col6 = qm_31_ops_input[1][2];
-            *row[6] = in1_col6;
-            let in1_col7 = qm_31_ops_input[1][3];
-            *row[7] = in1_col7;
-            let out_col8 = qm_31_ops_input[2][0];
-            *row[8] = out_col8;
-            let out_col9 = qm_31_ops_input[2][1];
-            *row[9] = out_col9;
-            let out_col10 = qm_31_ops_input[2][2];
-            *row[10] = out_col10;
-            let out_col11 = qm_31_ops_input[2][3];
-            *row[11] = out_col11;
-            // The gate tuples are the addresses and these trace columns: the interaction write
-            // reads them back from the committed tree (see `write_interaction_trace`).
-            let _ = (in0_address, in1_address, out_address);
-            *lookup_data.mults = mults;
+        .for_each(|(row_index, (row, lookup_data))| {
+            let packed: PackedInputType =
+                <InputType as Pack>::pack(from_fn(|lane| operands(row_index * N_LANES + lane)));
+            for column in 0..N_TRACE_COLUMNS {
+                *row[column] = packed[column / 4][column % 4];
+            }
+            *lookup_data.mults = mults[row_index];
         });
 
     (trace, lookup_data)

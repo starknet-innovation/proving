@@ -149,6 +149,11 @@ const LOG_N_BLOCKS: u32 = 2;
 const BLOCK_COLUMNS_BYTES: usize = 768 << 20;
 /// At most `2^MAX_LOG_N_BLOCKS` blocks: each block folds every column's coefficients again.
 const MAX_LOG_N_BLOCKS: u32 = 5;
+/// The most bytes of block columns for which a component is evaluated in two halves instead of
+/// `2^LOG_N_BLOCKS` blocks: the circuit's narrow block-evaluated components (eq, triple_xor,
+/// m31_to_u32, verify_bitwise_xor_12; at most ~190 MiB per half), never qm31_ops or
+/// blake_g_gate, whose block windows set the composition's memory.
+const NARROW_BLOCK_COLUMNS_BYTES: usize = 192 << 20;
 
 /// The smallest evaluation domain that [`FrameworkComponent::evaluate_in_blocks`] evaluates
 /// block by block; smaller components extend at once, as before.
@@ -171,7 +176,16 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             // Enough blocks that one block of the columns evaluated per block stays under
             // `BLOCK_COLUMNS_BYTES`: the window of a wide component is its blocks' columns.
             let n_block_columns = self.n_block_columns(trace);
-            let mut log_n_blocks = LOG_N_BLOCKS;
+            // A narrow component whose half-domain blocks stay under `NARROW_BLOCK_COLUMNS_BYTES`
+            // takes two blocks: each is the evaluation on a subdomain of the coefficients' size
+            // (no fold), and the coefficients are read twice instead of four times. Every row is
+            // still evaluated once, from the same values, so the accumulator is unchanged.
+            let mut log_n_blocks =
+                if n_block_columns * (4usize << (eval_log_size - 1)) <= NARROW_BLOCK_COLUMNS_BYTES {
+                    1
+                } else {
+                    LOG_N_BLOCKS
+                };
             while log_n_blocks < MAX_LOG_N_BLOCKS
                 && n_block_columns * (4usize << (eval_log_size - log_n_blocks)) > BLOCK_COLUMNS_BYTES
             {
@@ -432,22 +446,35 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
             }
         }
         // The shifted columns, extended to the whole domain.
-        let whole = component_polys
-            .as_cols_ref()
-            .zip_cols(shifted.as_cols_ref())
-            .map_cols(|(poly, shifted): (&&&Poly<SimdBackend>, &bool)| {
-                shifted.then(|| poly.get_evaluation_on_domain(eval_domain, &twiddles))
-            });
+        let extend = |(poly, shifted): (&&&Poly<SimdBackend>, &bool)| {
+            shifted.then(|| poly.get_evaluation_on_domain(eval_domain, &twiddles))
+        };
         // A block column kept without coefficients (a compact preprocessed column) is regrown
         // once here for all the blocks instead of once per block: every block folds the same
-        // coefficients, so its values are unchanged.
-        let regrow = |(poly, whole): (&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>)| {
-            (whole.is_none() && poly.coeffs.is_none()).then(|| poly.regrown_coefficients())
+        // coefficients, so its values are unchanged. (A column is extended whole exactly when it
+        // is shifted, so `!shifted` is the former `whole.is_none()`.)
+        let regrow = |(poly, shifted): (&&&Poly<SimdBackend>, &bool)| {
+            (!*shifted && poly.coeffs.is_none()).then(|| poly.regrown_coefficients())
         };
+        let inputs = || component_polys.as_cols_ref().zip_cols(shifted.as_cols_ref());
         #[cfg(not(feature = "parallel"))]
-        let regrown = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).map_cols(regrow);
+        let (whole, regrown) = (inputs().map_cols(extend), inputs().map_cols(regrow));
+        // The shifted columns' extensions (each FFT parallel on its own, formerly one column
+        // after the other) and the compact columns' regrowth run together: each column's values
+        // are computed exactly as before, only concurrently. The regrowth twiddles are found once
+        // before the columns are regrown, instead of by every column racing on the empty cache.
         #[cfg(feature = "parallel")]
-        let regrown = component_polys.as_cols_ref().zip_cols(whole.as_cols_ref()).par_map_cols(regrow);
+        let (whole, regrown) = rayon::join(
+            || inputs().par_map_cols(extend),
+            || {
+                for (poly, shifted) in inputs().0.into_iter().flatten() {
+                    if !*shifted && poly.coeffs.is_none() {
+                        poly.warm_regrowth_twiddles();
+                    }
+                }
+                inputs().par_map_cols(regrow)
+            },
+        );
         // A block's column buffers are reused by the next block (no fresh pages).
         let spare = std::sync::Mutex::new(Vec::<BaseColumn>::new());
         // The first block's buffers: every value is written by `evaluate_block_into`'s FFT, so they
