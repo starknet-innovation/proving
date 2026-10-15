@@ -881,6 +881,18 @@ impl PolyOps for SimdBackend {
         }
     }
 
+    fn folds_rows_from_coefficients(log_size: u32) -> bool {
+        log_size > CACHED_FFT_LOG_SIZE
+    }
+
+    fn evaluate_rows_from_coefficients(
+        coeffs: &CircleCoefficients<Self>,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+    ) -> Option<Vec<Vec<BaseField>>> {
+        evaluate_rows_from_coefficients(coeffs, domain, targets)
+    }
+
     fn evaluate_stripe_into(
         poly: &CircleCoefficients<Self>,
         domain: CircleDomain,
@@ -1207,6 +1219,265 @@ pub fn evaluate_block_into(
             .collect::<Vec<_>>(),
     ];
     fft_subdomains_into(&folded, dst, &stripe_twiddles);
+}
+
+/// The values of a polynomial, given by its coefficients, at rows of the stripes of `domain`
+/// (`targets`: per stripe, its sorted rows), for a column that keeps its coefficients instead of
+/// stripe 0 (the decommitment's reads). `None` for a polynomial small enough to be stored in its
+/// natural order, which the caller evaluates otherwise.
+///
+/// A point's value is the fold of the coefficients with its factors `m_k`, one per coefficient
+/// bit: `y`, `x`, then `x` doubled `k - 1` times (`slow_eval_at_point`). The 32 points of an
+/// aligned block of the bit-reversed domain share every factor past the first five, and the most
+/// doubled factors take only a few values over all the blocks. A large polynomial is stored with
+/// its vectors transposed (see `split_at_mid`): the vector bits of those most shared factors are
+/// the lowest of the storage, so an aligned tile of `2^n0` vectors holds every pair they fold.
+/// Tile by tile, the column is read once:
+/// 1. the tile is folded over its top `K` bits once per distinct prefix of the blocks' factors
+///    (a factor and its negation share their product);
+/// 2. each block weights the rest of its folded tile with the products of its remaining factors
+///    of the tile's bits, and accumulates it with its factors of the tile's index;
+/// 3. each point combines its block's 32 values (16 lanes, two for the vector bit of `m_4`) with
+///    its own five factors.
+/// Everything but the coefficients depends only on the size, the domain and the rows, so it is
+/// planned once ([`CoefficientPlan`]) and shared by every column of that size.
+pub fn evaluate_rows_from_coefficients(
+    coeffs: &CircleCoefficients<SimdBackend>,
+    domain: CircleDomain,
+    targets: &[(usize, Vec<usize>)],
+) -> Option<Vec<Vec<BaseField>>> {
+    let n = coeffs.log_size();
+    if n <= CACHED_FFT_LOG_SIZE {
+        return None;
+    }
+    let plan = CoefficientPlan::get(n, domain, targets);
+    let n0 = plan.tile_bits as usize;
+    let k = plan.levels.len();
+    let tile = 1usize << n0;
+    let n_tiles = coeffs.coeffs.data.len() >> n0;
+    let low = 1usize << (n0 - k);
+    let n_blocks = plan.blocks.len();
+    let mut acc = vec![[PackedBaseField::zero(); 2]; n_blocks];
+    // The nodes of the current and next level, each `2^(n0 - d)` vectors, back to back.
+    let max_nodes = plan.levels.iter().map(|level| level.len()).max().unwrap_or(1);
+    let mut cur: Vec<PackedBaseField> = vec![PackedBaseField::zero(); max_nodes * tile / 2];
+    let mut next: Vec<PackedBaseField> = vec![PackedBaseField::zero(); max_nodes * tile / 2];
+    for t in 0..n_tiles {
+        let src = &coeffs.coeffs.data[t * tile..(t + 1) * tile];
+        for (d, level) in plan.levels.iter().enumerate() {
+            let half = tile >> (d + 1);
+            for op in level {
+                let parent: &[PackedBaseField] = if d == 0 {
+                    src
+                } else {
+                    &cur[op.parent * 2 * half..(op.parent + 1) * 2 * half]
+                };
+                let (lo, hi) = parent.split_at(half);
+                let f = PackedBaseField::broadcast(op.factor);
+                match (op.plus, op.minus) {
+                    (Some(p), Some(m)) => {
+                        let (a, b) = if p < m {
+                            let (x, y) = next.split_at_mut(m * half);
+                            (&mut x[p * half..(p + 1) * half], &mut y[..half])
+                        } else {
+                            let (x, y) = next.split_at_mut(p * half);
+                            (&mut y[..half], &mut x[m * half..(m + 1) * half])
+                        };
+                        for i in 0..half {
+                            let prod = hi[i] * f;
+                            a[i] = lo[i] + prod;
+                            b[i] = lo[i] - prod;
+                        }
+                    }
+                    (Some(p), None) => {
+                        let a = &mut next[p * half..(p + 1) * half];
+                        for i in 0..half {
+                            a[i] = lo[i] + hi[i] * f;
+                        }
+                    }
+                    (None, Some(m)) => {
+                        let b = &mut next[m * half..(m + 1) * half];
+                        for i in 0..half {
+                            b[i] = lo[i] - hi[i] * f;
+                        }
+                    }
+                    (None, None) => unreachable!(),
+                }
+            }
+            std::mem::swap(&mut cur, &mut next);
+        }
+        let leaves: &[PackedBaseField] = if k == 0 { src } else { &cur };
+        let e = (t >> plan.m4_tile_bit) & 1;
+        for (block, acc) in plan.blocks.iter().zip(acc.iter_mut()) {
+            let leaf = &leaves[block.leaf * low..(block.leaf + 1) * low];
+            let mut v = leaf[0];
+            for i in 1..low {
+                v += leaf[i] * PackedBaseField::broadcast(block.low_weights[i]);
+            }
+            acc[e] += v * PackedBaseField::broadcast(block.tile_weights[t]);
+        }
+    }
+    let mut out: Vec<Vec<BaseField>> =
+        targets.iter().map(|(_, rows)| vec![BaseField::zero(); rows.len()]).collect();
+    for (block, acc) in plan.blocks.iter().zip(acc) {
+        let values: Vec<BaseField> = acc.iter().flat_map(|p| p.to_array()).collect();
+        for &(target, k, own) in &block.points {
+            out[target][k] = fold(&values, &own);
+        }
+    }
+    Some(out)
+}
+
+/// One fold of a node of the previous level with a factor: its children with the factor (`plus`)
+/// and with its negation (`minus`), by index in the level.
+struct FoldOp {
+    parent: usize,
+    factor: BaseField,
+    plus: Option<usize>,
+    minus: Option<usize>,
+}
+
+struct CoefficientBlock {
+    /// Its node in the last folded level.
+    leaf: usize,
+    /// The products of its factors of the tile's bits below the folded ones, by those bits.
+    low_weights: Vec<BaseField>,
+    /// The products of its factors of the tile index's bits (all but `m_4`'s), by tile.
+    tile_weights: Vec<BaseField>,
+    /// Its points: target, row index in the target, and own factors `[m_4, m_3, m_2, m_1, m_0]`.
+    points: Vec<(usize, usize, [BaseField; 5])>,
+}
+
+/// The column-independent part of [`evaluate_rows_from_coefficients`] for one size, domain and
+/// set of rows.
+struct CoefficientPlan {
+    tile_bits: u32,
+    /// The bit of the tile index that is the vector bit of `m_4`.
+    m4_tile_bit: u32,
+    levels: Vec<Vec<FoldOp>>,
+    blocks: Vec<CoefficientBlock>,
+}
+
+/// The plans of [`CoefficientPlan::get`], by size, domain and rows.
+static COEFFICIENT_PLANS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<CoefficientPlan>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+impl CoefficientPlan {
+    /// The most top bits of a tile folded once per distinct prefix of factors; below them each
+    /// block weights its folded tile itself.
+    const MAX_LEVELS: u32 = 5;
+
+    fn get(n: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) -> std::sync::Arc<Self> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (n, domain.log_size(), domain.half_coset.initial_index.0, targets).hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some(plan) = COEFFICIENT_PLANS.lock().unwrap().get(&key) {
+            return plan.clone();
+        }
+        let plan = std::sync::Arc::new(Self::new(n, domain, targets));
+        COEFFICIENT_PLANS.lock().unwrap().entry(key).or_insert(plan).clone()
+    }
+
+    fn new(n: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) -> Self {
+        // The storage of `2^(n - 4)` vectors is `(c, b, a)` for the natural vector index
+        // `(a, b, c)`, `|a| = |c| = n0` (see `transposed_vec_index`).
+        let log_n_vecs = n - LOG_N_LANES;
+        let n0 = log_n_vecs / 2;
+        let n1 = log_n_vecs - n0;
+        // The factor of storage vector bit `s`: coefficient bit `4 + natural vector bit`.
+        let factor_of = |s: u32| -> usize {
+            let natural = if s < n0 {
+                n1 + s
+            } else if s < n1 {
+                n0
+            } else {
+                s - n1
+            };
+            (LOG_N_LANES + natural) as usize
+        };
+        let factors_at = |pos: usize| -> Vec<BaseField> {
+            let point = domain.at(bit_reverse_index(pos, domain.log_size()));
+            let mut x = point.x;
+            let mut factors = vec![point.y];
+            for _ in 1..n {
+                factors.push(x);
+                x = CirclePoint::double_x(x);
+            }
+            factors
+        };
+        // The blocks of 32 rows, in target and row order.
+        let mut blocks: Vec<(usize, Vec<BaseField>, Vec<(usize, usize, [BaseField; 5])>)> = vec![];
+        for (target, (stripe, rows)) in targets.iter().enumerate() {
+            for (k, &row) in rows.iter().enumerate() {
+                let pos = (stripe << n) + row;
+                let factors = factors_at(pos);
+                let own = [factors[4], factors[3], factors[2], factors[1], factors[0]];
+                match blocks.last_mut() {
+                    Some((block, _, points)) if *block == pos >> 5 => points.push((target, k, own)),
+                    _ => blocks.push((pos >> 5, factors, vec![(target, k, own)])),
+                }
+            }
+        }
+        let k = Self::MAX_LEVELS.min(n0);
+        // The folded levels: level `d` folds storage bit `n0 - 1 - d` of the tile.
+        let mut levels: Vec<Vec<FoldOp>> = vec![];
+        let mut node_of: Vec<usize> = vec![0; blocks.len()];
+        for d in 0..k {
+            let s = n0 - 1 - d;
+            let mut ops: Vec<FoldOp> = vec![];
+            let mut children: std::collections::HashMap<(usize, u32), usize> = Default::default();
+            let mut n_children = 0;
+            for (b, (_, factors, _)) in blocks.iter().enumerate() {
+                let f = factors[factor_of(s)];
+                let key = (node_of[b], f.0);
+                let child = *children.entry(key).or_insert_with(|| {
+                    n_children += 1;
+                    n_children - 1
+                });
+                // One op per parent and factor up to sign.
+                let neg = -f;
+                let (rep, is_plus) = if f.0 <= neg.0 { (f, true) } else { (neg, false) };
+                let op = match ops.iter_mut().find(|op| op.parent == node_of[b] && op.factor == rep) {
+                    Some(op) => op,
+                    None => {
+                        ops.push(FoldOp { parent: node_of[b], factor: rep, plus: None, minus: None });
+                        ops.last_mut().unwrap()
+                    }
+                };
+                if is_plus {
+                    op.plus = Some(child);
+                } else {
+                    op.minus = Some(child);
+                }
+                node_of[b] = child;
+            }
+            levels.push(ops);
+        }
+        let low_bits = n0 - k;
+        let m4_storage_bit = n1; // natural vector bit 0
+        let blocks = blocks
+            .into_iter()
+            .zip(node_of)
+            .map(|((_, factors, points), leaf)| {
+                let mut low_weights = vec![BaseField::one()];
+                for s in 0..low_bits {
+                    let f = factors[factor_of(s)];
+                    let high: Vec<BaseField> = low_weights.iter().map(|&w| w * f).collect();
+                    low_weights.extend(high);
+                }
+                let mut tile_weights = vec![BaseField::one()];
+                for s in n0..log_n_vecs {
+                    let f = if s == m4_storage_bit { BaseField::one() } else { factors[factor_of(s)] };
+                    let high: Vec<BaseField> = tile_weights.iter().map(|&w| w * f).collect();
+                    tile_weights.extend(high);
+                }
+                CoefficientBlock { leaf, low_weights, tile_weights, points }
+            })
+            .collect();
+        Self { tile_bits: n0, m4_tile_bit: m4_storage_bit - n0, levels, blocks }
+    }
 }
 
 fn compute_small_coset_twiddles(coset: Coset) -> TwiddleTree<SimdBackend> {
@@ -1557,6 +1828,7 @@ static PREFIX_PLANS: std::sync::LazyLock<
 pub fn clear_stripe_caches() {
     SUBDOMAIN_TWIDDLES.lock().unwrap().clear();
     PREFIX_PLANS.lock().unwrap().clear();
+    COEFFICIENT_PLANS.lock().unwrap().clear();
 }
 
 /// The domain whose values a [`PrefixPlan`] folds: stripe 0 of the column's extension, or the

@@ -227,6 +227,24 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
     ) {
     }
 
+    /// The values of `coeffs`' polynomial at the rows `targets[t].1` of the stripe `targets[t].0`
+    /// of `domain` (a column that keeps its coefficients instead of stripe 0), folded once for
+    /// all the rows. `None` where the backend does not support it (the caller then evaluates them
+    /// otherwise).
+    /// Whether [`Self::evaluate_rows_from_coefficients`] takes polynomials of `2^log_size`
+    /// coefficients.
+    fn folds_rows_from_coefficients(_log_size: u32) -> bool {
+        false
+    }
+
+    fn evaluate_rows_from_coefficients(
+        _coeffs: &CircleCoefficients<Self>,
+        _domain: CircleDomain,
+        _targets: &[(usize, Vec<usize>)],
+    ) -> Option<Vec<Vec<BaseField>>> {
+        None
+    }
+
     /// Writes the `stripe`-th contiguous block of [`Self::evaluate`]'s output on `domain`, of
     /// the size of `poly`, into `dst`: the evaluation on the `stripe`-th subdomain, which the
     /// extension computes as an independent FFT.

@@ -11,7 +11,9 @@
 use std::io::Write;
 
 use anyhow::{Result, anyhow, ensure};
-use circuit_cairo_verifier::verify::{build_and_fill_cairo_verifier_circuit, prepare_cairo_proof_for_circuit_verifier};
+use circuit_cairo_verifier::verify::{
+    build_and_fill_cairo_verifier_circuit_with_capacity, prepare_cairo_proof_for_circuit_verifier,
+};
 use circuit_common::finalize::{add_zk_blinding, pad_context};
 use circuit_prover::prover::{prepare_circuit_proof_for_circuit_verifier, prove_circuit_with_precompute};
 use circuit_serialize::serialize::CircuitSerialize;
@@ -90,7 +92,17 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
     // independent of it, and the fill is mostly sequential, so the tree's commitment runs on the
     // workers the fill leaves idle.
     let (mut context, ()) = rayon::join(
-        || build_and_fill_cairo_verifier_circuit(&precomputes.cairo_verifier_config, proof, aux, output_hash),
+        || {
+            // The circuit's variable count is known from its preprocessing (built beside the Cairo
+            // proof): the fill reserves its values once.
+            build_and_fill_cairo_verifier_circuit_with_capacity(
+                &precomputes.cairo_verifier_config,
+                proof,
+                aux,
+                output_hash,
+                precomputes.preprocessed_circuit.n_vars,
+            )
+        },
         || {
             let _ = &**precomputes.circuit_preprocessed_tree;
             // The columns the base trace's first writers read are built here, on the workers the

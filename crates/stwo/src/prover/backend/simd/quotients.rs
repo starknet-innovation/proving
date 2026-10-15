@@ -116,6 +116,11 @@ impl QuotientOps for SimdBackend {
                 SecureColumnByCoords::from_cpu(cpu_result.values),
             );
         }
+        // The points are computed by the workers, a stride each (one thread took ~20 ms at 2^23).
+        #[cfg(feature = "parallel")]
+        let subdomain_points: Vec<CirclePoint<PackedBaseField>> =
+            CircleDomainBitRevIterator::new(eval_subdomain).par_iter().collect();
+        #[cfg(not(feature = "parallel"))]
         let subdomain_points: Vec<CirclePoint<PackedBaseField>> =
             CircleDomainBitRevIterator::new(eval_subdomain).collect();
         let subdomain_log_size = eval_subdomain.log_size();

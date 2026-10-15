@@ -28,7 +28,7 @@ pub trait Gate: std::fmt::Debug {
 }
 
 /// Represents an addition gate in the circuit: `[in0] + [in1] = [out]`.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Add {
     pub in0: usize,
     pub in1: usize,
@@ -55,7 +55,7 @@ impl std::fmt::Debug for Add {
 }
 
 /// Represents a subtraction gate in the circuit: `[in0] - [in1] = [out]`.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Sub {
     pub in0: usize,
     pub in1: usize,
@@ -82,7 +82,7 @@ impl std::fmt::Debug for Sub {
 }
 
 /// Represents a multiplication gate in the circuit: `[in0] * [in1] = [out]`.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Mul {
     pub in0: usize,
     pub in1: usize,
@@ -110,7 +110,7 @@ impl std::fmt::Debug for Mul {
 
 /// Represents a pointwise multiplication gate in the circuit.
 /// See [IValue::pointwise_mul] for more details.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PointwiseMul {
     pub in0: usize,
     pub in1: usize,
@@ -137,7 +137,7 @@ impl std::fmt::Debug for PointwiseMul {
 }
 
 /// Represents an equality gate in the circuit: `[in0] = [in1]`.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Eq {
     pub in0: usize,
     pub in1: usize,
@@ -164,7 +164,7 @@ impl std::fmt::Debug for Eq {
 
 /// Represents a triple XOR gate: `out = a ^ b ^ c` (u32 XOR).
 /// Inputs must be encoded as `(u16, u16, 0, 0)` in QM31.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TripleXor {
     pub input_a: usize,
     pub input_b: usize,
@@ -209,7 +209,7 @@ impl std::fmt::Debug for TripleXor {
 
 /// Represents an M31ToU32 gate in the circuit: `(x & 0xFFFF, x >> 16, 0, 0) = M31ToU32(x, 0, 0,
 /// 0)`.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct M31ToU32 {
     pub input: usize,
     pub out: usize,
@@ -245,7 +245,7 @@ impl std::fmt::Debug for M31ToU32 {
 /// Represents a permutation gate in the circuit.
 /// The gate enforces that the input values as a multi-set are equal to the output values
 /// as a multi-set.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Permutation {
     pub inputs: Vec<usize>,
     pub outputs: Vec<usize>,
@@ -287,7 +287,7 @@ impl std::fmt::Debug for Permutation {
 }
 
 /// Represents a gate that receives an input wire and "marks" it as output.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Output {
     pub in0: usize,
 }
@@ -313,7 +313,7 @@ impl std::fmt::Debug for Output {
 
 /// Represents a Blake2s G function gate in the circuit: G(a, b, c, d, f0, f1) = (a', b', c', d').
 /// Inputs must be encoded as `(u16, u16, 0, 0)` in QM31.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BlakeGGate {
     pub input_a: usize,
     pub input_b: usize,
@@ -586,5 +586,37 @@ impl std::fmt::Debug for Circuit {
             writeln!(f, "{gate:?}")?;
         }
         Ok(())
+    }
+}
+
+/// Renumbering of a gate's variables (see
+/// [`Context::build_in_parallel`](crate::context::Context::build_in_parallel)).
+pub trait ShiftVars {
+    /// Applies `shift` to every variable index of the gate.
+    fn shift_vars(&mut self, shift: &impl Fn(usize) -> usize);
+}
+macro_rules! impl_shift_vars {
+    ($($gate:ident { $($field:ident),* }),* $(,)?) => {$(
+        impl ShiftVars for $gate {
+            fn shift_vars(&mut self, shift: &impl Fn(usize) -> usize) {
+                $(self.$field = shift(self.$field);)*
+            }
+        }
+    )*};
+}
+impl_shift_vars!(
+    Add { in0, in1, out },
+    Sub { in0, in1, out },
+    Mul { in0, in1, out },
+    PointwiseMul { in0, in1, out },
+    Eq { in0, in1 },
+    TripleXor { input_a, input_b, input_c, out },
+    M31ToU32 { input, out },
+    BlakeGGate { input_a, input_b, input_c, input_d, input_f0, input_f1, out_a, out_b, out_c, out_d },
+    Output { in0 },
+);
+impl ShiftVars for Permutation {
+    fn shift_vars(&mut self, shift: &impl Fn(usize) -> usize) {
+        self.inputs.iter_mut().chain(self.outputs.iter_mut()).for_each(|idx| *idx = shift(*idx));
     }
 }

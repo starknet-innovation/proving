@@ -526,10 +526,13 @@ impl CompactColumn {
 
     /// Materializes the column's exact values.
     fn to_vec(&self) -> Vec<usize> {
+        use rayon::prelude::*;
+        // In parallel: the circuit witness writers materialize these columns (8.4M rows for
+        // qm31_ops) on the proof's critical path, right after the verifier fill.
         match self {
-            Self::Narrow(values) => values.iter().map(|&value| usize::try_from(value).expect("value originally fit usize")).collect(),
+            Self::Narrow(values) => values.par_iter().map(|&value| usize::try_from(value).expect("value originally fit usize")).collect(),
             Self::Wide(values) => values.clone(),
-            _ => (0..self.len()).map(|row| self.at(row)).collect(),
+            _ => (0..self.len()).into_par_iter().map(|row| self.at(row)).collect(),
         }
     }
 
@@ -554,9 +557,10 @@ impl CompactColumn {
     /// Like `chunks_exact(N_LANES)`, a partial trailing chunk is dropped.
     #[cfg(feature = "prover")]
     fn to_packed_column(&self) -> Vec<PackedM31> {
+        use rayon::prelude::*;
         match self {
             Self::Narrow(values) => values
-                .chunks_exact(N_LANES)
+                .par_chunks_exact(N_LANES)
                 .map(|c| {
                     PackedM31::from_array(std::array::from_fn(|i| {
                         BaseField::from(usize::try_from(c[i]).expect("value originally fit usize"))
@@ -564,10 +568,11 @@ impl CompactColumn {
                 })
                 .collect(),
             Self::Wide(values) => values
-                .chunks_exact(N_LANES)
+                .par_chunks_exact(N_LANES)
                 .map(|c| PackedM31::from_array(std::array::from_fn(|i| BaseField::from(c[i]))))
                 .collect(),
             _ => (0..self.len() / N_LANES)
+                .into_par_iter()
                 .map(|chunk| {
                     PackedM31::from_array(std::array::from_fn(|i| {
                         BaseField::from(self.at(chunk * N_LANES + i))
@@ -793,6 +798,9 @@ pub struct PreprocessedCircuit {
     pub first_permutation_row: usize,
     /// Number of public output values of the circuit (excluding the output gate of the `u` wire).
     pub n_outputs: usize,
+    /// The number of variables of the padded circuit: a context filling it can reserve its values
+    /// once instead of growing them (each growth copied all the values so far).
+    pub n_vars: usize,
 }
 
 impl PreprocessedCircuit {
@@ -914,6 +922,7 @@ impl PreprocessedCircuit {
             first_permutation_row: qm31_ops_trace_generator.first_permutation_row,
             // Discard the output gate of the `u` wire.
             n_outputs: output.len() - 1,
+            n_vars: circuit.n_vars,
         }
     }
 }

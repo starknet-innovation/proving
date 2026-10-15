@@ -23,6 +23,8 @@ pub fn qm31_from_u32s(a: u32, b: u32, c: u32, d: u32) -> QM31 {
 /// concrete values.
 pub trait IValue:
     Sized
+    + Send
+    + Sync
     + Copy
     + Clone
     + std::fmt::Debug

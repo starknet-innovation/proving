@@ -135,9 +135,29 @@ pub fn build_and_fill_cairo_verifier_circuit(
     serialized_aux_data: Vec<M31>,
     output_hash: Blake2sHash,
 ) -> FinalizedContext<QM31> {
+    build_and_fill_cairo_verifier_circuit_with_capacity(
+        verifier_config,
+        proof,
+        serialized_aux_data,
+        output_hash,
+        0,
+    )
+}
+
+/// [`build_and_fill_cairo_verifier_circuit`], with room reserved for `n_vars` variables' values
+/// (the padded circuit's count, see `PreprocessedCircuit::n_vars`): the values are then written
+/// once instead of being copied at every growth of their vector, the last of them during padding.
+pub fn build_and_fill_cairo_verifier_circuit_with_capacity(
+    verifier_config: &CairoVerifierConfig,
+    proof: Proof<QM31>,
+    serialized_aux_data: Vec<M31>,
+    output_hash: Blake2sHash,
+    n_vars: usize,
+) -> FinalizedContext<QM31> {
     let config = &verifier_config.proof_config;
 
     let mut context = Context::new(N_RESERVED);
+    context.reserve_vars(n_vars);
     let statement = CairoStatement::<QM31>::new(
         &mut context,
         serialized_aux_data,

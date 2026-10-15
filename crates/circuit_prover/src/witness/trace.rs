@@ -387,15 +387,16 @@ where
         verify_bitwise_xor_9,
         range_check_16,
     } = circuit_interaction_claim_generator;
-    // The blake gate's interaction trace, the largest, is written before the others, so that its
-    // temporaries do not coexist with theirs.
-    let (trace, claim) =
-        blake_g_gate.write_interaction_trace(&interaction_elements.common_lookup_elements);
-    all_polys.blake_g_gate = SimdBackend::interpolate_columns(trace, twiddles);
-    claimed_sums.blake_g_gate = claim.claimed_sum;
-    // The other components write their interaction traces in parallel (each writer is parallel
-    // inside too): with the gate tuples kept narrow, their lookup data no longer sets a peak here.
-    rayon::scope(|s| {
+    // The blake gate's interaction trace, the largest, is written beside the other components'
+    // (each writer is parallel inside too): with the gate tuples kept narrow, their temporaries fit
+    // together under the proof's peak.
+    let ((blake_polys, blake_sum), ()) = rayon::join(
+        || {
+            let (trace, claim) =
+                blake_g_gate.write_interaction_trace(&interaction_elements.common_lookup_elements);
+            (SimdBackend::interpolate_columns(trace, twiddles), claim.claimed_sum)
+        },
+        || rayon::scope(|s| {
         s.spawn(|_| {
             let (trace, claimed_sum) = eq::write_interaction_trace(
                 eq_log_size,
@@ -468,7 +469,10 @@ where
             all_polys.range_check_16 = SimdBackend::interpolate_columns(trace, twiddles);
             claimed_sums.range_check_16 = claim.claimed_sum;
         });
-    });
+    }),
+    );
+    all_polys.blake_g_gate = blake_polys;
+    claimed_sums.blake_g_gate = blake_sum;
 
     // Commit the interaction columns.
     for polys in all_polys.into_array() {

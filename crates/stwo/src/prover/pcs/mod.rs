@@ -835,8 +835,13 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         // A tree that keeps its coefficients evaluates whole stripes: every block folds all of a
         // column's coefficients again, which made its fill (at 2^23 circuit rows) about twice as
         // slow as one FFT per stripe, and with the circuit's lookup data kept narrow its stripe
-        // scratch fits under the proof's peak.
-        let sub = if keep_coef {
+        // scratch fits under the proof's peak. So does a tree whose whole-stripe scratch takes at
+        // most 2 GiB (the circuit's preprocessed tree, 1.5 GB, committed beside the Cairo proof
+        // far below the peak): its fill then costs no fold and it takes fewer cores from the
+        // Cairo proof.
+        let whole_stripe_scratch: usize =
+            polynomials.iter().map(|poly| 4usize << poly.log_size()).sum();
+        let sub = if keep_coef || whole_stripe_scratch <= 2 << 30 {
             0
         } else {
             1u32.min(polynomials.iter().map(|poly| poly.log_size()).min().unwrap() - 4)
@@ -1121,6 +1126,37 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                         .collect();
                 }
             }
+            // A column that keeps its coefficients and no stripe (see `prove_values`), or a sourced
+            // one, whose coefficients are regrown from its trace values: every row read is
+            // evaluated from the coefficients at once, folding each tile's most shared bits once
+            // for all the rows (`PolyOps::evaluate_rows_from_coefficients`).
+            let fold_log_size = poly.coeffs.as_ref().map(|coeffs| coeffs.log_size()).or_else(|| {
+                poly.is_sourced().then(|| poly.source.as_ref().unwrap().log_size())
+            });
+            if poly.evals.values.is_empty()
+                && fold_log_size.is_some_and(|log_size| B::folds_rows_from_coefficients(log_size))
+            {
+                let regrown = poly.coeffs.is_none().then(|| poly.regrown_coefficients());
+                let coeffs = poly.coeffs.as_ref().or(regrown.as_ref()).unwrap();
+                let log_size = coeffs.log_size();
+                let targets =
+                    stripes.iter().map(|&stripe| (stripe, rows_of(log_size, stripe))).collect_vec();
+                if let Some(values) =
+                    B::evaluate_rows_from_coefficients(coeffs, poly.evals.domain, &targets)
+                {
+                    let shift = stripe_log_size - log_size;
+                    return positions
+                        .iter()
+                        .map(|&position| {
+                            let stripe = position >> stripe_log_size;
+                            let local = position - (stripe << stripe_log_size);
+                            let row = (local >> (shift + 1) << 1) + (local & 1);
+                            let t = targets.iter().position(|(s, _)| *s == stripe).unwrap();
+                            values[t][targets[t].1.binary_search(&row).unwrap()]
+                        })
+                        .collect();
+                }
+            }
             // A column that keeps its coefficients and no stripe (see `prove_values`): its rows in
             // every stripe are evaluated from the coefficients, with no stripe evaluated.
             if let Some(coeffs) = poly.coeffs.as_ref().filter(|_| poly.evals.values.is_empty()) {
@@ -1219,6 +1255,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .iter()
             .filter(|poly| poly.is_sourced())
             .map(|poly| (poly.source.as_ref().unwrap().log_size(), poly.evals.domain))
+            // The sizes the coefficient fold takes need no plan.
+            .filter(|&(log_size, _)| !B::folds_rows_from_coefficients(log_size))
             .unique_by(|&(log_size, domain)| {
                 (log_size, domain.log_size(), domain.half_coset.initial_index.0)
             })
@@ -1234,6 +1272,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .iter()
             .filter(|poly| poly.coeffs.is_some() && poly.evals.values.is_empty())
             .map(|poly| (poly.coeffs.as_ref().unwrap().log_size(), poly.evals.domain))
+            .filter(|&(log_size, _)| !B::folds_rows_from_coefficients(log_size))
             .unique_by(|&(log_size, domain)| {
                 (log_size, domain.log_size(), domain.half_coset.initial_index.0)
             })

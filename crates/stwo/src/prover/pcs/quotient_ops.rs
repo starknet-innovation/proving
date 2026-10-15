@@ -448,7 +448,7 @@ fn combined_sourced_accumulations<B: Backend>(
             if terms.is_empty() {
                 continue;
             }
-            let sum = sum.get_or_insert_with(|| SecureColumnByCoords::zeros(chunk_domain.size()));
+            let sum = sum.get_or_insert_with(|| zeroed_in_parallel::<B>(chunk_domain.size()));
             B::accumulate_weighted_columns(sum, &terms);
         }
     }
@@ -517,10 +517,12 @@ fn combined_coefficient_accumulations<B: Backend>(
                     (&polys[data.column_index].coeffs.as_ref().unwrap().coeffs, c)
                 })
                 .collect();
-            let mut sum = SecureColumnByCoords::<B>::zeros(1 << log_size);
+            let mut sum = zeroed_in_parallel::<B>(1 << log_size);
             B::accumulate_weighted_columns(&mut sum, &terms);
             let evaluate = |column: Col<B, BaseField>| {
-                let mut stripe = Col::<B, BaseField>::zeros(1 << log_size);
+                // Every value is written by the FFT: taken as the pool's FFT buffers are, not zeroed.
+                let mut stripe =
+                    crate::prover::mempool::BaseColumnPool::<B>::new().take_or_alloc(log_size);
                 B::evaluate_stripe_into(&CircleCoefficients::new(column), domain, twiddles, 0, &mut stripe);
                 stripe
             };
@@ -545,6 +547,16 @@ fn combined_coefficient_accumulations<B: Backend>(
             }
         })
         .collect()
+}
+
+/// A zero secure column of `len` rows, written by the workers: a zeroed column is written by a
+/// single thread (tens of milliseconds per sum at 2^23 rows, every core but one idle).
+fn zeroed_in_parallel<B: Backend>(len: usize) -> SecureColumnByCoords<B> {
+    SecureColumnByCoords {
+        columns: std::array::from_fn(|_| {
+            Col::<B, BaseField>::from_rows(len, &|_, dst: &mut [BaseField]| dst.fill(BaseField::from(0u32)))
+        }),
+    }
 }
 
 /// Stripe 0 of `domain` of each coordinate of `values`, given on `trace_domain`: interpolated

@@ -34,6 +34,7 @@ fn generate_sort_keys<Value: IValue>(
 }
 
 /// Helper struct for sorting query values.
+#[derive(Clone)]
 pub struct QuerySorter {
     // Bit width of a sort key, equal to `LOG_SIZE_BITS + column_idx_bits`.
     // Unused when sorting is skipped.

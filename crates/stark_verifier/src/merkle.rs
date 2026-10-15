@@ -183,15 +183,32 @@ pub fn decommit_eval_domain_samples<Value: IValue>(
             None => QuerySorter::skip_sorting(),
         };
 
-        for query_idx in 0..n_queries {
-            let query_values =
-                data.iter().map(|column_data| column_data[query_idx].clone()).collect_vec();
+        let check_query =
+            |context: &mut Context<Value>, query_sorter: &mut QuerySorter, query_idx: usize| {
+                let query_values =
+                    data.iter().map(|column_data| column_data[query_idx].clone()).collect_vec();
 
-            let sorted = query_sorter.sort(context, query_values);
-            let leaf = hash_leaf_m31s(context, &sorted);
-            let auth_path = auth_paths.at(trace_idx, query_idx);
-            let bits_for_query = bits.iter().map(|b| b[query_idx]).collect_vec();
-            verify_merkle_path(context, leaf, &bits_for_query, root, auth_path);
+                let sorted = query_sorter.sort(context, query_values);
+                let leaf = hash_leaf_m31s(context, &sorted);
+                let auth_path = auth_paths.at(trace_idx, query_idx);
+                let bits_for_query = bits.iter().map(|b| b[query_idx]).collect_vec();
+                verify_merkle_path(context, leaf, &bits_for_query, root, auth_path);
+            };
+        if n_queries == 0 {
+            continue;
+        }
+        // The first query sorts the columns (the later ones only compare with its order) and
+        // creates the constants the hashing uses; the others are independent of each other and
+        // are built on rayon's workers, then appended in query order (most of the verifier fill's
+        // gates are these leaf hashes and paths, built on one core before).
+        check_query(context, &mut query_sorter, 0);
+        let parallel = context.build_in_parallel(n_queries - 1, |context, i| {
+            check_query(context, &mut query_sorter.clone(), i + 1);
+        });
+        if !parallel {
+            for query_idx in 1..n_queries {
+                check_query(context, &mut query_sorter, query_idx);
+            }
         }
     }
 }

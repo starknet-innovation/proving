@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use hashbrown::{HashMap, HashSet};
 use indexmap::IndexMap;
 use itertools::zip_eq;
@@ -6,7 +8,7 @@ use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
 
 use crate::blake::m31_to_u32_into;
-use crate::circuit::{Add, Circuit};
+use crate::circuit::{Add, Circuit, ShiftVars};
 use crate::finalize_constants::finalize_constants;
 use crate::ivalue::IValue;
 use crate::ops::{add_into, output, pointwise_mul_into};
@@ -91,6 +93,9 @@ pub struct Context<Value: IValue> {
     /// Set by [FinalizedContext::release_on_padding]: padding then hands the values to the proof
     /// and frees the gates.
     release_on_padding: bool,
+    /// For a piece of [Self::build_in_parallel]: the values of the context it was split from.
+    /// The piece's own variables follow them, and `values` holds only those.
+    base: Option<Arc<Vec<Value>>>,
 }
 
 impl<Value: IValue> Context<Value> {
@@ -151,10 +156,106 @@ impl<Value: IValue> Context<Value> {
         self.circuit.n_vars += pattern.len() * count;
     }
 
+    /// Reserves room for `n` more variables' values.
+    pub fn reserve_vars(&mut self, n: usize) {
+        self.values.reserve(n);
+    }
+
     /// Returns the value of a variable.
     pub fn get(&self, var: Var) -> Value {
         assert!(!self.reserved_vars.contains(&var.idx), "read of reserved variable",);
-        self.values[var.idx]
+        match &self.base {
+            None => self.values[var.idx],
+            Some(base) if var.idx < base.len() => base[var.idx],
+            Some(base) => self.values[var.idx - base.len()],
+        }
+    }
+
+    /// Builds `n` independent pieces of the circuit on rayon's workers and appends them in order:
+    /// the result is the context that calling `build(context, 0)`, ..., `build(context, n - 1)` one
+    /// after the other would give, variable for variable and gate for gate.
+    ///
+    /// Each piece starts from this context as it is now (its variables, values, constants and
+    /// reserved variables), adds its own variables after them, and is then renumbered to follow
+    /// the pieces before it. So the calls must not depend on each other, and none may create a
+    /// constant: a constant is created on first use, and a later call would reuse it. A call that
+    /// does is detected, and then nothing is appended and `false` is returned, for the caller to
+    /// build the pieces one after the other instead.
+    pub fn build_in_parallel(
+        &mut self,
+        n: usize,
+        build: impl Fn(&mut Context<Value>, usize) + Sync,
+    ) -> bool {
+        use rayon::prelude::*;
+        let n_base = self.circuit.n_vars;
+        let base = Arc::new(std::mem::take(&mut self.values));
+        let this = &*self;
+        let pieces: Vec<Context<Value>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut piece = Context {
+                    circuit: Circuit { n_vars: n_base, ..Circuit::default() },
+                    constants: this.constants.clone(),
+                    values: vec![],
+                    stats: Stats::default(),
+                    unused_vars: HashSet::new(),
+                    maybe_unused_vars: HashSet::new(),
+                    guessed_vars: this.guessed_vars.as_ref().map(|_| vec![]),
+                    reserved_vars: this.reserved_vars.clone(),
+                    assert_eq_on_eval: this.assert_eq_on_eval,
+                    debug_info: HashMap::new(),
+                    release_on_padding: false,
+                    base: Some(base.clone()),
+                };
+                build(&mut piece, i);
+                piece.base = None;
+                piece
+            })
+            .collect();
+        self.values = Arc::try_unwrap(base).unwrap_or_else(|_| unreachable!("every piece dropped its base"));
+        if pieces.iter().any(|piece| piece.constants.len() != self.constants.len()) {
+            return false;
+        }
+        // Renumber each piece's variables to follow the pieces before it, and append the pieces in
+        // order. The values and gates are copied on rayon's workers, each into its place: a
+        // sequential append of the hundreds of MB the pieces hold took longer than building them.
+        let mut offsets = Vec::with_capacity(n);
+        let mut n_vars = n_base;
+        for piece in &pieces {
+            offsets.push(n_vars - n_base);
+            n_vars += piece.circuit.n_vars - n_base;
+        }
+        let shift_by = |offset: usize| move |idx: usize| if idx >= n_base { idx + offset } else { idx };
+        par_append(&mut self.values, pieces.iter().map(|piece| &piece.values).collect(), |value, _| *value);
+        macro_rules! append_gates {
+            ($($field:ident),*) => {$(
+                let parts = pieces.iter().map(|piece| &piece.circuit.$field).collect();
+                par_append(&mut self.circuit.$field, parts, |gate, k| {
+                    let mut gate = gate.clone();
+                    gate.shift_vars(&shift_by(offsets[k]));
+                    gate
+                });
+            )*};
+        }
+        append_gates!(add, sub, mul, pointwise_mul, eq, triple_xor, m31_to_u32, blake_g_gate, permutation, output);
+        for (piece, &offset) in pieces.into_iter().zip(&offsets) {
+            let shift = shift_by(offset);
+            self.stats.add_assign(&piece.stats);
+            self.unused_vars.extend(piece.unused_vars.iter().map(|&idx| shift(idx)));
+            self.maybe_unused_vars.extend(piece.maybe_unused_vars.iter().map(|&idx| shift(idx)));
+            if let (Some(guessed), Some(piece_guessed)) = (self.guessed_vars.as_mut(), piece.guessed_vars) {
+                guessed.extend(piece_guessed.into_iter().map(|mut guessed| {
+                    let (GuessVar::M31(var) | GuessVar::QM31(var) | GuessVar::U16(var)) = &mut guessed;
+                    var.idx = shift(var.idx);
+                    guessed
+                }));
+            }
+            self.debug_info.extend(piece.debug_info.into_iter().map(|(name, var)| (name, Var { idx: shift(var.idx) })));
+        }
+        assert_eq!(self.circuit.n_vars, n_base);
+        self.circuit.n_vars = n_vars;
+        assert_eq!(self.values.len(), n_vars);
+        true
     }
 
     /// Allocates a fresh variable with no concrete value yet.
@@ -286,6 +387,7 @@ impl<Value: IValue> Default for Context<Value> {
             assert_eq_on_eval: false,
             debug_info: HashMap::new(),
             release_on_padding: false,
+            base: None,
         };
         // Register zero, one, and u as the first constants.
         res.constant(QM31::zero());
@@ -379,4 +481,24 @@ impl FinalizedContext<QM31> {
     pub fn validate_circuit(&self) {
         self.context.validate_circuit();
     }
+}
+
+/// Appends `parts` to `dst` in order, mapping each element with `f(element, part index)`, on
+/// rayon's workers (each element is written once, into its place).
+fn par_append<T: Send + Sync, U: Send>(
+    dst: &mut Vec<U>,
+    parts: Vec<&Vec<T>>,
+    f: impl Fn(&T, usize) -> U + Sync,
+) {
+    use rayon::prelude::*;
+    let mut starts = Vec::with_capacity(parts.len());
+    let mut total = 0;
+    for part in &parts {
+        starts.push(total);
+        total += part.len();
+    }
+    dst.par_extend((0..total).into_par_iter().map(|i| {
+        let k = starts.partition_point(|&start| start <= i) - 1;
+        f(&parts[k][i - starts[k]], k)
+    }));
 }
