@@ -40,6 +40,7 @@ impl FrameworkEval for Eval {
     #[allow(unused_parens)]
     #[allow(clippy::double_parens)]
     #[allow(non_snake_case)]
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_1027333874 = E::F::from(M31::from(1027333874));
         let range_check_4_4_4_4_column_0 = eval.get_preprocessed_column(PreProcessedColumnId {

@@ -46,6 +46,7 @@ impl FrameworkEval for Eval {
         self.log_size() + 1
     }
 
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         // al, bl are the constant columns for the inputs: All pairs of elements in [0,
         // 2^LIMB_BITS).

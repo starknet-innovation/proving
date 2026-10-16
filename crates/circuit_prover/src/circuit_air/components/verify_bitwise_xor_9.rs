@@ -40,6 +40,7 @@ impl FrameworkEval for Eval {
     #[allow(unused_parens)]
     #[allow(clippy::double_parens)]
     #[allow(non_snake_case)]
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_95781001 = E::F::from(M31::from(95781001));
         let bitwise_xor_9_0 =

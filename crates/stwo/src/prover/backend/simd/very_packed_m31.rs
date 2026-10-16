@@ -265,7 +265,14 @@ where
 
     #[inline(always)]
     fn mul(self, other: Vectorized<B, N>) -> Self::Output {
-        Vectorized::from_fn(|i| self.0[i].mul_inl(other.0[i]))
+        // A plain loop rather than `from_fn` with a closure: the closure, holding the whole
+        // expanded multiplication, was outlined, so every product went through a call that
+        // passed both operands through memory.
+        let mut out = [self.0[0].mul_inl(other.0[0]); N];
+        for i in 1..N {
+            out[i] = self.0[i].mul_inl(other.0[i]);
+        }
+        Vectorized(out)
     }
 }
 
@@ -277,7 +284,11 @@ where
 
     #[inline(always)]
     fn mul(self, other: B) -> Self::Output {
-        Vectorized::from_fn(|i| self.0[i].mul_inl(other))
+        let mut out = [self.0[0].mul_inl(other); N];
+        for i in 1..N {
+            out[i] = self.0[i].mul_inl(other);
+        }
+        Vectorized(out)
     }
 }
 

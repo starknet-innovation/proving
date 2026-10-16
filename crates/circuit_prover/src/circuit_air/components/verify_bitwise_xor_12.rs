@@ -45,6 +45,7 @@ impl FrameworkEval for Eval {
         self.log_size() + 1
     }
 
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let relation_id = E::F::from(M31::from(648362599));
         // al, bl are the constant columns for the inputs: All pairs of elements in [0,

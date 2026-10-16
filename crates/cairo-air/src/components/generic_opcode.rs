@@ -69,6 +69,7 @@ impl FrameworkEval for Eval {
     #[allow(unused_parens)]
     #[allow(clippy::double_parens)]
     #[allow(non_snake_case)]
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_428564188 = E::F::from(M31::from(428564188));
         let enabler_col0 = eval.next_trace_mask();

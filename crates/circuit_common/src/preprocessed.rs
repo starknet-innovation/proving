@@ -141,6 +141,17 @@ const XOR_TABLE_N_BITS: [u32; 5] = [4, 7, 8, 9, 10];
 const SEQ_LOG_SIZE: u32 = 16;
 
 /// A fixed column's per-row value, as a function of the column's log size.
+/// `BaseField::from(value)` for a compact column's value, inlined here: the same
+/// [`BaseField::reduce`] formula, so the result is identical, but the per-element conversion of a
+/// regrown column no longer goes through an out-of-line call and the loops over a column vectorize.
+#[inline(always)]
+fn field_of(value: usize) -> BaseField {
+    let value = value as u64;
+    BaseField::from_u32_unchecked(
+        (((((value >> 31) + value + 1) >> 31) + value) & (stwo::core::fields::m31::P as u64)) as u32,
+    )
+}
+
 fn seq(_log_size: u32, row: usize) -> usize {
     row
 }
@@ -543,13 +554,13 @@ impl CompactColumn {
     fn to_field_column<B: Backend>(&self) -> Col<B, BaseField> {
         match self {
             Self::Narrow(values) => Col::<B, BaseField>::from_iter(
-                values.iter().map(|&value| BaseField::from(usize::try_from(value).expect("value originally fit usize"))),
+                values.iter().map(|&value| field_of(usize::try_from(value).expect("value originally fit usize"))),
             ),
             Self::Wide(values) => {
-                Col::<B, BaseField>::from_iter(values.iter().cloned().map(BaseField::from))
+                Col::<B, BaseField>::from_iter(values.iter().cloned().map(field_of))
             }
             _ => Col::<B, BaseField>::from_iter(
-                (0..self.len()).map(|row| BaseField::from(self.at(row))),
+                (0..self.len()).map(|row| field_of(self.at(row))),
             ),
         }
     }
@@ -564,19 +575,19 @@ impl CompactColumn {
                 .par_chunks_exact(N_LANES)
                 .map(|c| {
                     PackedM31::from_array(std::array::from_fn(|i| {
-                        BaseField::from(usize::try_from(c[i]).expect("value originally fit usize"))
+                        field_of(usize::try_from(c[i]).expect("value originally fit usize"))
                     }))
                 })
                 .collect(),
             Self::Wide(values) => values
                 .par_chunks_exact(N_LANES)
-                .map(|c| PackedM31::from_array(std::array::from_fn(|i| BaseField::from(c[i]))))
+                .map(|c| PackedM31::from_array(std::array::from_fn(|i| field_of(c[i]))))
                 .collect(),
             _ => (0..self.len() / N_LANES)
                 .into_par_iter()
                 .map(|chunk| {
                     PackedM31::from_array(std::array::from_fn(|i| {
-                        BaseField::from(self.at(chunk * N_LANES + i))
+                        field_of(self.at(chunk * N_LANES + i))
                     }))
                 })
                 .collect(),
@@ -766,51 +777,59 @@ impl stwo::prover::TraceSource for PreprocessedColumnSource {
         // The same `BaseField::from(usize)` conversion as `CompactColumn::to_field_column`.
         let column = self.column();
         assert_eq!(dst.len(), column.len());
-        match column {
-            CompactColumn::Narrow(values) => {
-                for (value, &narrow) in dst.iter_mut().zip(values) {
-                    *value = BaseField::from(
-                        usize::try_from(narrow).expect("value originally fit usize"),
-                    );
-                }
-            }
-            CompactColumn::Wide(values) => {
-                for (value, &wide) in dst.iter_mut().zip(values) {
-                    *value = BaseField::from(wide);
-                }
-            }
-            _ => {
-                for (row, value) in dst.iter_mut().enumerate() {
-                    *value = BaseField::from(column.at(row));
-                }
-            }
-        }
+        write_compact_rows(column, 0, dst);
     }
 
     fn write_rows(&self, first: usize, dst: &mut [BaseField]) {
         // The conversions of `write_values`, for the rows `first..first + dst.len()`.
         let column = self.column();
-        let rows = first..first + dst.len();
-        assert!(rows.end <= column.len());
-        match column {
-            CompactColumn::Narrow(values) => {
-                for (value, &narrow) in dst.iter_mut().zip(&values[rows]) {
-                    *value = BaseField::from(
-                        usize::try_from(narrow).expect("value originally fit usize"),
-                    );
-                }
-            }
-            CompactColumn::Wide(values) => {
-                for (value, &wide) in dst.iter_mut().zip(&values[rows]) {
-                    *value = BaseField::from(wide);
-                }
-            }
-            _ => {
-                for (row, value) in rows.zip(dst.iter_mut()) {
-                    *value = BaseField::from(column.at(row));
-                }
+        assert!(first + dst.len() <= column.len());
+        write_compact_rows(column, first, dst);
+    }
+}
+
+/// Writes `field_of(column.at(row))` for the rows `first..first + dst.len()`, with the variant (and
+/// a fixed column's formula) matched once per call instead of once per row.
+fn write_compact_rows(column: &CompactColumn, first: usize, dst: &mut [BaseField]) {
+    let rows = first..first + dst.len();
+    match column {
+        CompactColumn::Narrow(values) => {
+            for (value, &narrow) in dst.iter_mut().zip(&values[rows]) {
+                *value = field_of(usize::try_from(narrow).expect("value originally fit usize"));
             }
         }
+        CompactColumn::Wide(values) => {
+            for (value, &wide) in dst.iter_mut().zip(&values[rows]) {
+                *value = field_of(wide);
+            }
+        }
+        CompactColumn::Bits { words, .. } => {
+            for (row, value) in rows.zip(dst.iter_mut()) {
+                *value = field_of(((words[row / 64] >> (row % 64)) & 1) as usize);
+            }
+        }
+        &CompactColumn::Fixed { log_size, kind } => match kind {
+            FixedColumnKind::Seq => {
+                for (row, value) in rows.zip(dst.iter_mut()) {
+                    *value = field_of(seq(log_size, row));
+                }
+            }
+            FixedColumnKind::XorRhs => {
+                for (row, value) in rows.zip(dst.iter_mut()) {
+                    *value = field_of(xor_rhs(log_size, row));
+                }
+            }
+            FixedColumnKind::XorLhs => {
+                for (row, value) in rows.zip(dst.iter_mut()) {
+                    *value = field_of(xor_lhs(log_size, row));
+                }
+            }
+            FixedColumnKind::XorResult => {
+                for (row, value) in rows.zip(dst.iter_mut()) {
+                    *value = field_of(xor_result(log_size, row));
+                }
+            }
+        },
     }
 }
 

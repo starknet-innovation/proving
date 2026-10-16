@@ -43,6 +43,7 @@ impl M31 {
     /// let val = 2 * P - 19;
     /// assert_eq!(M31::partial_reduce(val), M31::from(P - 19));
     /// ```
+    #[inline]
     pub fn partial_reduce(val: u32) -> Self {
         Self(val.checked_sub(P).unwrap_or(val))
     }
@@ -144,18 +145,21 @@ impl Zero for M31 {
 }
 
 impl From<usize> for M31 {
+    #[inline]
     fn from(value: usize) -> Self {
         M31::reduce(value.try_into().unwrap())
     }
 }
 
 impl From<u32> for M31 {
+    #[inline]
     fn from(value: u32) -> Self {
         M31::reduce(value.into())
     }
 }
 
 impl From<i32> for M31 {
+    #[inline]
     fn from(value: i32) -> Self {
         if value < 0 {
             const P2: u64 = 2 * P as u64;

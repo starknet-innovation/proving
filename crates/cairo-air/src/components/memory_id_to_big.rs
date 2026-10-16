@@ -68,6 +68,7 @@ impl FrameworkEval for BigEval {
     }
 
     #[allow(non_snake_case)]
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_1 = E::F::from(M31::from(1));
         let M31_1662111297 = E::F::from(M31::from(1662111297));

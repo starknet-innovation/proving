@@ -160,11 +160,13 @@ impl Mul for PackedQM31 {
 }
 
 /// Returns `a * b`. Not inlinable from other crates, see [`cm31::mul_cm31`].
+#[inline]
 pub(crate) fn mul_qm31(a: PackedQM31, b: PackedQM31) -> PackedQM31 {
     a.mul_inline(b)
 }
 
 /// Returns `a * b`; see [`mul_qm31`].
+#[inline]
 pub(crate) fn mul_qm31_m31(a: PackedQM31, b: PackedM31) -> PackedQM31 {
     a.mul_m31_inline(b)
 }

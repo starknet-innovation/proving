@@ -18,6 +18,7 @@ pub trait Unpack: Copy {
 impl Pack for M31 {
     type SimdType = PackedM31;
 
+    #[inline]
     fn pack(inputs: [M31; N_LANES]) -> Self::SimdType {
         PackedM31::from_array(inputs)
     }
@@ -25,6 +26,7 @@ impl Pack for M31 {
 
 impl Unpack for PackedM31 {
     type CpuType = M31;
+    #[inline]
     fn unpack(self) -> [M31; N_LANES] {
         self.to_array()
     }

@@ -50,6 +50,7 @@ impl FrameworkEval for Eval {
         self.log_size() + 1
     }
 
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         // Addresses are offsetted by 1, as 0 address is reserved.
         let seq_plus_one =

@@ -40,6 +40,7 @@ impl FrameworkEval for Eval {
     #[allow(unused_parens)]
     #[allow(clippy::double_parens)]
     #[allow(non_snake_case)]
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_941275232 = E::F::from(M31::from(941275232));
         let seq_12 = eval.get_preprocessed_column(PreProcessedColumnId { id: "seq_12".to_owned() });

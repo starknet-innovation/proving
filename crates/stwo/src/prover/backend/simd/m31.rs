@@ -96,15 +96,18 @@ impl PackedM31 {
         }
     }
 
+    #[inline]
     pub fn from_array(values: [M31; N_LANES]) -> PackedM31 {
         Self(Simd::from_array(values.map(|M31(v)| v)))
     }
 
+    #[inline]
     pub fn to_array(self) -> [M31; N_LANES] {
         self.reduce().0.to_array().map(M31)
     }
 
     /// Reduces each element of the vector to the range `[0, P)`.
+    #[inline]
     fn reduce(self) -> PackedM31 {
         Self(min_u32x16(self.0, self.0 - MODULUS))
     }
@@ -333,6 +336,7 @@ unsafe impl Zeroable for PackedM31 {
 }
 
 impl From<[BaseField; N_LANES]> for PackedM31 {
+    #[inline]
     fn from(v: [BaseField; N_LANES]) -> Self {
         Self::from_array(v)
     }

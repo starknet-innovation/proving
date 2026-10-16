@@ -48,6 +48,7 @@ impl FrameworkEval for Eval {
     #[allow(unused_parens)]
     #[allow(clippy::double_parens)]
     #[allow(non_snake_case)]
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_256 = E::F::from(M31::from(256));
         let M31_990559919 = E::F::from(M31::from(990559919));

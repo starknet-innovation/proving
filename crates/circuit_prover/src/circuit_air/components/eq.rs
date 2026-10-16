@@ -19,6 +19,7 @@ impl FrameworkEval for Eval {
         self.log_size() + 1
     }
 
+    #[inline(always)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let m31_gate_relation_id = E::F::from(M31::from(378353459));
         let in0_address =
