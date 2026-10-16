@@ -816,7 +816,7 @@ impl PolyOps for SimdBackend {
         advise_pages(&buffer.data, true);
 
         // FFT from the coefficients buffer directly into the provided buffer.
-        fft_subdomains_into(poly, None, &mut buffer, &subdomain_twiddles);
+        fft_subdomains_into(poly, None, &mut buffer, &subdomain_twiddles, rfft::Phases::All);
 
         CircleEvaluation::new(domain, buffer)
     }
@@ -906,7 +906,7 @@ impl PolyOps for SimdBackend {
                 })
                 .collect::<Vec<_>>(),
         ];
-        fft_subdomains_into(poly, None, dst, &stripe_twiddles);
+        fft_subdomains_into(poly, None, dst, &stripe_twiddles, rfft::Phases::All);
     }
 
     fn evaluate_block_into(
@@ -1050,16 +1050,46 @@ fn fft_subdomains_into(
     load: Option<(u32, &(dyn Fn(usize, &mut [Simd<u32, N_LANES>]) + Sync))>,
     dst: &mut BaseColumn,
     subdomain_twiddles: &[Vec<&[u32]>],
+    phases: rfft::Phases,
 ) {
+    assert!(!matches!(phases, rfft::Phases::Chunk(_)));
     let log_size = load.map_or(poly.log_size(), |(log_size, _)| log_size);
     assert!(dst.len() >= subdomain_twiddles.len() << log_size);
+    fft_subdomains_slices(&poly.coeffs.data, load, &mut dst.data, subdomain_twiddles, log_size, phases);
+}
+
+/// [`rfft::fft_subdomains`] from the packed words of `src` into those of `dst`, of
+/// `2^log_size` values per subdomain (with [`rfft::Phases::Chunk`], `src` holds the first phase's
+/// output of one subdomain and `dst` receives the chunk).
+fn fft_subdomains_slices(
+    src: &[PackedBaseField],
+    load: Option<(u32, &(dyn Fn(usize, &mut [Simd<u32, N_LANES>]) + Sync))>,
+    dst: &mut [PackedBaseField],
+    subdomain_twiddles: &[Vec<&[u32]>],
+    log_size: u32,
+    phases: rfft::Phases,
+) {
+    match phases {
+        rfft::Phases::Chunk(_) => {
+            assert!(load.is_none() && subdomain_twiddles.len() == 1);
+            assert!(src.len() << LOG_N_LANES >= 1 << log_size);
+            assert!(
+                dst.len() << LOG_N_LANES >= 1 << rfft::phase2_chunk_log_size(log_size as usize)
+            );
+        }
+        _ => {
+            assert!(load.is_some() || src.len() << LOG_N_LANES >= 1 << log_size);
+            assert!(dst.len() << LOG_N_LANES >= subdomain_twiddles.len() << log_size);
+        }
+    }
     unsafe {
         rfft::fft_subdomains(
-            transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
+            src.as_ptr() as *const u32,
             load.map(|(_, load)| load),
-            transmute::<*mut PackedBaseField, *mut u32>(dst.data.as_mut_ptr()),
+            dst.as_mut_ptr() as *mut u32,
             subdomain_twiddles,
             log_size as usize,
+            phases,
         );
     }
 }
@@ -1089,21 +1119,96 @@ pub fn evaluate_block_into(
     block: usize,
     dst: &mut BaseColumn,
 ) {
-    let log_size = poly.log_size();
-    assert!(log_block <= log_size && log_block >= MIN_FFT_LOG_SIZE && log_block < domain.log_size());
-    assert_eq!(dst.len(), 1 << log_block);
-    if log_block == log_size {
-        return SimdBackend::evaluate_stripe_into(poly, domain, twiddles, block, dst);
-    }
+    evaluate_block_phases_into(poly, domain, twiddles, log_block, block, dst, rfft::Phases::All)
+}
+
+/// The log of the number of rows of the chunks in which [`finish_block_chunk_into`] completes a
+/// block of `2^log_block` rows, or `None` for a block too small to be split in phases
+/// (`log_block` up to `CACHED_FFT_LOG_SIZE`).
+pub fn block_chunk_log_size(log_block: u32) -> Option<u32> {
+    (log_block > CACHED_FFT_LOG_SIZE)
+        .then(|| rfft::phase2_chunk_log_size(log_block as usize) as u32)
+}
+
+/// [`evaluate_block_into`] up to the first phase of its fft (and the transposition after it):
+/// `dst` holds what [`finish_block_chunk_into`] completes chunk by chunk, chunk `h` of the
+/// result being rows `h << chunk_log..(h + 1) << chunk_log` of [`evaluate_block_into`]'s. For
+/// blocks with [`block_chunk_log_size`].
+pub fn evaluate_block_first_phase_into(
+    poly: &CircleCoefficients<SimdBackend>,
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<SimdBackend>,
+    log_block: u32,
+    block: usize,
+    dst: &mut BaseColumn,
+) {
+    assert!(block_chunk_log_size(log_block).is_some());
+    evaluate_block_phases_into(poly, domain, twiddles, log_block, block, dst, rfft::Phases::First)
+}
+
+/// The twiddles of block `block` of `2^log_block` rows of `domain`'s bit-reversed order: those of
+/// the subdomain [`evaluate_block_into`] evaluates it on.
+pub fn block_twiddles<'a>(
+    domain: CircleDomain,
+    twiddles: &'a TwiddleTree<SimdBackend>,
+    log_block: u32,
+    block: usize,
+) -> Vec<Vec<&'a [u32]>> {
     let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
-    let stripe_twiddles = vec![
+    vec![
         (0..(log_block - 1))
             .map(|layer_i| {
                 &line_twiddles[layer_i as usize][block << (log_block - 2 - layer_i)
                     ..(block + 1) << (log_block - 2 - layer_i)]
             })
             .collect::<Vec<_>>(),
-    ];
+    ]
+}
+
+/// Completes chunk `chunk` of a block from [`evaluate_block_first_phase_into`]'s output
+/// `first_phase`, with the block's [`block_twiddles`]: writes rows
+/// `chunk << chunk_log..(chunk + 1) << chunk_log` of [`evaluate_block_into`]'s result to `dst`
+/// (`2^chunk_log` rows, [`block_chunk_log_size`]), the same values.
+pub fn finish_block_chunk_into(
+    first_phase: &BaseColumn,
+    block_twiddles: &[Vec<&[u32]>],
+    log_block: u32,
+    chunk: usize,
+    dst: &mut [PackedBaseField],
+) {
+    assert!(block_chunk_log_size(log_block).is_some());
+    assert_eq!(first_phase.len(), 1 << log_block);
+    fft_subdomains_slices(
+        &first_phase.data,
+        None,
+        dst,
+        block_twiddles,
+        log_block,
+        rfft::Phases::Chunk(chunk),
+    );
+}
+
+fn evaluate_block_phases_into(
+    poly: &CircleCoefficients<SimdBackend>,
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<SimdBackend>,
+    log_block: u32,
+    block: usize,
+    dst: &mut BaseColumn,
+    phases: rfft::Phases,
+) {
+    let log_size = poly.log_size();
+    assert!(log_block <= log_size && log_block >= MIN_FFT_LOG_SIZE && log_block < domain.log_size());
+    assert_eq!(dst.len(), 1 << log_block);
+    let stripe_twiddles = block_twiddles(domain, twiddles, log_block, block);
+    if log_block == log_size {
+        if phases == rfft::Phases::All {
+            return SimdBackend::evaluate_stripe_into(poly, domain, twiddles, block, dst);
+        }
+        // `evaluate_stripe_into`'s fft (the same twiddles), stopped after its first phase.
+        return fft_subdomains_into(poly, None, dst, &stripe_twiddles, phases);
+    }
+    let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
     if log_size - log_block <= 2 && log_block > CACHED_FFT_LOG_SIZE {
         // One or two folds, as below, but each vector of the folded coefficients is computed as
         // the FFT's first phase reads it instead of being written to a column of the block's
@@ -1136,7 +1241,7 @@ pub fn evaluate_block_into(
                     *vec = value.into_simd();
                 }
             };
-        return fft_subdomains_into(poly, Some((log_block, load)), dst, &stripe_twiddles);
+        return fft_subdomains_into(poly, Some((log_block, load)), dst, &stripe_twiddles, phases);
     }
     // Fold from the polynomial's size down to the block's.
     let mut folded: Option<BaseColumn> = None;
@@ -1208,7 +1313,7 @@ pub fn evaluate_block_into(
         }
     }
     let folded = CircleCoefficients::<SimdBackend>::new(folded.unwrap());
-    fft_subdomains_into(&folded, None, dst, &stripe_twiddles);
+    fft_subdomains_into(&folded, None, dst, &stripe_twiddles, phases);
 }
 
 /// The values of a polynomial, given by its coefficients, at rows of the stripes of `domain`

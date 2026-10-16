@@ -108,69 +108,40 @@ pub fn write_trace(
     verify_bitwise_xor_9_state: &verify_bitwise_xor_9::ClaimGenerator,
     verify_bitwise_xor_7_state: &verify_bitwise_xor_7::ClaimGenerator,
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, Claim, InteractionClaimGenerator) {
-    let input_addr_a = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_input_addr_a".to_owned() });
-    let input_addr_b = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_input_addr_b".to_owned() });
-    let input_addr_c = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_input_addr_c".to_owned() });
-    let input_addr_d = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_input_addr_d".to_owned() });
-    let input_addr_f0 = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_input_addr_f0".to_owned() });
-    let input_addr_f1 = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_input_addr_f1".to_owned() });
-    let output_addr_a = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_output_addr_a".to_owned() });
-    let output_addr_b = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_output_addr_b".to_owned() });
-    let output_addr_c = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_output_addr_c".to_owned() });
-    let output_addr_d = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_output_addr_d".to_owned() });
-    let multiplicity_col = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "blake_g_gate_multiplicity".to_owned() });
+    // The inputs are gathered per packed row straight from the context values at the
+    // preprocessed addresses, read in place: no staged inputs, no packed copy of them and no
+    // materialized address columns.
+    let columns = [
+        "blake_g_gate_input_addr_a",
+        "blake_g_gate_input_addr_b",
+        "blake_g_gate_input_addr_c",
+        "blake_g_gate_input_addr_d",
+        "blake_g_gate_input_addr_f0",
+        "blake_g_gate_input_addr_f1",
+        "blake_g_gate_output_addr_a",
+        "blake_g_gate_output_addr_b",
+        "blake_g_gate_output_addr_c",
+        "blake_g_gate_output_addr_d",
+        "blake_g_gate_multiplicity",
+    ]
+    .map(|id| preprocessed_trace.column_rows(&PreProcessedColumnId { id: id.to_owned() }));
 
-    let inputs = extract_component_inputs(
-        &input_addr_a,
-        &input_addr_b,
-        &input_addr_c,
-        &input_addr_d,
-        &input_addr_f0,
-        &input_addr_f1,
-        &output_addr_a,
-        &output_addr_b,
-        &output_addr_c,
-        &output_addr_d,
-        context_values,
-    );
-
-    let n_rows = inputs.len();
+    let n_rows = columns[0].len();
+    assert!(columns.iter().all(|column| column.len() == n_rows));
     assert_ne!(n_rows, 0);
+    assert!(n_rows.is_multiple_of(N_LANES));
     let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
     let log_size = size.ilog2();
 
-    let packed_inputs = pack_values(&inputs);
-    drop(inputs);
+    // A row's inputs, as `extract_component_inputs` stages them.
+    let input = |row: usize| -> InputType {
+        from_fn(|i| {
+            let value = context_values[columns[i].at(row)].to_m31_array();
+            UInt32::from(value[0].0 | (value[1].0 << 16))
+        })
+    };
 
-    let preprocessed_columns = [
-        input_addr_a,
-        input_addr_b,
-        input_addr_c,
-        input_addr_d,
-        input_addr_f0,
-        input_addr_f1,
-        output_addr_a,
-        output_addr_b,
-        output_addr_c,
-        output_addr_d,
-        multiplicity_col,
-    ]
-    .into_iter()
-    .map(|col| crate::witness::utils::pack_usize_column(&col))
-    .collect_vec();
-
-    let (trace, lookup_data) = write_trace_simd(packed_inputs, preprocessed_columns);
+    let (trace, lookup_data) = write_trace_simd(n_rows, input, &columns);
     // The small xor tables count their rows per task from the narrow tuples, every column of a
     // table in one pass (see `count_table_rows`); the 2^24-row xor_12 table keeps its atomic adds.
     let d = &lookup_data;
@@ -210,10 +181,11 @@ pub fn write_trace(
 #[allow(clippy::double_parens)]
 #[allow(non_snake_case)]
 fn write_trace_simd(
-    inputs: Vec<PackedInputType>,
-    preprocessed_columns: Vec<Vec<PackedM31>>,
+    n_rows: usize,
+    input: impl Fn(usize) -> InputType + Sync,
+    columns: &[circuit_common::preprocessed::ColumnRows<'_>; 11],
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData) {
-    let log_n_packed_rows = inputs.len().ilog2();
+    let log_n_packed_rows = (n_rows / N_LANES).ilog2();
     let log_size = log_n_packed_rows + LOG_N_LANES;
     let (mut trace, mut lookup_data) = unsafe {
         (
@@ -232,35 +204,26 @@ fn write_trace_simd(
     let UInt16_8 = PackedUInt16::broadcast(UInt16::from(8));
     let UInt16_9 = PackedUInt16::broadcast(UInt16::from(9));
     let UInt32_0 = PackedUInt32::broadcast(UInt32::from(0));
-    let [
-        blake_g_gate_input_addr_a,
-        blake_g_gate_input_addr_b,
-        blake_g_gate_input_addr_c,
-        blake_g_gate_input_addr_d,
-        blake_g_gate_input_addr_f0,
-        blake_g_gate_input_addr_f1,
-        blake_g_gate_output_addr_a,
-        blake_g_gate_output_addr_b,
-        blake_g_gate_output_addr_c,
-        blake_g_gate_output_addr_d,
-        blake_g_gate_multiplicity,
-    ]: [Vec<PackedM31>; 11] = preprocessed_columns.try_into().unwrap();
-
-    (trace.par_iter_mut(), lookup_data.par_iter_mut(), inputs.into_par_iter())
+    (trace.par_iter_mut(), lookup_data.par_iter_mut())
         .into_par_iter()
         .enumerate()
-        .for_each(|(row_index, (row, lookup_data, blake_g_gate_input))| {
-            let blake_g_gate_input_addr_a = blake_g_gate_input_addr_a[row_index];
-            let blake_g_gate_input_addr_b = blake_g_gate_input_addr_b[row_index];
-            let blake_g_gate_input_addr_c = blake_g_gate_input_addr_c[row_index];
-            let blake_g_gate_input_addr_d = blake_g_gate_input_addr_d[row_index];
-            let blake_g_gate_input_addr_f0 = blake_g_gate_input_addr_f0[row_index];
-            let blake_g_gate_input_addr_f1 = blake_g_gate_input_addr_f1[row_index];
-            let blake_g_gate_output_addr_a = blake_g_gate_output_addr_a[row_index];
-            let blake_g_gate_output_addr_b = blake_g_gate_output_addr_b[row_index];
-            let blake_g_gate_output_addr_c = blake_g_gate_output_addr_c[row_index];
-            let blake_g_gate_output_addr_d = blake_g_gate_output_addr_d[row_index];
-            let blake_g_gate_multiplicity = blake_g_gate_multiplicity[row_index];
+        .for_each(|(row_index, (row, lookup_data))| {
+            let first = row_index * N_LANES;
+            let blake_g_gate_input: PackedInputType =
+                crate::witness::utils::packed_input(&input, first);
+            let [
+                blake_g_gate_input_addr_a,
+                blake_g_gate_input_addr_b,
+                blake_g_gate_input_addr_c,
+                blake_g_gate_input_addr_d,
+                blake_g_gate_input_addr_f0,
+                blake_g_gate_input_addr_f1,
+                blake_g_gate_output_addr_a,
+                blake_g_gate_output_addr_b,
+                blake_g_gate_output_addr_c,
+                blake_g_gate_output_addr_d,
+                blake_g_gate_multiplicity,
+            ] = crate::witness::utils::packed_column_rows(columns, first);
             let input_a_limb_0_col0 = blake_g_gate_input[0].low().as_m31();
             *row[0] = input_a_limb_0_col0;
             let input_a_limb_1_col1 = blake_g_gate_input[0].high().as_m31();

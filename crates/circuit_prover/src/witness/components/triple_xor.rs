@@ -61,40 +61,35 @@ pub fn write_trace(
     preprocessed_trace: &PreProcessedTrace,
     verify_bitwise_xor_8_state: &verify_bitwise_xor_8::ClaimGenerator,
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, Claim, InteractionClaimGenerator) {
-    let input_addr_col_0 = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "triple_xor_input_addr_0".to_owned() });
-    let input_addr_col_1 = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "triple_xor_input_addr_1".to_owned() });
-    let input_addr_col_2 = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "triple_xor_input_addr_2".to_owned() });
-    let output_addr_col = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "triple_xor_output_addr".to_owned() });
-    let multiplicity_col = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "triple_xor_multiplicity".to_owned() });
+    // The inputs are gathered per packed row straight from the context values at the
+    // preprocessed addresses, read in place: no staged inputs, no packed copy of them and no
+    // materialized address columns.
+    let columns = [
+        "triple_xor_input_addr_0",
+        "triple_xor_input_addr_1",
+        "triple_xor_input_addr_2",
+        "triple_xor_output_addr",
+        "triple_xor_multiplicity",
+    ]
+    .map(|id| preprocessed_trace.column_rows(&PreProcessedColumnId { id: id.to_owned() }));
 
-    let inputs = extract_component_inputs(
-        &input_addr_col_0,
-        &input_addr_col_1,
-        &input_addr_col_2,
-        &output_addr_col,
-        context_values,
-    );
-
-    let n_rows = inputs.len();
+    let n_rows = columns[0].len();
+    assert!(columns[..4].iter().all(|column| column.len() == n_rows));
+    assert_eq!(columns[4].len(), n_rows);
     assert_ne!(n_rows, 0);
+    assert!(n_rows.is_multiple_of(N_LANES));
     let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
     let log_size = size.ilog2();
 
-    let packed_inputs = pack_values(&inputs);
+    // A row's inputs, as `extract_component_inputs` stages them.
+    let input = |row: usize| -> InputType {
+        from_fn(|i| {
+            let value = context_values[columns[i].at(row)].to_m31_array();
+            UInt32::from(value[0].0 | (value[1].0 << 16))
+        })
+    };
 
-    let preprocessed_columns =
-        [input_addr_col_0, input_addr_col_1, input_addr_col_2, output_addr_col, multiplicity_col]
-            .into_iter()
-            .map(|col| crate::witness::utils::pack_usize_column(&col))
-            .collect_vec();
-
-    let (trace, lookup_data, sub_component_inputs) =
-        write_trace_simd(packed_inputs, preprocessed_columns);
+    let (trace, lookup_data, sub_component_inputs) = write_trace_simd(n_rows, input, &columns);
     for inputs in sub_component_inputs.verify_bitwise_xor_8 {
         verify_bitwise_xor_8_state.add_packed_inputs(&inputs, 0);
     }
@@ -107,10 +102,11 @@ pub fn write_trace(
 #[allow(clippy::double_parens)]
 #[allow(non_snake_case)]
 fn write_trace_simd(
-    inputs: Vec<PackedInputType>,
-    preprocessed_columns: Vec<Vec<PackedM31>>,
+    n_rows: usize,
+    input: impl Fn(usize) -> InputType + Sync,
+    columns: &[circuit_common::preprocessed::ColumnRows<'_>; 5],
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData, SubComponentInputs) {
-    let log_n_packed_rows = inputs.len().ilog2();
+    let log_n_packed_rows = (n_rows / N_LANES).ilog2();
     let log_size = log_n_packed_rows + LOG_N_LANES;
     let (mut trace, mut lookup_data, mut sub_component_inputs) = unsafe {
         (
@@ -125,27 +121,24 @@ fn write_trace_simd(
     let M31_378353459 = PackedM31::broadcast(M31::from(378353459));
     let UInt16_8 = PackedUInt16::broadcast(UInt16::from(8));
 
-    let [
-        triple_xor_input_addr_0,
-        triple_xor_input_addr_1,
-        triple_xor_input_addr_2,
-        triple_xor_output_addr,
-        mults,
-    ]: [Vec<PackedM31>; 5] = preprocessed_columns.try_into().unwrap();
-
     (
         trace.par_iter_mut(),
         lookup_data.par_iter_mut(),
         sub_component_inputs.par_iter_mut(),
-        inputs.into_par_iter(),
     )
         .into_par_iter()
         .enumerate()
-        .for_each(|(row_index, (row, lookup_data, sub_component_inputs, triple_xor_input))| {
-            let triple_xor_input_addr_0 = triple_xor_input_addr_0[row_index];
-            let triple_xor_input_addr_1 = triple_xor_input_addr_1[row_index];
-            let triple_xor_input_addr_2 = triple_xor_input_addr_2[row_index];
-            let triple_xor_output_addr = triple_xor_output_addr[row_index];
+        .for_each(|(row_index, (row, lookup_data, sub_component_inputs))| {
+            let first = row_index * N_LANES;
+            let triple_xor_input: PackedInputType =
+                crate::witness::utils::packed_input(&input, first);
+            let [
+                triple_xor_input_addr_0,
+                triple_xor_input_addr_1,
+                triple_xor_input_addr_2,
+                triple_xor_output_addr,
+                mults,
+            ] = crate::witness::utils::packed_column_rows(columns, first);
 
             let input_a_limb_0_col0 = triple_xor_input[0].low().as_m31();
             *row[0] = input_a_limb_0_col0;
@@ -335,7 +328,7 @@ fn write_trace_simd(
                 input_a_xor_b_xor_c_limb_0_col6,
                 input_a_xor_b_xor_c_limb_1_col7,
             ];
-            *lookup_data.mults_0 = mults[row_index];
+            *lookup_data.mults_0 = mults;
         });
     (trace, lookup_data, sub_component_inputs)
 }

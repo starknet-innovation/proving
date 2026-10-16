@@ -424,6 +424,9 @@ const FUSED_LEVELS: u32 = 5;
 const TILE: usize = 1 << FUSED_LEVELS;
 /// Tile size of the passes that work on a smaller domain than the largest one.
 const LOWER_TILE: usize = 64;
+/// The passes this many levels below the largest domain, or fewer, are computed by the tiles of
+/// the largest domain ([`LeavesPlan::compute_tile`]) instead of over whole layers of states.
+const TILE_LOWER_LEVELS: u32 = 2;
 const N_HASHES_PER_SIMD_STATE: usize = 1 << LOG_N_HASHES_PER_SIMD_STATE;
 
 #[cfg(feature = "parallel")]
@@ -477,6 +480,10 @@ struct LeavesPlan<'a> {
     lower_log_size: Option<u32>,
     /// The passes over a smaller domain than the largest one, in increasing order of log size.
     lower_passes: Vec<Pass>,
+    /// The passes `lower_passes[..n_heap_passes]` are computed at construction into
+    /// `lower_states`; the others, one and two levels below the largest domain, are computed by
+    /// [`Self::compute_tile`] for the tile's states of those levels.
+    n_heap_passes: usize,
 }
 
 impl<'a> LeavesPlan<'a> {
@@ -551,8 +558,13 @@ impl<'a> LeavesPlan<'a> {
         let n_lower = passes.iter().take_while(|pass| pass.log_size < max_log_size).count();
         let top_passes = passes.split_off(n_lower);
         let lower_passes = passes;
+        // The passes one and two levels below the largest domain are left to the tiles: their
+        // states (16 and 8 per tile of 32) are computed on the stack beside the tile's, instead of
+        // whole layers of states written here and read back (realadii, lead rgr1_abd2509b).
+        let n_heap_passes =
+            lower_passes.iter().take_while(|pass| pass.log_size + TILE_LOWER_LEVELS < max_log_size).count();
         let lower_len = if compute_lower_states {
-            lower_passes.last().map_or(0, |pass| 1usize << pass.log_size)
+            lower_passes[..n_heap_passes].last().map_or(0, |pass| 1usize << pass.log_size)
         } else {
             0
         };
@@ -567,13 +579,13 @@ impl<'a> LeavesPlan<'a> {
 
         // `None` stands for the initial state of the hash.
         let mut prev_log_size: Option<u32> = None;
-        for pass in lower_passes.iter().take(if compute_lower_states { usize::MAX } else { 0 }) {
+        for pass in lower_passes[..n_heap_passes].iter().take(if compute_lower_states { usize::MAX } else { 0 }) {
             let log_ratio = pass.log_size - prev_log_size.unwrap_or(0);
             let prev_states: &[[u32x16; N_FELTS_IN_BLAKE_STATE]] = &prev_layer_states;
             let next_states = &mut next_layer_states[0..1 << pass.log_size];
             chunks_mut_iter(next_states, LOWER_TILE).enumerate().for_each(|(tile_index, tile)| {
                 let first_state = tile_index * LOWER_TILE;
-                init_tile(tile, first_state, prev_log_size.map(|_| (prev_states, log_ratio)));
+                init_tile(tile, first_state, prev_log_size.map(|_| (prev_states, log_ratio, 0)));
                 hash_pass_tile(columns, pass, first_state, tile);
             });
             std::mem::swap(&mut prev_layer_states, &mut next_layer_states);
@@ -590,6 +602,7 @@ impl<'a> LeavesPlan<'a> {
             lower_states: prev_layer_states,
             lower_log_size: prev_log_size,
             lower_passes,
+            n_heap_passes,
         }
     }
 
@@ -625,9 +638,42 @@ impl<'a> LeavesPlan<'a> {
     /// Computes the final states `first_state..first_state + tile.len()` of the largest domain.
     #[inline(always)]
     fn compute_tile(&self, first_state: usize, tile: &mut [[u32x16; N_FELTS_IN_BLAKE_STATE]]) {
-        let lower = self
-            .lower_log_size
-            .map(|log_size| (self.lower_states.as_slice(), self.max_log_size - log_size));
+        // `near[d - 1]` holds the tile's states of the level `d` below the largest domain, the
+        // first being the state `first_state >> d` of that level. `prev` is where the states of
+        // the last pass are: on the heap (`lower_states`) or in `near`, and their log size.
+        let mut near = [[INITIAL_STATE; TILE / 2]; TILE_LOWER_LEVELS as usize];
+        let mut prev = self.lower_log_size.map(|log_size| (false, log_size));
+        for pass in &self.lower_passes[self.n_heap_passes..] {
+            let d = (self.max_log_size - pass.log_size) as usize;
+            let first = first_state >> d;
+            let (one_below, two_below) = near.split_at_mut(1);
+            let (dst, other) = match d {
+                1 => (&mut one_below[0][..tile.len() >> 1], &two_below[0][..]),
+                _ => (&mut two_below[0][..tile.len() >> 2], &one_below[0][..]),
+            };
+            match prev {
+                // A further pass over the same domain continues from its states in place.
+                Some((true, log_size)) if log_size == pass.log_size => {}
+                Some((true, log_size)) => init_tile(
+                    dst,
+                    first,
+                    Some((other, pass.log_size - log_size, first_state >> (self.max_log_size - log_size))),
+                ),
+                Some((false, log_size)) => {
+                    init_tile(dst, first, Some((&self.lower_states, pass.log_size - log_size, 0)))
+                }
+                None => dst.fill(INITIAL_STATE),
+            }
+            hash_pass_tile(self.columns, pass, first, dst);
+            prev = Some((true, pass.log_size));
+        }
+        let lower = prev.map(|(in_tile, log_size)| {
+            let log_ratio = self.max_log_size - log_size;
+            match in_tile {
+                true => (&near[log_ratio as usize - 1][..], log_ratio, first_state >> log_ratio),
+                false => (self.lower_states.as_slice(), log_ratio, 0),
+            }
+        });
         init_tile(tile, first_state, lower);
         for pass in &self.top_passes {
             hash_pass_tile(self.columns, pass, first_state, tile);
@@ -645,20 +691,21 @@ impl<'a> LeavesPlan<'a> {
 
 /// Writes the states `first_state..first_state + tile.len()` of a pass to `tile`: either the
 /// initial state of the hash, or the states of the previous pass (`prev`, together with the log
-/// ratio between the two passes) lifted to the current domain.
+/// ratio between the two passes and the index of the previous pass's state held at
+/// `prev_states[0]`) lifted to the current domain.
 #[inline(always)]
 fn init_tile(
     tile: &mut [[u32x16; N_FELTS_IN_BLAKE_STATE]],
     first_state: usize,
-    prev: Option<(&[[u32x16; N_FELTS_IN_BLAKE_STATE]], u32)>,
+    prev: Option<(&[[u32x16; N_FELTS_IN_BLAKE_STATE]], u32, usize)>,
 ) {
     match prev {
         None => tile.fill(INITIAL_STATE),
-        Some((prev_states, log_ratio)) => {
+        Some((prev_states, log_ratio, offset)) => {
             for (k, state) in tile.iter_mut().enumerate() {
                 let i = first_state + k;
                 *state = array::from_fn(|j| {
-                    to_lifted_simd(prev_states[i >> log_ratio][j], log_ratio, i)
+                    to_lifted_simd(prev_states[(i >> log_ratio) - offset][j], log_ratio, i)
                 });
             }
         }

@@ -15,6 +15,27 @@ where
     values.par_chunks_exact(N_LANES).map(|c| T::pack(c.try_into().unwrap())).collect()
 }
 
+/// The packed row of rows `first..first + N_LANES` of preprocessed columns read in place: per
+/// column, the packed word [`pack_usize_column`] of the materialized column holds there.
+#[inline]
+pub fn packed_column_rows<const K: usize>(
+    columns: &[circuit_common::preprocessed::ColumnRows<'_>; K],
+    first: usize,
+) -> [stwo::prover::backend::simd::m31::PackedM31; K] {
+    use stwo::core::fields::m31::M31;
+    use stwo::prover::backend::simd::m31::PackedM31;
+    std::array::from_fn(|k| {
+        PackedM31::from_array(std::array::from_fn(|lane| M31::from(columns[k].at(first + lane))))
+    })
+}
+
+/// The inputs of the packed row of rows `first..first + N_LANES`, packed as [`pack_values`] packs
+/// the staged inputs of those rows.
+#[inline]
+pub fn packed_input<T: Pack>(input: impl Fn(usize) -> T, first: usize) -> T::SimdType {
+    T::pack(std::array::from_fn(|lane| input(first + lane)))
+}
+
 /// A preprocessed column's values as packed field elements: what
 /// `Col::<SimdBackend, M31>::from_iter` of their `M31::from` holds (the last packed word padded
 /// with zeros), converted in parallel instead of one value after the other. At 2^23 rows the

@@ -36,29 +36,26 @@ pub fn write_trace(
     preprocessed_trace: &PreProcessedTrace,
     range_check_16_state: &range_check_16::ClaimGenerator,
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, Claim, InteractionClaimGenerator) {
-    let input_addr_col = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "m31_to_u32_input_addr".to_owned() });
-    let output_addr_col = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "m31_to_u32_output_addr".to_owned() });
-    let multiplicity_col = preprocessed_trace
-        .get_column(&PreProcessedColumnId { id: "m31_to_u32_multiplicity".to_owned() });
+    // The inputs are gathered per packed row straight from the context values at the
+    // preprocessed addresses, read in place: no staged inputs, no packed copy of them and no
+    // materialized address columns.
+    let columns = ["m31_to_u32_input_addr", "m31_to_u32_output_addr", "m31_to_u32_multiplicity"]
+        .map(|id| preprocessed_trace.column_rows(&PreProcessedColumnId { id: id.to_owned() }));
 
-    let inputs = extract_component_inputs(&input_addr_col, context_values);
-
-    let n_rows = inputs.len();
+    let n_rows = columns[0].len();
+    assert!(columns.iter().all(|column| column.len() == n_rows));
     assert_ne!(n_rows, 0);
+    assert!(n_rows.is_multiple_of(N_LANES));
     let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
     let log_size = size.ilog2();
 
-    let packed_inputs = pack_values(&inputs);
+    // A row's input, as `extract_component_inputs` stages it.
+    let input = |row: usize| -> InputType {
+        let m31_input = context_values[columns[0].at(row)].to_m31_array()[0];
+        (m31_input, UInt32::from(m31_input.0))
+    };
 
-    let preprocessed_columns = [input_addr_col, output_addr_col, multiplicity_col]
-        .into_iter()
-        .map(|col| crate::witness::utils::pack_usize_column(&col))
-        .collect_vec();
-
-    let (trace, lookup_data, sub_component_inputs) =
-        write_trace_simd(packed_inputs, preprocessed_columns);
+    let (trace, lookup_data, sub_component_inputs) = write_trace_simd(n_rows, input, &columns);
     for inputs in sub_component_inputs.range_check_16 {
         range_check_16_state.add_packed_inputs(&inputs, 0);
     }
@@ -76,10 +73,11 @@ struct SubComponentInputs {
 #[allow(clippy::double_parens)]
 #[allow(non_snake_case)]
 fn write_trace_simd(
-    inputs: Vec<PackedInputType>,
-    preprocessed_columns: Vec<Vec<PackedM31>>,
+    n_rows: usize,
+    input: impl Fn(usize) -> InputType + Sync,
+    columns: &[circuit_common::preprocessed::ColumnRows<'_>; 3],
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData, SubComponentInputs) {
-    let log_n_packed_rows = inputs.len().ilog2();
+    let log_n_packed_rows = (n_rows / N_LANES).ilog2();
     let log_size = log_n_packed_rows + LOG_N_LANES;
     let (mut trace, mut lookup_data, mut sub_component_inputs) = unsafe {
         (
@@ -94,22 +92,21 @@ fn write_trace_simd(
     let M31_1008385708 = PackedM31::broadcast(M31::from(1008385708));
     let M31_32767 = PackedM31::broadcast(M31::from(32767));
     let M31_378353459 = PackedM31::broadcast(M31::from(378353459));
-    let [m31_to_u32_input_addr, m31_to_u32_output_addr, m31_to_u32_multiplicity]: [Vec<PackedM31>;
-        3] = preprocessed_columns.try_into().unwrap();
 
     (
         trace.par_iter_mut(),
         lookup_data.par_iter_mut(),
         sub_component_inputs.par_iter_mut(),
-        inputs.into_par_iter(),
     )
         .into_par_iter()
         .enumerate()
         .for_each(
-            |(row_index, (row, lookup_data, sub_component_inputs, m_31_to_u_32_input))| {
-                let m31_to_u32_input_addr = m31_to_u32_input_addr[row_index];
-                let m31_to_u32_output_addr = m31_to_u32_output_addr[row_index];
-                let m31_to_u32_multiplicity = m31_to_u32_multiplicity[row_index];
+            |(row_index, (row, lookup_data, sub_component_inputs))| {
+                let first = row_index * N_LANES;
+                let m_31_to_u_32_input: PackedInputType =
+                    crate::witness::utils::packed_input(&input, first);
+                let [m31_to_u32_input_addr, m31_to_u32_output_addr, m31_to_u32_multiplicity] =
+                    crate::witness::utils::packed_column_rows(columns, first);
                 let input_m31_col0 = m_31_to_u_32_input.0;
                 *row[0] = input_m31_col0;
                 let input_u32_limb_0_col1 = m_31_to_u_32_input.1.low().as_m31();

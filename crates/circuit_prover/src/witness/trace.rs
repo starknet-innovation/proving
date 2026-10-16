@@ -11,11 +11,14 @@ use circuits::context::U_VAR_IDX;
 use itertools::Itertools;
 use rayon::scope;
 use stwo::core::channel::MerkleChannel;
+use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::QM31;
 use stwo::prover::TreeBuilder;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::poly::circle::PolyOps;
+use stwo::prover::mempool::BaseColumnPool;
+use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use stwo::prover::poly::twiddles::TwiddleTree;
 
 use crate::witness::components::{
@@ -42,6 +45,23 @@ pub fn warm_writer_columns(preprocessed_trace: &PreProcessedTrace) {
         stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId { id: id.to_owned() }
     });
     preprocessed_trace.warm_columns(&ids);
+}
+
+/// Interpolates the columns of one component. Columns above 2^16 values (all of a component's
+/// columns have one size) are interpolated one after another, each parallel inside, through
+/// [`PolyOps::interpolate_pooled`]: the fused out-of-place inverse FFT writes the coefficients
+/// without a transposition pass of its own, into the evaluation buffer the previous column gave
+/// back. The butterflies, twiddles and last pass are those of the in-place path, so every
+/// coefficient is the same. Mechanism: realadii's fused-IFFT interpolation (lead rgr1_90de72d7).
+fn interpolate_in_turn(
+    columns: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    twiddles: &TwiddleTree<SimdBackend>,
+) -> Vec<CircleCoefficients<SimdBackend>> {
+    if !columns.first().is_some_and(|column| column.domain.log_size() > 16) {
+        return SimdBackend::interpolate_columns(columns, twiddles);
+    }
+    let pool = BaseColumnPool::<SimdBackend>::new();
+    columns.into_iter().map(|column| SimdBackend::interpolate_pooled(column, twiddles, &pool)).collect()
 }
 
 pub struct TraceGenerator {
@@ -95,13 +115,13 @@ where
                 preprocessed_trace_ref,
                 &trace_generator.qm31_ops_trace_generator,
             );
-            let polys = SimdBackend::interpolate_columns(trace.to_evals(), twiddles);
+            let polys = interpolate_in_turn(trace.to_evals(), twiddles);
             qm31_ops_result.write((polys, log_size, lookup_data));
         });
         s.spawn(|_| {
             let (trace, log_size, lookup_data) =
                 eq::write_trace(context_values, preprocessed_trace_ref);
-            let polys = SimdBackend::interpolate_columns(trace.to_evals(), twiddles);
+            let polys = interpolate_in_turn(trace.to_evals(), twiddles);
             eq_result.write((polys, log_size, lookup_data));
         });
         });
@@ -187,47 +207,47 @@ where
         s.spawn(|_| {
             let trace = unsafe { triple_xor_trace_data.assume_init() };
             triple_xor_polys_result
-                .write(SimdBackend::interpolate_columns(trace.to_evals(), twiddles));
+                .write(interpolate_in_turn(trace.to_evals(), twiddles));
         });
         s.spawn(|_| {
             let trace = unsafe { m_31_to_u_32_trace_data.assume_init() };
             m_31_to_u_32_polys_result
-                .write(SimdBackend::interpolate_columns(trace.to_evals(), twiddles));
+                .write(interpolate_in_turn(trace.to_evals(), twiddles));
         });
         s.spawn(|_| {
             let trace = unsafe { blake_g_gate_trace_data.assume_init() };
             blake_g_gate_polys_result
-                .write(SimdBackend::interpolate_columns(trace.to_evals(), twiddles));
+                .write(interpolate_in_turn(trace.to_evals(), twiddles));
         });
         s.spawn(|_| {
             let (trace, _claim, interaction_claim_gen) = verify_bitwise_xor_8_state.write_trace();
-            let polys = SimdBackend::interpolate_columns(trace.to_evals(), twiddles);
+            let polys = interpolate_in_turn(trace.to_evals(), twiddles);
             verify_bitwise_xor_8_result.write((polys, interaction_claim_gen));
         });
         s.spawn(|_| {
             let (trace, _claim, interaction_claim_gen) = verify_bitwise_xor_12_state.write_trace();
             // verify_bitwise_xor_12 returns Vec<CircleEvaluation> directly, not ComponentTrace.
-            let polys = SimdBackend::interpolate_columns(trace, twiddles);
+            let polys = interpolate_in_turn(trace, twiddles);
             verify_bitwise_xor_12_result.write((polys, interaction_claim_gen));
         });
         s.spawn(|_| {
             let (trace, _claim, interaction_claim_gen) = verify_bitwise_xor_4_state.write_trace();
-            let polys = SimdBackend::interpolate_columns(trace.to_evals(), twiddles);
+            let polys = interpolate_in_turn(trace.to_evals(), twiddles);
             verify_bitwise_xor_4_result.write((polys, interaction_claim_gen));
         });
         s.spawn(|_| {
             let (trace, _claim, interaction_claim_gen) = verify_bitwise_xor_7_state.write_trace();
-            let polys = SimdBackend::interpolate_columns(trace.to_evals(), twiddles);
+            let polys = interpolate_in_turn(trace.to_evals(), twiddles);
             verify_bitwise_xor_7_result.write((polys, interaction_claim_gen));
         });
         s.spawn(|_| {
             let (trace, _claim, interaction_claim_gen) = verify_bitwise_xor_9_state.write_trace();
-            let polys = SimdBackend::interpolate_columns(trace.to_evals(), twiddles);
+            let polys = interpolate_in_turn(trace.to_evals(), twiddles);
             verify_bitwise_xor_9_result.write((polys, interaction_claim_gen));
         });
         s.spawn(|_| {
             let (trace, _claim, interaction_claim_gen) = range_check_16_state.write_trace();
-            let polys = SimdBackend::interpolate_columns(trace.to_evals(), twiddles);
+            let polys = interpolate_in_turn(trace.to_evals(), twiddles);
             range_check_16_result.write((polys, interaction_claim_gen));
         });
     });
@@ -391,7 +411,7 @@ where
         || {
             let (trace, claim) =
                 blake_g_gate.write_interaction_trace(&interaction_elements.common_lookup_elements);
-            (SimdBackend::interpolate_columns(trace, twiddles), claim.claimed_sum)
+            (interpolate_in_turn(trace, twiddles), claim.claimed_sum)
         },
         || rayon::scope(|s| {
         s.spawn(|_| {
@@ -400,7 +420,7 @@ where
                 eq_lookup_data,
                 &interaction_elements.common_lookup_elements,
             );
-            all_polys.eq = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.eq = interpolate_in_turn(trace, twiddles);
             claimed_sums.eq = claimed_sum;
         });
         s.spawn(|_| {
@@ -415,55 +435,55 @@ where
                 &preprocessed_trace,
                 &interaction_elements.common_lookup_elements,
             );
-            all_polys.qm31_ops = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.qm31_ops = interpolate_in_turn(trace, twiddles);
             claimed_sums.qm31_ops = claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) =
                 triple_xor.write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.triple_xor = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.triple_xor = interpolate_in_turn(trace, twiddles);
             claimed_sums.triple_xor = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) =
                 m_31_to_u_32.write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.m_31_to_u_32 = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.m_31_to_u_32 = interpolate_in_turn(trace, twiddles);
             claimed_sums.m_31_to_u_32 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_8
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_8 = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.verify_bitwise_xor_8 = interpolate_in_turn(trace, twiddles);
             claimed_sums.verify_bitwise_xor_8 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_12
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_12 = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.verify_bitwise_xor_12 = interpolate_in_turn(trace, twiddles);
             claimed_sums.verify_bitwise_xor_12 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_4
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_4 = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.verify_bitwise_xor_4 = interpolate_in_turn(trace, twiddles);
             claimed_sums.verify_bitwise_xor_4 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_7
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_7 = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.verify_bitwise_xor_7 = interpolate_in_turn(trace, twiddles);
             claimed_sums.verify_bitwise_xor_7 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_9
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_9 = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.verify_bitwise_xor_9 = interpolate_in_turn(trace, twiddles);
             claimed_sums.verify_bitwise_xor_9 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = range_check_16
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.range_check_16 = SimdBackend::interpolate_columns(trace, twiddles);
+            all_polys.range_check_16 = interpolate_in_turn(trace, twiddles);
             claimed_sums.range_check_16 = claim.claimed_sum;
         });
     }),

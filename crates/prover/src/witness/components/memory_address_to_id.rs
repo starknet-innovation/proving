@@ -8,8 +8,7 @@ use cairo_air::components::memory_address_to_id::{
     N_TRACE_COLUMNS,
 };
 use cairo_air::relations::{self, MEMORY_ADDRESS_TO_ID_RELATION_ID};
-use itertools::{Itertools, izip};
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use itertools::Itertools;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::SliceExt;
@@ -189,31 +188,27 @@ impl InteractionClaimGenerator {
         let n_rows = 1 << log_size;
         let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(log_size) };
 
-        for (i, ((ids0, mults0), (ids1, mults1))) in
-            izip!(&self.ids, &self.multiplicities).tuples().enumerate()
-        {
-            let mut col_gen = logup_gen.new_col();
-            (col_gen.par_iter_mut(), ids0, ids1, mults0, mults1)
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(vec_row, (writer, &id0, &id1, &mult0, &mult1))| {
-                    let addr = Seq::new(log_size).packed_at(vec_row) + PackedM31::broadcast(M31(1));
-                    let addr0 = addr + PackedM31::broadcast(M31(((i * 2) * n_rows) as u32));
-                    let addr1 = addr + PackedM31::broadcast(M31(((i * 2 + 1) * n_rows) as u32));
-                    let p0: PackedQM31 = common_lookup_elements.combine(&[
-                        MEMORY_ADDRESS_TO_ID_RELATION_ID.into(),
-                        addr0,
-                        id0,
-                    ]);
-                    let p1: PackedQM31 = common_lookup_elements.combine(&[
-                        MEMORY_ADDRESS_TO_ID_RELATION_ID.into(),
-                        addr1,
-                        id1,
-                    ]);
-                    writer.write_frac(p0 * (-mult1) + p1 * (-mult0), p1 * p0);
-                });
-            col_gen.finalize_col();
-        }
+        // Column `i` holds the lookups of the splits `2i` and `2i + 1`, all the columns written in
+        // one pass over the rows.
+        let (ids, mults) = (&self.ids, &self.multiplicities);
+        logup_gen.write_frac_cols(MEMORY_ADDRESS_TO_ID_SPLIT / 2, |i, vec_row| {
+            let (id0, id1) = (ids[i * 2][vec_row], ids[i * 2 + 1][vec_row]);
+            let (mult0, mult1) = (mults[i * 2][vec_row], mults[i * 2 + 1][vec_row]);
+            let addr = Seq::new(log_size).packed_at(vec_row) + PackedM31::broadcast(M31(1));
+            let addr0 = addr + PackedM31::broadcast(M31(((i * 2) * n_rows) as u32));
+            let addr1 = addr + PackedM31::broadcast(M31(((i * 2 + 1) * n_rows) as u32));
+            let p0: PackedQM31 = common_lookup_elements.combine(&[
+                MEMORY_ADDRESS_TO_ID_RELATION_ID.into(),
+                addr0,
+                id0,
+            ]);
+            let p1: PackedQM31 = common_lookup_elements.combine(&[
+                MEMORY_ADDRESS_TO_ID_RELATION_ID.into(),
+                addr1,
+                id1,
+            ]);
+            (p0 * (-mult1) + p1 * (-mult0), p1 * p0)
+        });
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
 

@@ -130,6 +130,24 @@ impl<const N: usize> InputToRow<N> {
             self.fields.iter().map(|&(i, shift)| (input[i].0 as usize) << shift).sum()
         }
     }
+
+    /// The rows holding the `N_LANES` inputs of a packed row, as [`Self::row`] gives them.
+    #[inline]
+    pub fn rows_packed(&self, input: &[PackedM31; N]) -> [u32; N_LANES] {
+        if self.fields.is_empty() {
+            let lanes = input.map(|values| values.to_array());
+            std::array::from_fn(|lane| {
+                self.row(&std::array::from_fn(|i| lanes[i][lane])).try_into().unwrap()
+            })
+        } else {
+            self.fields
+                .iter()
+                .fold(std::simd::u32x16::splat(0), |rows, &(i, shift)| {
+                    rows + (input[i].into_simd() << shift)
+                })
+                .to_array()
+        }
+    }
 }
 
 pub fn pack_values<T: Pack>(values: &[T]) -> Vec<T::SimdType> {

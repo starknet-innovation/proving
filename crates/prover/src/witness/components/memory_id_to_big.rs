@@ -15,9 +15,7 @@ use cairo_air::relations::{
     RANGE_CHECK_9_9_RELATION_ID,
 };
 use itertools::{Itertools, chain};
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use stwo::core::fields::qm31::SecureField;
 use stwo_cairo_adapter::memory::{EncodedMemoryValueId, Memory, MemoryValueId, u128_to_4_limbs};
 use stwo_cairo_common::memory::{LARGE_MEMORY_VALUE_ID_BASE, N_M31_IN_SMALL_FELT252};
@@ -120,60 +118,22 @@ impl ClaimGenerator {
             std::array::from_fn(|i| small_table_trace[i + 1].data.clone());
         let small_multiplicities = small_table_trace.first().unwrap().data.clone();
 
-        // Add inputs to range check that all the values are 9-bit felts.
+        // Add inputs to range check that all the values are 9-bit felts: the limbs `2i` and
+        // `2i + 1` of a value are an input of relation `i % 8` (`i % 4` for the small values). A
+        // task adds every input of its packed rows, one row at a time.
         for values in &big_components_values {
-            for (i, (col0, col1)) in values.iter().tuples().enumerate() {
-                match i % 8 {
-                    0 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                        range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 0);
-                    }),
-                    1 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                        range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 1);
-                    }),
-                    2 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                        range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 2);
-                    }),
-                    3 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                        range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 3);
-                    }),
-                    4 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                        range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 4);
-                    }),
-                    5 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                        range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 5);
-                    }),
-                    6 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                        range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 6);
-                    }),
-                    7 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                        range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 7);
-                    }),
-                    _ => {
-                        unreachable!("There are only 8 possible values for i % 8.",)
-                    }
-                };
-            }
-        }
-
-        for (i, (col0, col1)) in small_values.iter().tuples().enumerate() {
-            match i % 4 {
-                0 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                    range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 0);
-                }),
-                1 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                    range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 1);
-                }),
-                2 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                    range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 2);
-                }),
-                3 => col0.par_iter().zip(col1.par_iter()).for_each(|(val0, val1)| {
-                    range_check_9_9_trace_generator.add_packed_inputs(&[[*val0, *val1]], 3);
-                }),
-                _ => {
-                    unreachable!("There are only 4 possible values for i % 4.",)
+            (0..values[0].len()).into_par_iter().with_min_len(1 << 6).for_each(|row| {
+                for (i, (col0, col1)) in values.iter().tuples().enumerate() {
+                    range_check_9_9_trace_generator
+                        .add_packed_input(&[col0[row], col1[row]], i % 8);
                 }
-            };
+            });
         }
+        (0..small_values[0].len()).into_par_iter().with_min_len(1 << 6).for_each(|row| {
+            for (i, (col0, col1)) in small_values.iter().tuples().enumerate() {
+                range_check_9_9_trace_generator.add_packed_input(&[col0[row], col1[row]], i % 4);
+            }
+        });
 
         // Extend trace.
         let mut big_log_sizes = vec![];
@@ -361,25 +321,33 @@ impl InteractionClaimGenerator {
         self,
         common_lookup_elements: &relations::CommonLookupElements,
     ) -> (BigTraces, SmallTrace, BigInteractionClaim, SmallInteractionClaim) {
-        let mut offset = 0;
-        let (big_traces, big_claimed_sums): (Vec<_>, Vec<_>) = self
-            .big_components_values
+        // The big tables (each at its offset in the ids) and the small table are independent.
+        let offsets = self
+            .big_multiplicities
             .iter()
-            .zip(self.big_multiplicities.iter())
-            .map(|(big_components_values, big_multiplicities)| {
-                let res = Self::gen_big_memory_interaction_trace(
-                    big_components_values,
-                    big_multiplicities,
-                    offset,
-                    common_lookup_elements,
-                );
-                offset += big_multiplicities.len() as u32 * N_LANES as u32;
-                res
+            .scan(0, |offset, big_multiplicities| {
+                let start = *offset;
+                *offset += big_multiplicities.len() as u32 * N_LANES as u32;
+                Some(start)
             })
-            .unzip();
-
-        let (small_trace, small_claimed_sum) =
-            self.gen_small_memory_interaction_trace(common_lookup_elements);
+            .collect_vec();
+        let (big, (small_trace, small_claimed_sum)) = rayon::join(
+            || {
+                (&self.big_components_values, &self.big_multiplicities, offsets)
+                    .into_par_iter()
+                    .map(|(big_components_values, big_multiplicities, offset)| {
+                        Self::gen_big_memory_interaction_trace(
+                            big_components_values,
+                            big_multiplicities,
+                            offset,
+                            common_lookup_elements,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            || self.gen_small_memory_interaction_trace(common_lookup_elements),
+        );
+        let (big_traces, big_claimed_sums): (Vec<_>, Vec<_>) = big.into_iter().unzip();
         let claimed_sum = big_claimed_sums.iter().sum::<SecureField>();
 
         (
@@ -401,93 +369,43 @@ impl InteractionClaimGenerator {
         let mut big_values_logup_gen =
             unsafe { LogupTraceGenerator::uninitialized(big_table_log_size) };
 
-        // Every element is 9-bit.
-        for (i, (limb0, limb1, limb2, limb3)) in big_components_values.iter().tuples().enumerate() {
-            let mut col_gen = big_values_logup_gen.new_col();
-            (col_gen.par_iter_mut(), limb0, limb1, limb2, limb3).into_par_iter().for_each(
-                |(writer, limb0, limb1, limb2, limb3)| {
-                    let (denom0, denom1): (PackedQM31, PackedQM31) = match i % 4 {
-                        0 => (
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_RELATION_ID.into(),
-                                *limb0,
-                                *limb1,
-                            ]),
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_B_RELATION_ID.into(),
-                                *limb2,
-                                *limb3,
-                            ]),
-                        ),
-                        1 => (
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_C_RELATION_ID.into(),
-                                *limb0,
-                                *limb1,
-                            ]),
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_D_RELATION_ID.into(),
-                                *limb2,
-                                *limb3,
-                            ]),
-                        ),
-                        2 => (
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_E_RELATION_ID.into(),
-                                *limb0,
-                                *limb1,
-                            ]),
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_F_RELATION_ID.into(),
-                                *limb2,
-                                *limb3,
-                            ]),
-                        ),
-                        3 => (
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_G_RELATION_ID.into(),
-                                *limb0,
-                                *limb1,
-                            ]),
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_H_RELATION_ID.into(),
-                                *limb2,
-                                *limb3,
-                            ]),
-                        ),
-                        _ => {
-                            unreachable!("There are only 4 possible values for i % 4.",)
-                        }
-                    };
-                    writer.write_frac(denom0 + denom1, denom0 * denom1);
-                },
-            );
-            col_gen.finalize_col();
-        }
-
-        // Yield large values.
-        let mut col_gen = big_values_logup_gen.new_col();
+        // Every element is 9-bit: column `i` holds the limbs `4i..4i + 4` as two lookups of the
+        // relations `i % 4`, and the last column yields the large values. All the columns are
+        // written in one pass over the rows.
+        let range_check_relations = [
+            (RANGE_CHECK_9_9_RELATION_ID, RANGE_CHECK_9_9_B_RELATION_ID),
+            (RANGE_CHECK_9_9_C_RELATION_ID, RANGE_CHECK_9_9_D_RELATION_ID),
+            (RANGE_CHECK_9_9_E_RELATION_ID, RANGE_CHECK_9_9_F_RELATION_ID),
+            (RANGE_CHECK_9_9_G_RELATION_ID, RANGE_CHECK_9_9_H_RELATION_ID),
+        ];
+        let n_range_check_columns = FELT252_N_WORDS / 4;
         let large_memory_value_id_tag = Simd::splat(LARGE_MEMORY_VALUE_ID_BASE);
-        #[allow(clippy::needless_range_loop)]
-        for vec_row in 0..1 << (big_table_log_size - LOG_N_LANES) {
-            let id_and_value: [_; FELT252_N_WORDS + MEMORY_ID_SIZE] = std::array::from_fn(|i| {
-                if i == 0 {
-                    unsafe {
+        big_values_logup_gen.write_frac_cols(n_range_check_columns + 1, |i, vec_row| {
+            if i < n_range_check_columns {
+                let [limb0, limb1, limb2, limb3] =
+                    std::array::from_fn(|j| big_components_values[4 * i + j][vec_row]);
+                let (relation0, relation1) = range_check_relations[i % 4];
+                let denom0: PackedQM31 =
+                    common_lookup_elements.combine(&[relation0.into(), limb0, limb1]);
+                let denom1: PackedQM31 =
+                    common_lookup_elements.combine(&[relation1.into(), limb2, limb3]);
+                return (denom0 + denom1, denom0 * denom1);
+            }
+            // Yield large values.
+            let id_and_value: [_; 1 + MEMORY_ID_SIZE + FELT252_N_WORDS] =
+                std::array::from_fn(|i| match i {
+                    0 => MEMORY_ID_TO_BIG_RELATION_ID.into(),
+                    1 => unsafe {
                         PackedM31::from_simd_unchecked(
                             (SIMD_ENUMERATION_0 + Simd::splat((vec_row * N_LANES) as u32 + offset))
                                 | large_memory_value_id_tag,
                         )
-                    }
-                } else {
-                    big_components_values[i - 1][vec_row]
-                }
-            });
-            let denom: PackedQM31 = common_lookup_elements.combine(
-                &chain!([MEMORY_ID_TO_BIG_RELATION_ID.into()], id_and_value).collect_vec(),
-            );
-            col_gen.write_frac(vec_row, (-big_multiplicities[vec_row]).into(), denom);
-        }
-        col_gen.finalize_col();
+                    },
+                    _ => big_components_values[i - 2][vec_row],
+                });
+            let denom: PackedQM31 = common_lookup_elements.combine(&id_and_value);
+            ((-big_multiplicities[vec_row]).into(), denom)
+        });
 
         big_values_logup_gen.finalize_last()
     }
@@ -500,67 +418,39 @@ impl InteractionClaimGenerator {
         let mut small_values_logup_gen =
             unsafe { LogupTraceGenerator::uninitialized(small_table_log_size) };
 
-        // Every element is 9-bit.
-        for (i, (limb0, limb1, limb2, limb3)) in self.small_values.iter().tuples().enumerate() {
-            let mut col_gen = small_values_logup_gen.new_col();
-            (col_gen.par_iter_mut(), limb0, limb1, limb2, limb3).into_par_iter().for_each(
-                |(writer, limb0, limb1, limb2, limb3)| {
-                    let (denom0, denom1): (PackedQM31, PackedQM31) = match i % 2 {
-                        0 => (
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_RELATION_ID.into(),
-                                *limb0,
-                                *limb1,
-                            ]),
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_B_RELATION_ID.into(),
-                                *limb2,
-                                *limb3,
-                            ]),
-                        ),
-                        1 => (
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_C_RELATION_ID.into(),
-                                *limb0,
-                                *limb1,
-                            ]),
-                            common_lookup_elements.combine(&[
-                                RANGE_CHECK_9_9_D_RELATION_ID.into(),
-                                *limb2,
-                                *limb3,
-                            ]),
-                        ),
-                        _ => {
-                            unreachable!()
-                        }
-                    };
-                    writer.write_frac(denom0 + denom1, denom0 * denom1);
-                },
-            );
-            col_gen.finalize_col();
-        }
-
-        // Yield small values.
-        let mut col_gen = small_values_logup_gen.new_col();
-        for vec_row in 0..1 << (small_table_log_size - LOG_N_LANES) {
-            let id_and_value: [_; N_M31_IN_SMALL_FELT252 + MEMORY_ID_SIZE] =
-                std::array::from_fn(|i| {
-                    if i == 0 {
-                        unsafe {
-                            PackedM31::from_simd_unchecked(
-                                SIMD_ENUMERATION_0 + Simd::splat((vec_row * N_LANES) as u32),
-                            )
-                        }
-                    } else {
-                        self.small_values[i - 1][vec_row]
-                    }
+        // Every element is 9-bit: column `i` holds the limbs `4i..4i + 4` as two lookups of the
+        // relations `i % 2`, and the last column yields the small values. All the columns are
+        // written in one pass over the rows.
+        let range_check_relations = [
+            (RANGE_CHECK_9_9_RELATION_ID, RANGE_CHECK_9_9_B_RELATION_ID),
+            (RANGE_CHECK_9_9_C_RELATION_ID, RANGE_CHECK_9_9_D_RELATION_ID),
+        ];
+        let n_range_check_columns = N_M31_IN_SMALL_FELT252 / 4;
+        small_values_logup_gen.write_frac_cols(n_range_check_columns + 1, |i, vec_row| {
+            if i < n_range_check_columns {
+                let [limb0, limb1, limb2, limb3] =
+                    std::array::from_fn(|j| self.small_values[4 * i + j][vec_row]);
+                let (relation0, relation1) = range_check_relations[i % 2];
+                let denom0: PackedQM31 =
+                    common_lookup_elements.combine(&[relation0.into(), limb0, limb1]);
+                let denom1: PackedQM31 =
+                    common_lookup_elements.combine(&[relation1.into(), limb2, limb3]);
+                return (denom0 + denom1, denom0 * denom1);
+            }
+            // Yield small values.
+            let id_and_value: [_; 1 + MEMORY_ID_SIZE + N_M31_IN_SMALL_FELT252] =
+                std::array::from_fn(|i| match i {
+                    0 => MEMORY_ID_TO_BIG_RELATION_ID.into(),
+                    1 => unsafe {
+                        PackedM31::from_simd_unchecked(
+                            SIMD_ENUMERATION_0 + Simd::splat((vec_row * N_LANES) as u32),
+                        )
+                    },
+                    _ => self.small_values[i - 2][vec_row],
                 });
-            let denom: PackedQM31 = common_lookup_elements.combine(
-                &chain!([MEMORY_ID_TO_BIG_RELATION_ID.into()], id_and_value).collect_vec(),
-            );
-            col_gen.write_frac(vec_row, (-self.small_multiplicities[vec_row]).into(), denom);
-        }
-        col_gen.finalize_col();
+            let denom: PackedQM31 = common_lookup_elements.combine(&id_and_value);
+            ((-self.small_multiplicities[vec_row]).into(), denom)
+        });
 
         small_values_logup_gen.finalize_last()
     }

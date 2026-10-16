@@ -94,6 +94,13 @@ impl<const N: usize> ComponentTrace<N> {
         Self { data, log_size }
     }
 
+    /// Creates a `ComponentTrace` from its columns, each of `2^log_size` values.
+    pub fn from_columns(data: [Vec<PackedM31>; N], log_size: u32) -> Self {
+        assert!(log_size >= LOG_N_LANES, "log_size < LOG_N_LANES not supported!");
+        assert!(data.iter().all(|column| column.len() == 1 << (log_size - LOG_N_LANES)));
+        Self { data, log_size }
+    }
+
     pub fn log_size(&self) -> u32 {
         self.log_size
     }

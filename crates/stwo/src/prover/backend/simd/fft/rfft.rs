@@ -207,6 +207,27 @@ thread_local! {
     static PHASE1_SCRATCH: RefCell<Vec<u32x16>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Which part of [`fft_subdomains`] to run (for values above `CACHED_FFT_LOG_SIZE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phases {
+    /// The whole fft.
+    All,
+    /// The first phase and its transposition only: `dst` holds what the second phase reads.
+    First,
+    /// The second phase of one of its `2^post` independent contiguous chunks (see
+    /// [`phase2_chunk_log_size`]): `src` holds the first phase's output of the whole values (one
+    /// subdomain), and chunk `h` of the result is written to `dst`, of the chunk's size. The
+    /// second phase of the whole fft runs each chunk this way in place, with the same twiddles.
+    Chunk(usize),
+}
+
+/// The log of the number of elements of a chunk of the second phase of [`fft_subdomains`] on
+/// `2^log_n_elements` values (above `CACHED_FFT_LOG_SIZE`).
+pub const fn phase2_chunk_log_size(log_n_elements: usize) -> usize {
+    let log_n_vecs = log_n_elements - LOG_N_LANES as usize;
+    log_n_vecs - log_n_vecs / 2 + LOG_N_LANES as usize
+}
+
 /// Performs [`fft`] of the same coefficients for several consecutive subdomains: the evaluation on
 /// subdomain `i` is written to `dst + (i << log_n_elements)`, using the twiddles
 /// `subdomain_twiddles[i]`.
@@ -235,15 +256,18 @@ thread_local! {
 /// # Safety
 ///
 /// Behavior is undefined if `src` and `dst` do not have the same alignment as [`PackedBaseField`],
-/// or if `dst` does not have room for `subdomain_twiddles.len() << log_n_elements` elements.
+/// or if `dst` does not have room for `subdomain_twiddles.len() << log_n_elements` elements (with
+/// [`Phases::Chunk`], for the chunk's elements, and `src` must hold the `2^log_n_elements`).
 pub unsafe fn fft_subdomains(
     src: *const u32,
     load: Option<&(dyn Fn(usize, &mut [u32x16]) + Sync)>,
     dst: *mut u32,
     subdomain_twiddles: &[Vec<&[u32]>],
     log_n_elements: usize,
+    phases: Phases,
 ) {
     assert!(load.is_none() || log_n_elements > CACHED_FFT_LOG_SIZE as usize);
+    assert!(phases == Phases::All || log_n_elements > CACHED_FFT_LOG_SIZE as usize);
     if log_n_elements <= CACHED_FFT_LOG_SIZE as usize {
         for (i, twiddle_dbl) in subdomain_twiddles.iter().enumerate() {
             fft(src, dst.add(i << log_n_elements), twiddle_dbl, log_n_elements);
@@ -257,10 +281,59 @@ pub unsafe fn fft_subdomains(
     // (a, b, c) to the place (c, b, a).
     let post = log_n_vecs / 2;
     let pre = log_n_vecs - post;
+    if let Phases::Chunk(h) = phases {
+        // Iteration `index_h = h` of the second phase's `fft_lower_with_vecwise`, out of place:
+        // the same layers and twiddle indices, its offsets taken from the chunk's start.
+        const VECWISE_FFT_BITS: usize = LOG_N_LANES as usize + 1;
+        assert_eq!(subdomain_twiddles.len(), 1);
+        let fft_layers = pre + LOG_N_LANES as usize;
+        assert!(h < 1 << post);
+        let twiddle_dbl = &subdomain_twiddles[0][..3 + pre];
+        assert_eq!(twiddle_dbl[0].len(), 1 << (log_n_elements - 2));
+        let mut from = src.add(h << fft_layers);
+        for layer in (VECWISE_FFT_BITS..fft_layers).step_by(3).rev() {
+            match fft_layers - layer {
+                1 => fft1_loop::<true>(from, dst, &twiddle_dbl[(layer - 1)..], layer, h),
+                2 => fft2_loop::<true>(from, dst, &twiddle_dbl[(layer - 1)..], layer, h),
+                _ => fft3_loop::<true>(
+                    from,
+                    dst,
+                    &twiddle_dbl[(layer - 1)..],
+                    fft_layers - layer - 3,
+                    layer,
+                    h,
+                ),
+            }
+            from = dst;
+        }
+        let loop_bits = fft_layers - VECWISE_FFT_BITS;
+        for index_l in 0..1 << loop_bits {
+            let index = (h << loop_bits) + index_l;
+            let mut val0 = PackedBaseField::load(from.add(index_l * 32));
+            let mut val1 = PackedBaseField::load(from.add(index_l * 32 + 16));
+            (val0, val1) =
+                simd_butterfly(val0, val1, u32x16::splat(*twiddle_dbl[3].get_unchecked(index)));
+            (val0, val1) = vecwise_butterflies(
+                val0,
+                val1,
+                array::from_fn(|i| *twiddle_dbl[0].get_unchecked(index * 8 + i)),
+                array::from_fn(|i| *twiddle_dbl[1].get_unchecked(index * 4 + i)),
+                array::from_fn(|i| *twiddle_dbl[2].get_unchecked(index * 2 + i)),
+            );
+            val0.store(dst.add(index_l * 32));
+            val1.store(dst.add(index_l * 32 + 16));
+        }
+        return;
+    }
     let log_n_b = log_n_vecs & 1;
     let block_vecs = 1usize << post;
     let block_elems = block_vecs << LOG_N_LANES;
-    let group_log = SCATTER_SCRATCH_LOG_BYTES.saturating_sub(post + 6).clamp(1, 4).min(post);
+    // Without a load closure, the 2^22 and 2^23 columns (post = 9) store runs of 4 vectors
+    // instead of 2: the scratch of a group stays at 128 KiB, and each destination line gets
+    // longer contiguous writes (realadii, lead rgr1_abd2509b). Same blocks, same stores.
+    let min_group_log = if load.is_none() && post <= 9 { 2 } else { 1 };
+    let group_log =
+        SCATTER_SCRATCH_LOG_BYTES.saturating_sub(post + 6).clamp(min_group_log, 4).min(post);
     let group_size = 1usize << group_log;
     let n_tasks = 1usize << (post - group_log + log_n_b);
 
@@ -356,6 +429,9 @@ pub unsafe fn fft_subdomains(
         });
     });
 
+    if phases == Phases::First {
+        return;
+    }
     for (dst, twiddle_dbl) in dsts.iter().zip(subdomain_twiddles) {
         let dst = dst.get();
         fft_lower_with_vecwise(

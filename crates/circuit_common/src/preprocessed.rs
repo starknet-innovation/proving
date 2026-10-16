@@ -515,6 +515,7 @@ impl CompactColumn {
     }
 
     /// The value at `row`, without any allocation.
+    #[inline]
     fn at(&self, row: usize) -> usize {
         match self {
             Self::Narrow(values) => usize::try_from(values[row]).expect("value originally fit usize"),
@@ -580,6 +581,27 @@ impl CompactColumn {
                 })
                 .collect(),
         }
+    }
+}
+
+/// A preprocessed column read in place, see [`PreProcessedTrace::column_rows`].
+pub struct ColumnRows<'a>(&'a CompactColumn);
+
+impl ColumnRows<'_> {
+    /// The number of rows in the column.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the column has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
+
+    /// The value at `row`: `get_column(id)[row]`.
+    #[inline]
+    pub fn at(&self, row: usize) -> usize {
+        self.0.at(row)
     }
 }
 
@@ -690,6 +712,14 @@ impl PreProcessedTrace {
             })
             .collect();
         WARM_COLUMNS.lock().unwrap().extend(warm);
+    }
+
+    /// The values of the column `id`, read in place one row at a time: those of
+    /// [`Self::get_column`], with no materialized copy, for a writer that reads each row once.
+    pub fn column_rows(&self, id: &PreProcessedColumnId) -> ColumnRows<'_> {
+        ColumnRows(
+            self.columns.get(id).unwrap_or_else(|| panic!("Missing preprocessed column {id:?}")),
+        )
     }
 
     #[cfg(feature = "prover")]

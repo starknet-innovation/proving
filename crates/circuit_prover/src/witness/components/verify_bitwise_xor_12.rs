@@ -2,8 +2,6 @@
 #![allow(dead_code)]
 use std::simd::u32x16;
 
-use itertools::{Itertools, chain};
-
 use crate::circuit_air::components::verify_bitwise_xor_12::{
     Claim, EXPAND_BITS, InteractionClaim, LIMB_BITS, LOG_SIZE, N_MULT_COLUMNS,
 };
@@ -28,12 +26,11 @@ impl ClaimGenerator {
         let mults = self.mults.map(AtomicMultiplicityColumn::into_simd_vec);
 
         let domain = CanonicCoset::new(LOG_SIZE).circle_domain();
+        // The columns are copied on the workers (the multiplicities stay for the interaction).
         let trace = mults
-            .iter()
-            .cloned()
-            .map(BaseColumn::from_simd)
-            .map(|col| CircleEvaluation::new(domain, col))
-            .collect_vec();
+            .par_iter()
+            .map(|mults| CircleEvaluation::new(domain, BaseColumn::from_simd(mults.clone())))
+            .collect::<Vec<_>>();
         let lookup_data = LookupData { mults };
 
         (trace, Claim {}, InteractionClaimGenerator { lookup_data })
@@ -80,12 +77,11 @@ impl InteractionClaimGenerator {
 
         const EXPAND_BITS_MASK: u32 = (1 << EXPAND_BITS) - 1;
 
-        // Batch two lookups at a time. `i0` and `i1` are the column indices of the two multiplicity
-        // columns batched together.
-        for ((i0, mults0), (i1, mults1)) in self.lookup_data.mults.into_iter().enumerate().tuples()
-        {
-            let mut col_gen = logup_gen.new_col();
-
+        // Batch two lookups at a time: logup column `k` sums the lookups of the multiplicity
+        // columns `i0 = 2k` and `i1 = 2k + 1`. The columns are written in one pass over the rows.
+        let mults = &self.lookup_data.mults;
+        logup_gen.write_frac_cols(N_MULT_COLUMNS / 2, |col, vec_row| {
+            let (i0, i1) = (2 * col, 2 * col + 1);
             // Each multiplicity column represents a different combination of `EXPAND_BITS`
             // MSBs of each enumeration column. For example, if `EXPAND_BITS == 1`, then the
             // multiplicity columns are: 0b00, 0b01, 0b10, 0b11.
@@ -97,41 +93,33 @@ impl InteractionClaimGenerator {
             let ah1 = i1 as u32 >> EXPAND_BITS;
             let bh1 = i1 as u32 & EXPAND_BITS_MASK;
 
-            // Reconstruct the "expanded" values of a and b, and batch the lookups.
-            (col_gen.par_iter_mut(), mults0, mults1).into_par_iter().enumerate().for_each(
-                |(vec_row, (writer, mults0, mults1))| {
-                    // vec_row is LIMB_BITS of al and LIMB_BITS - LOG_N_LANES of bl. The low part of
-                    // bl is just the consecutive numbers 0 .. N_LANES-1.
-                    let al = vec_row as u32 >> (LIMB_BITS - LOG_N_LANES);
-                    let blh = vec_row as u32 & ((1 << (LIMB_BITS - LOG_N_LANES)) - 1);
+            // vec_row is LIMB_BITS of al and LIMB_BITS - LOG_N_LANES of bl. The low part of
+            // bl is just the consecutive numbers 0 .. N_LANES-1.
+            let al = vec_row as u32 >> (LIMB_BITS - LOG_N_LANES);
+            let blh = vec_row as u32 & ((1 << (LIMB_BITS - LOG_N_LANES)) - 1);
 
-                    // Construct the 3 vectors a, b, c.
-                    let a0 = u32x16::splat((ah0 << LIMB_BITS) | al);
-                    let a1 = u32x16::splat((ah1 << LIMB_BITS) | al);
-                    let b0 =
-                        u32x16::splat((bh0 << LIMB_BITS) | (blh << LOG_N_LANES)) | zero_to_n_lanes;
-                    let b1 =
-                        u32x16::splat((bh1 << LIMB_BITS) | (blh << LOG_N_LANES)) | zero_to_n_lanes;
+            // Construct the 3 vectors a, b, c.
+            let a0 = u32x16::splat((ah0 << LIMB_BITS) | al);
+            let a1 = u32x16::splat((ah1 << LIMB_BITS) | al);
+            let b0 = u32x16::splat((bh0 << LIMB_BITS) | (blh << LOG_N_LANES)) | zero_to_n_lanes;
+            let b1 = u32x16::splat((bh1 << LIMB_BITS) | (blh << LOG_N_LANES)) | zero_to_n_lanes;
 
-                    let c0 = a0 ^ b0;
-                    let c1 = a1 ^ b1;
+            let c0 = a0 ^ b0;
+            let c1 = a1 ^ b1;
 
-                    let (v0, v1) = unsafe {
-                        (
-                            [a0, b0, c0].map(|v| PackedM31::from_simd_unchecked(v)),
-                            [a1, b1, c1].map(|v| PackedM31::from_simd_unchecked(v)),
-                        )
-                    };
+            let (v0, v1) = unsafe {
+                (
+                    [a0, b0, c0].map(|v| PackedM31::from_simd_unchecked(v)),
+                    [a1, b1, c1].map(|v| PackedM31::from_simd_unchecked(v)),
+                )
+            };
 
-                    let vals0: Vec<PackedM31> = chain!([relation_id], v0).collect_vec();
-                    let vals1: Vec<PackedM31> = chain!([relation_id], v1).collect_vec();
-                    let p0: PackedQM31 = common_lookup_elements.combine(&vals0);
-                    let p1: PackedQM31 = common_lookup_elements.combine(&vals1);
-                    writer.write_frac(p0 * (-mults1) + p1 * (-mults0), p1 * p0);
-                },
-            );
-            col_gen.finalize_col();
-        }
+            let p0: PackedQM31 =
+                common_lookup_elements.combine(&[relation_id, v0[0], v0[1], v0[2]]);
+            let p1: PackedQM31 =
+                common_lookup_elements.combine(&[relation_id, v1[0], v1[1], v1[2]]);
+            (p0 * (-mults[i1][vec_row]) + p1 * (-mults[i0][vec_row]), p1 * p0)
+        });
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
 

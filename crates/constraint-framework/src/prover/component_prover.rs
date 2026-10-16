@@ -11,7 +11,10 @@ use stwo::core::pcs::TreeVec;
 use stwo::core::poly::circle::{CanonicCoset, CircleDomain};
 use stwo::core::utils::bit_reverse;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::simd::circle::evaluate_block_into;
+use stwo::prover::backend::simd::circle::{
+    block_chunk_log_size, block_twiddles, evaluate_block_first_phase_into, evaluate_block_into,
+    finish_block_chunk_into,
+};
 use stwo::core::fields::qm31::SECURE_EXTENSION_DEGREE;
 use stwo::prover::backend::simd::column::{
     BaseColumn, VeryPackedBaseColumnMutSlice, VeryPackedSecureColumnByCoordsMutSlice,
@@ -276,6 +279,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
             denom_inv,
             window,
             block,
+            false,
         );
     }
 
@@ -291,6 +295,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         denom_inv: &[BaseField],
         window: Option<(usize, isize)>,
         block: usize,
+        serial: bool,
     ) {
         let [c0, c1, c2, c3] =
             coords.map(as_very_packed_mut);
@@ -312,22 +317,6 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                     VeryPackedBaseColumnMutSlice(d),
                 ])
             }),
-        );
-
-        #[cfg(feature = "parallel")]
-        let iter = range.into_par_iter().step_by(CHUNK_SIZE).zip(
-            c0.par_chunks_mut(CHUNK_SIZE)
-                .zip(c1.par_chunks_mut(CHUNK_SIZE))
-                .zip(c2.par_chunks_mut(CHUNK_SIZE))
-                .zip(c3.par_chunks_mut(CHUNK_SIZE))
-                .map(|(((a, b), c), d)| {
-                    VeryPackedSecureColumnByCoordsMutSlice([
-                        VeryPackedBaseColumnMutSlice(a),
-                        VeryPackedBaseColumnMutSlice(b),
-                        VeryPackedBaseColumnMutSlice(c),
-                        VeryPackedBaseColumnMutSlice(d),
-                    ])
-                }),
         );
 
         // Define any `self` values outside the loop to prevent the compiler thinking there is a
@@ -382,12 +371,56 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
 
         #[cfg(not(feature = "parallel"))]
         {
+            let _ = serial;
             let mut fracs = Vec::new();
             iter.for_each(|item| body(&mut fracs, item));
         }
 
         #[cfg(feature = "parallel")]
-        iter.for_each_init(Vec::new, body);
+        if serial {
+            // The rows in order on this thread (a caller already running in parallel).
+            let mut fracs = Vec::new();
+            range.step_by(CHUNK_SIZE)
+                .zip(itertools::izip!(
+                    c0.chunks_mut(CHUNK_SIZE),
+                    c1.chunks_mut(CHUNK_SIZE),
+                    c2.chunks_mut(CHUNK_SIZE),
+                    c3.chunks_mut(CHUNK_SIZE)
+                ))
+                .for_each(|(chunk_idx, (a, b, c, d))| {
+                    body(
+                        &mut fracs,
+                        (
+                            chunk_idx,
+                            VeryPackedSecureColumnByCoordsMutSlice([
+                                VeryPackedBaseColumnMutSlice(a),
+                                VeryPackedBaseColumnMutSlice(b),
+                                VeryPackedBaseColumnMutSlice(c),
+                                VeryPackedBaseColumnMutSlice(d),
+                            ]),
+                        ),
+                    )
+                });
+        } else {
+            range
+                .into_par_iter()
+                .step_by(CHUNK_SIZE)
+                .zip(
+                    c0.par_chunks_mut(CHUNK_SIZE)
+                        .zip(c1.par_chunks_mut(CHUNK_SIZE))
+                        .zip(c2.par_chunks_mut(CHUNK_SIZE))
+                        .zip(c3.par_chunks_mut(CHUNK_SIZE))
+                        .map(|(((a, b), c), d)| {
+                            VeryPackedSecureColumnByCoordsMutSlice([
+                                VeryPackedBaseColumnMutSlice(a),
+                                VeryPackedBaseColumnMutSlice(b),
+                                VeryPackedBaseColumnMutSlice(c),
+                                VeryPackedBaseColumnMutSlice(d),
+                            ])
+                        }),
+                )
+                .for_each_init(Vec::new, body);
+        }
     }
 
     /// Evaluates the constraint quotients of a component whose evaluation domain is twice its trace
@@ -480,6 +513,11 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         // The first block's buffers: every value is written by `evaluate_block_into`'s FFT, so they
         // are taken as the commitment's evaluation buffers are, without zeroing them first.
         let fresh = stwo::prover::mempool::BaseColumnPool::<SimdBackend>::new();
+        // A large block's fft ends with independent chunks of its second phase: each chunk is
+        // completed for every block column into small per-job buffers and its rows evaluated on
+        // the same thread, instead of the second phase writing the whole block back to memory
+        // and the evaluation reading it again (realadii, rgr1_47b6d3ff).
+        let chunk_log = block_chunk_log_size(log_block);
         for block in 0..1usize << log_n_blocks {
             let fill = |((poly, whole), regrown): (
                 (&&&Poly<SimdBackend>, &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>),
@@ -494,7 +532,14 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                     Some(coeffs) => Cow::Borrowed(coeffs),
                     None => coefficients(**poly),
                 };
-                evaluate_block_into(&coeffs, eval_domain, &twiddles, log_block, block, &mut values);
+                // With chunks, only the fft's first phase: the second runs per chunk below.
+                if chunk_log.is_some() {
+                    evaluate_block_first_phase_into(
+                        &coeffs, eval_domain, &twiddles, log_block, block, &mut values,
+                    );
+                } else {
+                    evaluate_block_into(&coeffs, eval_domain, &twiddles, log_block, block, &mut values);
+                }
                 let mut evaluation = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
                     CanonicCoset::new(1).circle_domain(),
                     BaseColumn::zeros(2),
@@ -520,7 +565,92 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
             // The block's rows accumulate straight into the accumulator's slice for the block:
             // each row adds `row_res * denom_inv` to the value there, the value the zeroed
             // per-block buffer and its add pass produced (the accumulator stays below P).
-            {
+            if let Some(chunk_log) = chunk_log {
+                drop(columns);
+                let block_twiddles = block_twiddles(eval_domain, &twiddles, log_block, block);
+                let chunk_packed = 1usize << (chunk_log - LOG_N_LANES);
+                let start = (block * block_len) >> LOG_N_LANES;
+                let n_packed = block_len >> LOG_N_LANES;
+                let [c0, c1, c2, c3] = &mut accum.col.columns;
+                let [c0, c1, c2, c3] = [c0, c1, c2, c3].map(|c| &mut c.data[start..start + n_packed]);
+                let random_coeff_powers = &accum.random_coeff_powers;
+                let chunk_buffers = || {
+                    blocks.as_cols_ref().map_cols(
+                        |block: &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>| {
+                            block.as_ref().map(|_| {
+                                let mut buffer =
+                                    CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                                        CanonicCoset::new(1).circle_domain(),
+                                        BaseColumn::zeros(2),
+                                    );
+                                buffer.values = BaseColumn::zeros(1 << chunk_log);
+                                buffer
+                            })
+                        },
+                    )
+                };
+                let run_chunk = |buffers: &mut TreeVec<
+                    Vec<Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>>,
+                >,
+                                 (h, (((a, b), c), d)): (
+                    usize,
+                    (
+                        (
+                            (&mut [PackedBaseField], &mut [PackedBaseField]),
+                            &mut [PackedBaseField],
+                        ),
+                        &mut [PackedBaseField],
+                    ),
+                )| {
+                    for (buffer, block) in buffers.iter_mut().flatten().zip(blocks.iter().flatten()) {
+                        if let (Some(buffer), Some(block)) = (buffer, block) {
+                            finish_block_chunk_into(
+                                &block.values,
+                                &block_twiddles,
+                                log_block,
+                                h,
+                                &mut buffer.values.data,
+                            );
+                        }
+                    }
+                    let columns = buffers.as_cols_ref().zip_cols(whole.as_cols_ref()).map_cols(
+                        |(buffer, whole): (
+                            &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+                            &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+                        )| buffer.as_ref().or(whole.as_ref()).unwrap(),
+                    );
+                    self.accumulate_rows_into(
+                        &columns,
+                        [a, b, c, d],
+                        random_coeff_powers,
+                        eval_domain.log_size(),
+                        &denom_inv,
+                        None,
+                        (block * block_len + (h << chunk_log))
+                            >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS),
+                        true,
+                    );
+                };
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let mut buffers = chunk_buffers();
+                    itertools::izip!(
+                        c0.chunks_mut(chunk_packed),
+                        c1.chunks_mut(chunk_packed),
+                        c2.chunks_mut(chunk_packed),
+                        c3.chunks_mut(chunk_packed)
+                    )
+                    .enumerate()
+                    .for_each(|(h, (a, b, c, d))| run_chunk(&mut buffers, (h, (((a, b), c), d))));
+                }
+                #[cfg(feature = "parallel")]
+                c0.par_chunks_mut(chunk_packed)
+                    .zip(c1.par_chunks_mut(chunk_packed))
+                    .zip(c2.par_chunks_mut(chunk_packed))
+                    .zip(c3.par_chunks_mut(chunk_packed))
+                    .enumerate()
+                    .for_each_init(chunk_buffers, run_chunk);
+            } else {
                 let start = (block * block_len) >> LOG_N_LANES;
                 let n_packed = block_len >> LOG_N_LANES;
                 let [c0, c1, c2, c3] = &mut accum.col.columns;
@@ -533,9 +663,10 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                     &denom_inv,
                     None,
                     block * block_len >> (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS),
+                    false,
                 );
+                drop(columns);
             }
-            drop(columns);
             spare
                 .lock()
                 .unwrap()

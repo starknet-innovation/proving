@@ -1,5 +1,6 @@
 use std::simd::{simd_swizzle, u32x16};
 
+use crate::core::fields::m31::M31;
 use crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
 use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
 use crate::prover::backend::simd::m31::PackedBaseField;
@@ -113,17 +114,29 @@ const LIFTING_SWIZZLES_LOG_RATIO_GREATER_2: [[usize; 16]; 8] = [
 pub fn transpose_packed_leaf(
     packed_values: [[PackedBaseField; SECURE_EXTENSION_DEGREE]; PACKED_LEAF_SIZE],
 ) -> [[PackedBaseField; SECURE_EXTENSION_DEGREE]; PACKED_LEAF_SIZE] {
-    let coord_arrays = packed_values.map(|coords| coords.map(PackedBaseField::to_array));
-
-    core::array::from_fn(|offset| {
-        core::array::from_fn(|coord| {
-            PackedBaseField::from_array(core::array::from_fn(|lane| {
-                let src_packed = lane / 4;
-                let src_lane = (lane % 4) * 4 + offset;
-                coord_arrays[src_packed][coord][src_lane]
-            }))
-        })
-    })
+    // Output lane `4 * p + j` of `[offset][coord]` is lane `4 * j + offset` of `[p][coord]`: each
+    // input is transposed as a 4x4 matrix, then the 128-bit blocks are transposed across inputs.
+    // `reduce_simd` keeps the canonical values that `to_array` produced.
+    let mut out = [[PackedBaseField::broadcast(M31(0)); SECURE_EXTENSION_DEGREE]; PACKED_LEAF_SIZE];
+    for coord in 0..SECURE_EXTENSION_DEGREE {
+        let [t0, t1, t2, t3] = packed_values.map(|v| {
+            simd_swizzle!(v[coord].into_simd(), [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15])
+        });
+        let a = simd_swizzle!(t0, t1, [0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23]);
+        let b = simd_swizzle!(t2, t3, [0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23]);
+        let c = simd_swizzle!(t0, t1, [8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31]);
+        let d = simd_swizzle!(t2, t3, [8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31]);
+        let blocks: [u32x16; PACKED_LEAF_SIZE] = [
+            simd_swizzle!(a, b, [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]),
+            simd_swizzle!(a, b, [8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31]),
+            simd_swizzle!(c, d, [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]),
+            simd_swizzle!(c, d, [8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31]),
+        ];
+        for (dst, block) in out.iter_mut().zip(blocks) {
+            dst[coord] = PackedBaseField::reduce_simd(block);
+        }
+    }
+    out
 }
 
 #[cfg(not(any(
