@@ -15,6 +15,7 @@ pub mod m31;
 pub mod qm31;
 
 pub trait FieldExpOps: Mul<Output = Self> + MulAssign + Sized + One + Clone {
+    #[inline]
     fn square(&self) -> Self {
         self.clone() * self.clone()
     }
@@ -144,6 +145,7 @@ pub trait Field:
     + Sum
     + for<'a> Sum<&'a Self>
 {
+    #[inline]
     fn double(&self) -> Self {
         *self + *self
     }
@@ -193,18 +195,21 @@ macro_rules! impl_field {
         impl Field for $field_name {}
 
         impl AddAssign for $field_name {
+            #[inline]
             fn add_assign(&mut self, rhs: Self) {
                 *self = *self + rhs;
             }
         }
 
         impl SubAssign for $field_name {
+            #[inline]
             fn sub_assign(&mut self, rhs: Self) {
                 *self = *self - rhs;
             }
         }
 
         impl MulAssign for $field_name {
+            #[inline]
             fn mul_assign(&mut self, rhs: Self) {
                 *self = *self * rhs;
             }
@@ -214,6 +219,7 @@ macro_rules! impl_field {
             type Output = Self;
 
             #[allow(clippy::suspicious_arithmetic_impl)]
+            #[inline]
             fn div(self, rhs: Self) -> Self::Output {
                 self * rhs.inverse()
             }
@@ -294,6 +300,7 @@ macro_rules! impl_extension_field {
         impl Add for $field_name {
             type Output = Self;
 
+            #[inline]
             fn add(self, rhs: Self) -> Self::Output {
                 Self(self.0 + rhs.0, self.1 + rhs.1)
             }
@@ -302,6 +309,7 @@ macro_rules! impl_extension_field {
         impl Neg for $field_name {
             type Output = Self;
 
+            #[inline]
             fn neg(self) -> Self::Output {
                 Self(-self.0, -self.1)
             }
@@ -310,22 +318,26 @@ macro_rules! impl_extension_field {
         impl Sub for $field_name {
             type Output = Self;
 
+            #[inline]
             fn sub(self, rhs: Self) -> Self::Output {
                 Self(self.0 - rhs.0, self.1 - rhs.1)
             }
         }
 
         impl One for $field_name {
+            #[inline]
             fn one() -> Self {
                 Self(<$extended_field_name>::one(), <$extended_field_name>::zero())
             }
         }
 
         impl Zero for $field_name {
+            #[inline]
             fn zero() -> Self {
                 Self(<$extended_field_name>::zero(), <$extended_field_name>::zero())
             }
 
+            #[inline]
             fn is_zero(&self) -> bool {
                 *self == Self::zero()
             }
@@ -334,6 +346,7 @@ macro_rules! impl_extension_field {
         impl Add<M31> for $field_name {
             type Output = Self;
 
+            #[inline]
             fn add(self, rhs: M31) -> Self::Output {
                 Self(self.0 + rhs, self.1)
             }
@@ -342,6 +355,7 @@ macro_rules! impl_extension_field {
         impl Add<$field_name> for M31 {
             type Output = $field_name;
 
+            #[inline]
             fn add(self, rhs: $field_name) -> Self::Output {
                 rhs + self
             }
@@ -350,6 +364,7 @@ macro_rules! impl_extension_field {
         impl Sub<M31> for $field_name {
             type Output = Self;
 
+            #[inline]
             fn sub(self, rhs: M31) -> Self::Output {
                 Self(self.0 - rhs, self.1)
             }
@@ -358,6 +373,7 @@ macro_rules! impl_extension_field {
         impl Sub<$field_name> for M31 {
             type Output = $field_name;
 
+            #[inline]
             fn sub(self, rhs: $field_name) -> Self::Output {
                 -rhs + self
             }
@@ -366,6 +382,7 @@ macro_rules! impl_extension_field {
         impl Mul<M31> for $field_name {
             type Output = Self;
 
+            #[inline]
             fn mul(self, rhs: M31) -> Self::Output {
                 Self(self.0 * rhs, self.1 * rhs)
             }
@@ -374,6 +391,7 @@ macro_rules! impl_extension_field {
         impl Mul<$field_name> for M31 {
             type Output = $field_name;
 
+            #[inline]
             fn mul(self, rhs: $field_name) -> Self::Output {
                 rhs * self
             }
@@ -382,6 +400,7 @@ macro_rules! impl_extension_field {
         impl Div<M31> for $field_name {
             type Output = Self;
 
+            #[inline]
             fn div(self, rhs: M31) -> Self::Output {
                 Self(self.0 / rhs, self.1 / rhs)
             }
@@ -391,12 +410,14 @@ macro_rules! impl_extension_field {
             type Output = $field_name;
 
             #[allow(clippy::suspicious_arithmetic_impl)]
+            #[inline]
             fn div(self, rhs: $field_name) -> Self::Output {
                 rhs.inverse() * self
             }
         }
 
         impl ComplexConjugate for $field_name {
+            #[inline]
             fn complex_conjugate(&self) -> Self {
                 Self(self.0, -self.1)
             }
@@ -409,18 +430,21 @@ macro_rules! impl_extension_field {
         }
 
         impl AddAssign<M31> for $field_name {
+            #[inline]
             fn add_assign(&mut self, rhs: M31) {
                 *self = *self + rhs;
             }
         }
 
         impl SubAssign<M31> for $field_name {
+            #[inline]
             fn sub_assign(&mut self, rhs: M31) {
                 *self = *self - rhs;
             }
         }
 
         impl MulAssign<M31> for $field_name {
+            #[inline]
             fn mul_assign(&mut self, rhs: M31) {
                 *self = *self * rhs;
             }

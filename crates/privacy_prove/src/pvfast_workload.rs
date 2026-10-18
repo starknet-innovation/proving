@@ -59,6 +59,7 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
         || serde_json::from_slice::<ProverInput>(&input[witness_start..]),
     );
     let precomputes = precomputes?;
+    eprintln!("pvfast-phase cairo_leg");
     let prover_input: ProverInput = prover_input?;
     drop(input);
     // The circuit's preprocessing and its committed tree (both built on first use, see
@@ -81,12 +82,14 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
         },
     );
     let cairo_proof = cairo_proof.map_err(|e| anyhow!("cairo proof failed: {e:?}"))?;
+    eprintln!("pvfast-phase cairo_to_circuit");
     let component_enable_bits = cairo_proof.claim.flatten_claim().component_enable_bits;
     let zk_blinding_seed = cairo_proof.extended_stark_proof.proof.commitments.0[1].0;
     let (proof, aux) = prepare_cairo_proof_for_circuit_verifier(&cairo_proof, &component_enable_bits);
     // Everything the circuit proof needs from the Cairo proof is in `proof`, `aux` and the seed.
     drop(cairo_proof);
     let output_hash = compute_privacy_bootloader_output_hash(output_preimage);
+    eprintln!("pvfast-phase verifier_fill");
     // The circuit's preprocessing and its committed tree (both built on first use, see
     // `LazyPreprocessedCircuit`) are built while the verifier circuit is filled: they are
     // independent of it, and the fill is mostly sequential, so the tree's commitment runs on the
@@ -113,9 +116,12 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
             );
         },
     );
+    eprintln!("pvfast-phase validity_check");
     ensure!(context.is_circuit_valid(), "Circuit is not valid");
+    eprintln!("pvfast-phase blinding_padding");
     add_zk_blinding(&mut context, zk_blinding_seed, precomputes.circuit_config.config.fri_config.n_queries);
     pad_context(&mut context);
+    eprintln!("pvfast-phase circuit_leg");
     // A context that handed its values over at padding (see `FinalizedContext::release_on_padding`)
     // is not read again: the circuit proof takes the released values, so free the rest of it first.
     let released = context.values().is_empty();
@@ -140,6 +146,7 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
         )
     }
     .map_err(|e| anyhow!("circuit proof failed: {e:?}"))?;
+    eprintln!("pvfast-phase serialize");
     let (proof_qm31s, _public_data) = prepare_circuit_proof_for_circuit_verifier(circuit_proof);
     let mut proof_bytes: Vec<u8> = vec![];
     proof_qm31s.serialize(&mut proof_bytes);

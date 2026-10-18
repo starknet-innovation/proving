@@ -20,10 +20,12 @@ impl_field!(CM31, P2);
 impl_extension_field!(CM31, M31);
 
 impl CM31 {
+    #[inline]
     pub const fn from_u32_unchecked(a: u32, b: u32) -> CM31 {
         Self(M31::from_u32_unchecked(a), M31::from_u32_unchecked(b))
     }
 
+    #[inline]
     pub const fn from_m31(a: M31, b: M31) -> CM31 {
         Self(a, b)
     }
@@ -44,6 +46,7 @@ impl Debug for CM31 {
 impl Mul for CM31 {
     type Output = Self;
 
+    #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         // (a + bi) * (c + di) = (ac - bd) + (ad + bc)i.
         Self(self.0 * rhs.0 - self.1 * rhs.1, self.0 * rhs.1 + self.1 * rhs.0)

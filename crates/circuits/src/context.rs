@@ -1,3 +1,4 @@
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use hashbrown::{HashMap, HashSet};
@@ -49,6 +50,56 @@ pub enum GuessVar {
     U16(Var),
 }
 
+/// The map from a constant's value to its variable. Insertion order is what `finalize_constants`
+/// iterates, and it does not depend on the hasher; the hasher only serves the lookups, one per
+/// use of a constant while the circuit is built.
+pub type ConstantsMap = IndexMap<QM31, Var, BuildHasherDefault<ConstantHasher>>;
+
+/// A multiply-and-rotate hasher for the constants map: a `QM31` key hashes as its four `M31`
+/// words, which is a few cycles here against the default SipHash's tens.
+#[derive(Clone, Copy, Default)]
+pub struct ConstantHasher(u64);
+
+impl ConstantHasher {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::K);
+    }
+}
+
+impl Hasher for ConstantHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.mix(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, word: u32) {
+        self.mix(u64::from(word));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, word: u64) {
+        self.mix(word);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, word: usize) {
+        self.mix(word as u64);
+    }
+}
+
 /// Represents the information required to build a [Circuit].
 ///
 /// Context can be used in two ways:
@@ -59,7 +110,7 @@ pub enum GuessVar {
 /// `QM31`.
 pub struct Context<Value: IValue> {
     pub circuit: Circuit,
-    constants: IndexMap<QM31, Var>,
+    constants: ConstantsMap,
     values: Vec<Value>,
     /// Counters tracking how many of each gate/operation were emitted while building the circuit.
     ///
@@ -85,6 +136,10 @@ pub struct Context<Value: IValue> {
     /// happens through method [Self::set_outputs]. Reading a reserved variable via
     /// [Self::get] triggers a debug assertion.
     reserved_vars: Vec<usize>,
+    /// One past the largest index in `reserved_vars`, or 0 when it is empty: a read of a variable
+    /// at or past it cannot be a read of a reserved variable, so [Self::get] skips the scan of
+    /// `reserved_vars` for it (every variable the circuit creates after its reserved wires).
+    reserved_bound: usize,
     /// Debug only. If true, equality is asserted when adding the `eq` gate; if false, no
     /// assertion is made during construction and equality can be checked later at validation.
     pub assert_eq_on_eval: bool,
@@ -113,7 +168,7 @@ impl<Value: IValue> Context<Value> {
         &self.values
     }
 
-    pub fn constants(&self) -> &IndexMap<QM31, Var> {
+    pub fn constants(&self) -> &ConstantsMap {
         &self.constants
     }
 
@@ -130,6 +185,7 @@ impl<Value: IValue> Context<Value> {
     }
 
     /// Creates a new variable.
+    #[inline]
     pub fn new_var(&mut self, value: Value) -> Var {
         let idx = self.circuit.n_vars;
         self.circuit.n_vars += 1;
@@ -186,13 +242,23 @@ impl<Value: IValue> Context<Value> {
     }
 
     /// Returns the value of a variable.
+    #[inline(always)]
     pub fn get(&self, var: Var) -> Value {
-        assert!(!self.reserved_vars.contains(&var.idx), "read of reserved variable",);
+        if var.idx < self.reserved_bound {
+            self.check_not_reserved(var);
+        }
         match &self.base {
             None => self.values[var.idx],
             Some(base) if var.idx < base.len() => base[var.idx],
             Some(base) => self.values[var.idx - base.len()],
         }
+    }
+
+    /// The scan of `reserved_vars` behind [Self::get]'s bound check, kept out of its inlined body.
+    #[cold]
+    #[inline(never)]
+    fn check_not_reserved(&self, var: Var) {
+        assert!(!self.reserved_vars.contains(&var.idx), "read of reserved variable",);
     }
 
     /// Builds `n` independent pieces of the circuit on rayon's workers and appends them in order:
@@ -242,6 +308,7 @@ impl<Value: IValue> Context<Value> {
                     maybe_unused_vars: HashSet::new(),
                     guessed_vars: this.guessed_vars.as_ref().map(|_| vec![]),
                     reserved_vars: this.reserved_vars.clone(),
+                    reserved_bound: this.reserved_bound,
                     assert_eq_on_eval: this.assert_eq_on_eval,
                     debug_info: HashMap::new(),
                     release_on_padding: false,
@@ -312,6 +379,7 @@ impl<Value: IValue> Context<Value> {
     pub fn reserve(&mut self) -> Var {
         let reserved = self.new_var(Value::placeholder());
         self.reserved_vars.push(reserved.idx);
+        self.reserved_bound = self.reserved_bound.max(reserved.idx + 1);
         reserved
     }
 
@@ -321,6 +389,7 @@ impl<Value: IValue> Context<Value> {
     ///
     /// Panics if `vars` has a different length than the number of the currently reserved variables.
     pub fn set_outputs(&mut self, vars: &[Var]) {
+        self.reserved_bound = 0;
         for (reserved, var) in zip_eq(std::mem::take(&mut self.reserved_vars), vars) {
             let value = self.get(*var);
             self.values[reserved] = value;
@@ -425,13 +494,14 @@ impl<Value: IValue> Default for Context<Value> {
     fn default() -> Self {
         let mut res = Self {
             circuit: Circuit::default(),
-            constants: IndexMap::new(),
+            constants: ConstantsMap::default(),
             values: vec![],
             stats: Stats::default(),
             unused_vars: HashSet::new(),
             maybe_unused_vars: HashSet::new(),
             guessed_vars: Some(vec![]),
             reserved_vars: vec![],
+            reserved_bound: 0,
             assert_eq_on_eval: false,
             debug_info: HashMap::new(),
             release_on_padding: false,
@@ -514,7 +584,7 @@ impl<Value: IValue> FinalizedContext<Value> {
         }
         Value::release_values(std::mem::take(&mut context.values));
         context.circuit = Circuit { n_vars: context.circuit.n_vars, ..Circuit::default() };
-        context.constants = IndexMap::new();
+        context.constants = ConstantsMap::default();
         context.unused_vars = HashSet::new();
         context.maybe_unused_vars = HashSet::new();
         context.debug_info = HashMap::new();
@@ -545,8 +615,14 @@ fn par_append<T: Send + Sync, U: Send>(
         starts.push(total);
         total += part.len();
     }
+    // Pieces of one length (the queries' checks) locate their part by division; otherwise by a
+    // binary search of the starts.
+    let uniform = parts.first().map(|part| part.len()).filter(|&len| len > 0 && parts.iter().all(|part| part.len() == len));
     dst.par_extend((0..total).into_par_iter().map(|i| {
-        let k = starts.partition_point(|&start| start <= i) - 1;
+        let k = match uniform {
+            Some(len) => i / len,
+            None => starts.partition_point(|&start| start <= i) - 1,
+        };
         f(&parts[k][i - starts[k]], k)
     }));
 }

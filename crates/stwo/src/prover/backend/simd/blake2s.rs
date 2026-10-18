@@ -4,6 +4,12 @@
 use std::array;
 use std::mem::transmute;
 use std::simd::{simd_swizzle, u32x8, u32x16};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use std::arch::x86_64::{__m256i, _mm256_shuffle_epi8};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use std::hint::black_box;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use std::simd::u8x32;
 
 use bytemuck::cast_slice;
 use itertools::Itertools;
@@ -355,37 +361,99 @@ pub fn untranspose_states(mut states: [u32x16; 8]) -> [u32x16; 8] {
     states
 }
 
-/// Applies [`u32::rotate_right(N)`] to each element of the 8-lane vector.
-#[inline(always)]
-fn rotate8<const N: u32>(x: u32x8) -> u32x8 {
-    (x >> N) | (x << (u32::BITS - N))
+/// The two byte rotations of BLAKE2s, `rotate_right(16)` and `rotate_right(8)`, on 8-lane vectors.
+///
+/// With AVX2 a rotation by whole bytes is one byte shuffle (`vpshufb`). Written as shifts, or as a
+/// shuffle whose mask the compiler can see, LLVM moves the shuffle through the xor it rotates
+/// (`rotr(d ^ a)` becomes `rotr(d) ^ rotr(a)`), and every `G` step carries two `vpshufb` per
+/// rotation: 152 of `compress16_8lane`'s 1,862 instructions. The masks are made once per
+/// compression behind `black_box`, so each rotation stays one shuffle. The results are the same
+/// rotations, bit for bit. Without AVX2 the shifts are used.
+#[derive(Clone, Copy)]
+pub(super) struct ByteRotations {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    by16: __m256i,
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    by8: __m256i,
+}
+
+impl ByteRotations {
+    #[inline(always)]
+    pub(super) fn new() -> Self {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            // Byte `i` of each 4-byte lane comes from byte `(i + 2) % 4` (16 bits) or
+            // `(i + 1) % 4` (8 bits) of the same lane: a right rotation in little-endian lanes.
+            const BY16: [u8; 32] = [
+                2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13, 18, 19, 16, 17, 22, 23, 20, 21,
+                26, 27, 24, 25, 30, 31, 28, 29,
+            ];
+            const BY8: [u8; 32] = [
+                1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12, 17, 18, 19, 16, 21, 22, 23, 20,
+                25, 26, 27, 24, 29, 30, 31, 28,
+            ];
+            Self {
+                by16: black_box(u8x32::from_array(BY16)).into(),
+                by8: black_box(u8x32::from_array(BY8)).into(),
+            }
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            Self {}
+        }
+    }
+
+    /// Applies [`u32::rotate_right(N)`] to each element of the 8-lane vector.
+    #[inline(always)]
+    pub(super) fn rotate<const N: u32>(self, x: u32x8) -> u32x8 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            if N == 16 || N == 8 {
+                let mask = if N == 16 { self.by16 } else { self.by8 };
+                // SAFETY: `_mm256_shuffle_epi8` is an AVX2 instruction and this arm is compiled
+                // only for targets with AVX2.
+                let rotated: __m256i = unsafe { _mm256_shuffle_epi8(x.into(), mask) };
+                return rotated.into();
+            }
+        }
+        (x >> N) | (x << (u32::BITS - N))
+    }
 }
 
 /// One BLAKE2s `G` mixing step on an 8-lane slice of the state.
 #[inline(always)]
-fn g8(v: &mut [u32x8; 16], a: usize, b: usize, c: usize, d: usize, x: u32x8, y: u32x8) {
+fn g8(
+    v: &mut [u32x8; 16],
+    rot: ByteRotations,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    x: u32x8,
+    y: u32x8,
+) {
     v[a] = v[a] + v[b] + x;
-    v[d] = rotate8::<16>(v[d] ^ v[a]);
+    v[d] = rot.rotate::<16>(v[d] ^ v[a]);
     v[c] += v[d];
-    v[b] = rotate8::<12>(v[b] ^ v[c]);
+    v[b] = rot.rotate::<12>(v[b] ^ v[c]);
     v[a] = v[a] + v[b] + y;
-    v[d] = rotate8::<8>(v[d] ^ v[a]);
+    v[d] = rot.rotate::<8>(v[d] ^ v[a]);
     v[c] += v[d];
-    v[b] = rotate8::<7>(v[b] ^ v[c]);
+    v[b] = rot.rotate::<7>(v[b] ^ v[c]);
 }
 
 /// One BLAKE2s round `R` on an 8-lane slice of the state.
 #[inline(always)]
-fn round8<const R: usize>(v: &mut [u32x8; 16], m: &[u32x8; 16]) {
+fn round8<const R: usize>(v: &mut [u32x8; 16], m: &[u32x8; 16], rot: ByteRotations) {
     let s = &SIGMA[R];
-    g8(v, 0, 4, 8, 12, m[s[0] as usize], m[s[1] as usize]);
-    g8(v, 1, 5, 9, 13, m[s[2] as usize], m[s[3] as usize]);
-    g8(v, 2, 6, 10, 14, m[s[4] as usize], m[s[5] as usize]);
-    g8(v, 3, 7, 11, 15, m[s[6] as usize], m[s[7] as usize]);
-    g8(v, 0, 5, 10, 15, m[s[8] as usize], m[s[9] as usize]);
-    g8(v, 1, 6, 11, 12, m[s[10] as usize], m[s[11] as usize]);
-    g8(v, 2, 7, 8, 13, m[s[12] as usize], m[s[13] as usize]);
-    g8(v, 3, 4, 9, 14, m[s[14] as usize], m[s[15] as usize]);
+    g8(v, rot, 0, 4, 8, 12, m[s[0] as usize], m[s[1] as usize]);
+    g8(v, rot, 1, 5, 9, 13, m[s[2] as usize], m[s[3] as usize]);
+    g8(v, rot, 2, 6, 10, 14, m[s[4] as usize], m[s[5] as usize]);
+    g8(v, rot, 3, 7, 11, 15, m[s[6] as usize], m[s[7] as usize]);
+    g8(v, rot, 0, 5, 10, 15, m[s[8] as usize], m[s[9] as usize]);
+    g8(v, rot, 1, 6, 11, 12, m[s[10] as usize], m[s[11] as usize]);
+    g8(v, rot, 2, 7, 8, 13, m[s[12] as usize], m[s[13] as usize]);
+    g8(v, rot, 3, 4, 9, 14, m[s[14] as usize], m[s[15] as usize]);
 }
 
 /// Compresses the low (`HI == false`) or high (`HI == true`) 8 of the 16 BLAKE2s instances.
@@ -430,16 +498,17 @@ fn compress16_8lane<const HI: bool>(
         u32x8::splat(IV[7]) ^ pick(lastnode),
     ];
 
-    round8::<0>(&mut v, &m);
-    round8::<1>(&mut v, &m);
-    round8::<2>(&mut v, &m);
-    round8::<3>(&mut v, &m);
-    round8::<4>(&mut v, &m);
-    round8::<5>(&mut v, &m);
-    round8::<6>(&mut v, &m);
-    round8::<7>(&mut v, &m);
-    round8::<8>(&mut v, &m);
-    round8::<9>(&mut v, &m);
+    let rot = ByteRotations::new();
+    round8::<0>(&mut v, &m, rot);
+    round8::<1>(&mut v, &m, rot);
+    round8::<2>(&mut v, &m, rot);
+    round8::<3>(&mut v, &m, rot);
+    round8::<4>(&mut v, &m, rot);
+    round8::<5>(&mut v, &m, rot);
+    round8::<6>(&mut v, &m, rot);
+    round8::<7>(&mut v, &m, rot);
+    round8::<8>(&mut v, &m, rot);
+    round8::<9>(&mut v, &m, rot);
 
     [
         h[0] ^ v[0] ^ v[8],

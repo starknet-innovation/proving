@@ -27,24 +27,29 @@ impl_field!(QM31, P4);
 impl_extension_field!(QM31, CM31);
 
 impl QM31 {
+    #[inline]
     pub const fn from_u32_unchecked(a: u32, b: u32, c: u32, d: u32) -> Self {
         Self(CM31::from_u32_unchecked(a, b), CM31::from_u32_unchecked(c, d))
     }
 
+    #[inline]
     pub const fn from_m31(a: M31, b: M31, c: M31, d: M31) -> Self {
         Self(CM31::from_m31(a, b), CM31::from_m31(c, d))
     }
 
+    #[inline]
     pub const fn from_m31_array(array: [M31; SECURE_EXTENSION_DEGREE]) -> Self {
         Self::from_m31(array[0], array[1], array[2], array[3])
     }
 
+    #[inline]
     pub const fn to_m31_array(self) -> [M31; SECURE_EXTENSION_DEGREE] {
         [self.0.0, self.0.1, self.1.0, self.1.1]
     }
 
     /// Returns the combined value, given the values of its composing base field polynomials at that
     /// point.
+    #[inline]
     pub fn from_partial_evals(evals: [Self; SECURE_EXTENSION_DEGREE]) -> Self {
         let mut res = evals[0];
         res += evals[1] * Self::from_u32_unchecked(0, 1, 0, 0);
@@ -55,6 +60,7 @@ impl QM31 {
 
     // Note: Adding this as a Mul impl drives rust insane, and it tries to infer Qm31*Qm31 as
     // QM31*CM31.
+    #[inline]
     pub fn mul_cm31(self, rhs: CM31) -> Self {
         Self(self.0 * rhs, self.1 * rhs)
     }
@@ -75,6 +81,7 @@ impl Debug for QM31 {
 impl Mul for QM31 {
     type Output = Self;
 
+    #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         // (a + bu) * (c + du) = (ac + rbd) + (ad + bc)u.
         Self(self.0 * rhs.0 + R * self.1 * rhs.1, self.0 * rhs.1 + self.1 * rhs.0)

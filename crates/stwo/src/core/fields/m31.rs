@@ -56,10 +56,12 @@ impl M31 {
     /// let val = (P as u64).pow(2) - 19;
     /// assert_eq!(M31::reduce(val), M31::from(P - 19));
     /// ```
+    #[inline]
     pub const fn reduce(val: u64) -> Self {
         Self((((((val >> MODULUS_BITS) + val + 1) >> MODULUS_BITS) + val) & (P as u64)) as u32)
     }
 
+    #[inline]
     pub const fn from_u32_unchecked(arg: u32) -> Self {
         Self(arg)
     }
@@ -79,6 +81,7 @@ impl Display for M31 {
 impl Add for M31 {
     type Output = Self;
 
+    #[inline]
     fn add(self, rhs: Self) -> Self::Output {
         Self::partial_reduce(self.0 + rhs.0)
     }
@@ -87,6 +90,7 @@ impl Add for M31 {
 impl Neg for M31 {
     type Output = Self;
 
+    #[inline]
     fn neg(self) -> Self::Output {
         Self::partial_reduce(P - self.0)
     }
@@ -95,6 +99,7 @@ impl Neg for M31 {
 impl Sub for M31 {
     type Output = Self;
 
+    #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
         Self::partial_reduce(self.0 + P - rhs.0)
     }
@@ -103,6 +108,7 @@ impl Sub for M31 {
 impl Mul for M31 {
     type Output = Self;
 
+    #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         Self::reduce((self.0 as u64) * (rhs.0 as u64))
     }
@@ -123,22 +129,26 @@ impl FieldExpOps for M31 {
 }
 
 impl ComplexConjugate for M31 {
+    #[inline]
     fn complex_conjugate(&self) -> Self {
         *self
     }
 }
 
 impl One for M31 {
+    #[inline]
     fn one() -> Self {
         Self(1)
     }
 }
 
 impl Zero for M31 {
+    #[inline]
     fn zero() -> Self {
         Self(0)
     }
 
+    #[inline]
     fn is_zero(&self) -> bool {
         *self == Self::zero()
     }
