@@ -22,11 +22,7 @@ pub fn packed_column_rows<const K: usize>(
     columns: &[circuit_common::preprocessed::ColumnRows<'_>; K],
     first: usize,
 ) -> [stwo::prover::backend::simd::m31::PackedM31; K] {
-    use stwo::core::fields::m31::M31;
-    use stwo::prover::backend::simd::m31::PackedM31;
-    std::array::from_fn(|k| {
-        PackedM31::from_array(std::array::from_fn(|lane| M31::from(columns[k].at(first + lane))))
-    })
+    std::array::from_fn(|k| columns[k].packed_m31_at(first))
 }
 
 /// The inputs of the packed row of rows `first..first + N_LANES`, packed as [`pack_values`] packs

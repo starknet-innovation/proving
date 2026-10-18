@@ -87,6 +87,7 @@ impl<const N: usize> LookupElements<N> {
         });
         Self { z, alpha, alpha_powers }
     }
+    #[inline(always)]
     pub fn combine<F: Clone, EF>(&self, values: &[F]) -> EF
     where
         EF: Clone + Zero + From<F> + From<SecureField> + Mul<F, Output = EF> + Sub<EF, Output = EF>,

@@ -525,9 +525,22 @@ impl CompactColumn {
         }
     }
 
-    /// The value at `row`, without any allocation.
-    #[inline]
+    /// The value at `row`, without any allocation. The narrow case, that of the address and
+    /// multiplicity columns the witness writers read per lane, is inlined into its reader; the
+    /// other kinds go through [`Self::at_other`], so the per-lane read is not an out-of-line call.
+    #[inline(always)]
     fn at(&self, row: usize) -> usize {
+        match self {
+            // A `u32` always fits a `usize` on the 64-bit targets this prover builds for; the
+            // conversion is the same as before, only no longer behind a call.
+            Self::Narrow(values) => usize::try_from(values[row]).expect("value originally fit usize"),
+            _ => self.at_other(row),
+        }
+    }
+
+    /// [`Self::at`] for the kinds other than `Narrow`.
+    #[inline(never)]
+    fn at_other(&self, row: usize) -> usize {
         match self {
             Self::Narrow(values) => usize::try_from(values[row]).expect("value originally fit usize"),
             Self::Wide(values) => values[row],
@@ -610,9 +623,27 @@ impl ColumnRows<'_> {
     }
 
     /// The value at `row`: `get_column(id)[row]`.
-    #[inline]
+    #[inline(always)]
     pub fn at(&self, row: usize) -> usize {
         self.0.at(row)
+    }
+
+    /// The packed field values of rows `first..first + N_LANES`: `M31::from` of [`Self::at`] in
+    /// each lane, loaded straight from the stored words of a narrow column (`M31::from(u32)` and
+    /// `M31::from(usize)` reduce a value that fits a `u32` alike).
+    #[cfg(feature = "prover")]
+    #[inline(always)]
+    pub fn packed_m31_at(&self, first: usize) -> PackedM31 {
+        match self.0 {
+            CompactColumn::Narrow(values) => {
+                let values: &[u32; N_LANES] =
+                    values[first..first + N_LANES].try_into().expect("N_LANES rows");
+                PackedM31::from_array(values.map(BaseField::from))
+            }
+            column => PackedM31::from_array(std::array::from_fn(|lane| {
+                BaseField::from(column.at(first + lane))
+            })),
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 use num_traits::Zero;
 use rayon::slice::{ParallelSlice, ParallelSliceMut};
 
+use circuit_common::preprocessed::ColumnRows;
+
 use crate::circuit_air::components::qm_31_ops::N_TRACE_COLUMNS;
 use crate::witness::components::prelude::*;
 
@@ -66,14 +68,14 @@ pub fn write_trace(
     context_values: &[QM31],
     preprocessed_trace: &PreProcessedTrace,
     trace_generator: &Qm31OpsTraceGenerator,
-) -> (ComponentTrace<N_TRACE_COLUMNS>, ComponentLogSize, LookupData) {
-    // Only the addresses and the multiplicities are read: the four flag columns are not part of
-    // this component's base trace (its AIR reads them from the preprocessed tree).
-    let column = |id: &str| preprocessed_trace.get_column(&PreProcessedColumnId { id: id.to_owned() });
+) -> (ComponentTrace<N_TRACE_COLUMNS>, ComponentLogSize) {
+    // Only the addresses are read, in place: the multiplicities are read by the interaction trace
+    // and the four flag columns are not part of this component's base trace (its AIR reads them
+    // from the preprocessed tree).
+    let column = |id: &str| preprocessed_trace.column_rows(&PreProcessedColumnId { id: id.to_owned() });
     let in0_address = column("qm31_ops_in0_address");
     let in1_address = column("qm31_ops_in1_address");
     let out_address = column("qm31_ops_out_address");
-    let mults = crate::witness::utils::pack_usize_column(&column("qm31_ops_mults"));
 
     let n_rows = in0_address.len();
     assert_eq!(n_rows, in1_address.len());
@@ -87,34 +89,28 @@ pub fn write_trace(
     assert!((n_rows - first_permutation_row).is_multiple_of(2));
     let log_size = n_rows.ilog2();
 
-    let (trace, lookup_data) = write_trace_simd(
+    let trace = write_trace_simd(
         context_values,
-        [&*in0_address, &*in1_address, &*out_address],
+        [&in0_address, &in1_address, &out_address],
         first_permutation_row,
-        mults,
     );
 
-    (trace, log_size, lookup_data)
+    (trace, log_size)
 }
 
 /// Writes the trace straight from the context values: each packed row gathers the operands of its
 /// rows exactly as [`extract_component_inputs`] would, packs them as `pack_values` would, and
 /// writes them in place, instead of collecting every row's operands into a vector and packing it
-/// into another (two copies of the 2^23-row component, 384 MiB each).
+/// into another (two copies of the 2^23-row component, 384 MiB each). The addresses are read from
+/// the preprocessed columns in place (omarespejel's in-place preprocessed reads, rgr1_3f4875e7).
 fn write_trace_simd(
     context_values: &[QM31],
-    [in0_address, in1_address, out_address]: [&[usize]; 3],
+    [in0_address, in1_address, out_address]: [&ColumnRows<'_>; 3],
     first_permutation_row: usize,
-    mults: Vec<PackedM31>,
-) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData) {
+) -> ComponentTrace<N_TRACE_COLUMNS> {
     let log_n_packed_rows = (in0_address.len() / N_LANES).ilog2();
     let log_size = log_n_packed_rows + LOG_N_LANES;
-    let (mut trace, mut lookup_data) = unsafe {
-        (
-            ComponentTrace::<N_TRACE_COLUMNS>::uninitialized(log_size),
-            LookupData::uninitialized(log_n_packed_rows),
-        )
-    };
+    let mut trace = unsafe { ComponentTrace::<N_TRACE_COLUMNS>::uninitialized(log_size) };
 
     let zero = QM31::zero().to_m31_array();
     // The operands of a row, as `extract_component_inputs` takes them: a permutation row (from
@@ -122,95 +118,89 @@ fn write_trace_simd(
     // first in1 address on the pair's first row and at its second out address on the second.
     let operands = |row: usize| -> InputType {
         if row < first_permutation_row {
-            [in0_address[row], in1_address[row], out_address[row]]
+            [in0_address.at(row), in1_address.at(row), out_address.at(row)]
                 .map(|address| context_values[address].to_m31_array())
         } else {
             let address = if (row - first_permutation_row).is_multiple_of(2) {
-                in1_address[row]
+                in1_address.at(row)
             } else {
-                out_address[row]
+                out_address.at(row)
             };
             let value = context_values[address].to_m31_array();
             [zero, value, value]
         }
     };
 
-    (trace.par_iter_mut(), lookup_data.par_iter_mut())
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(row_index, (row, lookup_data))| {
-            let packed: PackedInputType =
-                <InputType as Pack>::pack(from_fn(|lane| operands(row_index * N_LANES + lane)));
-            for column in 0..N_TRACE_COLUMNS {
-                *row[column] = packed[column / 4][column % 4];
-            }
-            *lookup_data.mults = mults[row_index];
-        });
+    trace.par_iter_mut().enumerate().for_each(|(row_index, row)| {
+        let packed: PackedInputType =
+            <InputType as Pack>::pack(from_fn(|lane| operands(row_index * N_LANES + lane)));
+        for column in 0..N_TRACE_COLUMNS {
+            *row[column] = packed[column / 4][column % 4];
+        }
+    });
 
-    (trace, lookup_data)
+    trace
 }
 
-/// The component's lookup data: its multiplicities. Its gate tuples (each address with the four
-/// coordinates of its value) are the preprocessed addresses and the component's trace columns,
-/// which [`write_interaction_trace`] reads back from the committed tree instead of their copy
-/// being kept through the base commit (realadii's qm31_ops read-back, rgr1_3c4bf108).
-#[derive(Uninitialized, IterMut, ParIterMut)]
-pub struct LookupData {
-    mults: Vec<PackedM31>,
-}
-
-/// `read_trace_columns(range)` reads back the component's trace columns `range` (the coordinates
-/// of `in_0`, `in_1` and `out` are columns 0 to 12), as committed: the eight of the inputs for
-/// the first logup column, then the four of the output for the second.
+/// The component keeps no lookup data: its gate tuples are the preprocessed addresses and the
+/// operands of its rows, gathered again from the context values at those addresses exactly as
+/// [`write_trace_simd`] gathers them for the trace (the committed columns hold the same values,
+/// which the previous version read back from the tree, re-evaluating their 12 columns), and its
+/// multiplicities the preprocessed `qm31_ops_mults`, all read in place (omarespejel,
+/// rgr1_3f4875e7).
 pub fn write_interaction_trace(
     log_size: u32,
-    lookup_data: LookupData,
-    read_trace_columns: &dyn Fn(std::ops::Range<usize>) -> Vec<Col<SimdBackend, M31>>,
+    context_values: &[QM31],
+    first_permutation_row: usize,
     preprocessed_trace: &PreProcessedTrace,
     common_lookup_elements: &relations::CommonLookupElements,
 ) -> (Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>, ClaimedSum) {
     let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(log_size) };
     let tag = PackedM31::broadcast(M31::from(relations::GATE_RELATION_ID));
-    let address = |id: &str| {
-        let column = preprocessed_trace.get_column(&PreProcessedColumnId { id: id.to_owned() });
-        Col::<SimdBackend, M31>::from_iter(column.iter().map(|&x| M31::from(x))).data
+    let column = |id: &str| preprocessed_trace.column_rows(&PreProcessedColumnId { id: id.to_owned() });
+    let [in0_address, in1_address, out_address, mults] = [
+        "qm31_ops_in0_address",
+        "qm31_ops_in1_address",
+        "qm31_ops_out_address",
+        "qm31_ops_mults",
+    ]
+    .map(column);
+    let zero = QM31::zero().to_m31_array();
+    // The operands `index` (in0, in1, out) of a row, as `write_trace_simd` takes them.
+    let operand = |row: usize, index: usize| -> [M31; 4] {
+        if row < first_permutation_row {
+            let address = [&in0_address, &in1_address, &out_address][index].at(row);
+            context_values[address].to_m31_array()
+        } else if index == 0 {
+            zero
+        } else {
+            let address = if (row - first_permutation_row).is_multiple_of(2) {
+                in1_address.at(row)
+            } else {
+                out_address.at(row)
+            };
+            context_values[address].to_m31_array()
+        }
     };
-    let [in0_address, in1_address, out_address] =
-        ["qm31_ops_in0_address", "qm31_ops_in1_address", "qm31_ops_out_address"].map(address);
-    let tuple = |columns: &[Col<SimdBackend, M31>], address: &[PackedM31], first: usize, row: usize| {
-        [
-            address[row],
-            columns[first].data[row],
-            columns[first + 1].data[row],
-            columns[first + 2].data[row],
-            columns[first + 3].data[row],
-        ]
+    let tuple = |address: &ColumnRows<'_>, index: usize, row: usize| {
+        let first = row * N_LANES;
+        let [a, b, c, d] = <[M31; 4] as Pack>::pack(from_fn(|lane| operand(first + lane, index)));
+        [tag, address.packed_m31_at(first), a, b, c, d]
     };
-    let inputs = read_trace_columns(0..8);
 
     // Sum logup terms in pairs, in one pass per column (fractions, inverses and the running sum
     // per chunk of rows).
     logup_gen.write_frac_cols(1, |_, row| {
-        let (values0, values1) =
-            (tuple(&inputs, &in0_address, 0, row), tuple(&inputs, &in1_address, 4, row));
-        let denom0: PackedQM31 = common_lookup_elements
-            .combine(&[tag, values0[0], values0[1], values0[2], values0[3], values0[4]]);
-        let denom1: PackedQM31 = common_lookup_elements
-            .combine(&[tag, values1[0], values1[1], values1[2], values1[3], values1[4]]);
+        let denom0: PackedQM31 = common_lookup_elements.combine(&tuple(&in0_address, 0, row));
+        let denom1: PackedQM31 = common_lookup_elements.combine(&tuple(&in1_address, 1, row));
         (denom0 + denom1, denom0 * denom1)
     });
-    drop(inputs);
 
     // Sum last logup term.
-    let outputs = read_trace_columns(8..12);
-    let mults = &lookup_data.mults;
     logup_gen.write_frac_cols(1, |_, row| {
-        let values = tuple(&outputs, &out_address, 0, row);
-        let denom = common_lookup_elements
-            .combine(&[tag, values[0], values[1], values[2], values[3], values[4]]);
-        (-PackedQM31::one() * mults[row], denom)
+        let denom = common_lookup_elements.combine(&tuple(&out_address, 2, row));
+        (-PackedQM31::one() * mults.packed_m31_at(row * N_LANES), denom)
     });
-    drop(outputs);
 
     let (trace, claimed_sum) = logup_gen.finalize_last();
 

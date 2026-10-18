@@ -36,6 +36,20 @@ impl ClaimGenerator {
             }
         });
     }
+
+    /// [`Self::add_packed_inputs`] (relation 0) of the values of lookup columns, each tuple's
+    /// last value, read in place and in one pass over the columns' rows.
+    pub fn add_lookup_columns<const K: usize>(&self, columns: [&[[PackedM31; 2]]; K]) {
+        let n_rows = columns[0].len();
+        assert!(columns.iter().all(|column| column.len() == n_rows));
+        (0..n_rows).into_par_iter().for_each(|row| {
+            for column in &columns {
+                for [idx] in [column[row][1]].unpack() {
+                    self.mults[0].increase_at(idx.0);
+                }
+            }
+        });
+    }
 }
 
 #[allow(clippy::useless_conversion)]
@@ -89,14 +103,13 @@ impl InteractionClaimGenerator {
         let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(LOG_SIZE) };
 
         // Sum last logup term.
-        let mut col_gen = logup_gen.new_col();
-        (col_gen.par_iter_mut(), &self.lookup_data.range_check_16_0, self.lookup_data.mults_0)
-            .into_par_iter()
-            .for_each(|(writer, values, mults_0)| {
-                let denom = common_lookup_elements.combine(values);
-                writer.write_frac(-PackedQM31::one() * mults_0, denom);
-            });
-        col_gen.finalize_col();
+        // In one pass per chunk of rows (fractions, inverses and the running sum), as the
+        // gate components' columns are written (omarespejel, rgr1_3f4875e7).
+        let lookup_data = &self.lookup_data;
+        logup_gen.write_frac_cols(1, |_, row| {
+            let denom = common_lookup_elements.combine(&lookup_data.range_check_16_0[row]);
+            (-PackedQM31::one() * lookup_data.mults_0[row], denom)
+        });
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
 

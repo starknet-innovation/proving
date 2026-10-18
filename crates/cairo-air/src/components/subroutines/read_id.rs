@@ -12,6 +12,7 @@ impl ReadId {
     #[allow(clippy::unused_unit)]
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn evaluate<E: EvalAtRow>(
         [read_id_input]: [E::F; 1],
         enabler: E::F,

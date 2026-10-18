@@ -12,6 +12,7 @@ impl VerifyTripleSum32 {
     #[allow(clippy::unused_unit)]
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn evaluate<E: EvalAtRow>(
         [
             verify_triple_sum_32_input_limb_0,

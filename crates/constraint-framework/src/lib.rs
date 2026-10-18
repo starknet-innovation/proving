@@ -250,6 +250,14 @@ where
 pub trait Relation<F: Clone, EF: RelationEFTraitBound<F>>: Sized {
     fn combine(&self, values: &[F]) -> EF;
 
+    /// The alpha powers and `z` that [`Self::combine`] uses, when it is
+    /// [`logup::LookupElements::combine`]; an evaluator may then combine the values in its own way
+    /// (the SIMD evaluator does it one coordinate at a time). `None` keeps [`Self::combine`].
+    #[inline(always)]
+    fn lookup_elements(&self) -> Option<(&[SecureField], SecureField)> {
+        None
+    }
+
     fn get_name(&self) -> &str;
     fn get_size(&self) -> usize;
 }
@@ -288,8 +296,19 @@ macro_rules! relation {
         }
 
         impl<F: Clone, EF: $crate::RelationEFTraitBound<F>> $crate::Relation<F, EF> for $name {
+            #[inline(always)]
             fn combine(&self, values: &[F]) -> EF {
                 self.0.combine(values)
+            }
+
+            #[inline(always)]
+            fn lookup_elements(
+                &self,
+            ) -> Option<(
+                &[stwo::core::fields::qm31::SecureField],
+                stwo::core::fields::qm31::SecureField,
+            )> {
+                Some((&self.0.alpha_powers, self.0.z))
             }
 
             fn get_name(&self) -> &str {

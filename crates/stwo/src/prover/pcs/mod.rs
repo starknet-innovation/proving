@@ -840,263 +840,266 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     ) -> Self {
         let _span = span!(Level::INFO, "Striped extension and Merkle").entered();
         // The witness and interaction writers leave freed temporaries in glibc's arenas: hand
-        // them back before the scratch of the commitment is taken.
-        crate::prover::backend::simd::column::trim_heap();
-        // Each stripe is committed as `2^sub` blocks, so that the scratch of every column is a
-        // block, not a stripe. The tree is the same: its leaves are rows.
-        // A tree that keeps its coefficients evaluates whole stripes: every block folds all of a
-        // column's coefficients again, which made its fill (at 2^23 circuit rows) about twice as
-        // slow as one FFT per stripe, and with the circuit's lookup data kept narrow its stripe
-        // scratch fits under the proof's peak. So does a tree whose whole-stripe scratch takes at
-        // most 2 GiB (the circuit's preprocessed tree, 1.5 GB, committed beside the Cairo proof
-        // far below the peak): its fill then costs no fold and it takes fewer cores from the
-        // Cairo proof.
-        let whole_stripe_scratch: usize =
-            polynomials.iter().map(|poly| 4usize << poly.log_size()).sum();
-        let sub = if keep_coef || whole_stripe_scratch <= 2 << 30 {
-            0
-        } else {
-            1u32.min(polynomials.iter().map(|poly| poly.log_size()).min().unwrap() - 4)
-        };
-        let n_stripes = 1usize << (log_blowup_factor + sub);
-        let stripe_lifting_log_size = lifting_log_size - log_blowup_factor - sub;
-        let domains = polynomials
-            .iter()
-            .map(|poly| CanonicCoset::new(poly.log_size() + log_blowup_factor).circle_domain())
-            .collect_vec();
-        let prefix = domains.iter().map(|&domain| keeps_prefix(domain, log_blowup_factor)).collect_vec();
-        // A prefix column with a source keeps nothing but the source: every stripe of it, stripe 0
-        // included, is hashed from its scratch column.
-        let sourced = prefix
-            .iter()
-            .zip(&sources)
-            .map(|(&prefix, source): (&bool, &Option<SharedTraceSource>)| {
-                prefix && !keep_coef && source.is_some()
-            })
-            .collect_vec();
-        // With `keep_coef`, a prefix column keeps its coefficients instead of stripe 0 (the same size):
-        // composition, the samples, the quotients (which combine the columns of a size before their
-        // transforms) and the decommitment read coefficients.
-        // Prefix columns get their stripe-0 buffer now (the last stripe hashed, which the FFT writes
-        // in place). Whole-extension columns are evaluated now.
-        let mut evals = polynomials
-            .iter()
-            .zip(&domains)
-            .zip(&prefix)
-            .zip(&sourced)
-            .map(|(((poly, &domain), &prefix), &sourced)| {
-                if (prefix && keep_coef) || sourced {
-                    Col::<B, BaseField>::zeros(0)
-                } else if prefix {
-                    base_column_pool.take_or_alloc(poly.log_size())
-                } else {
-                    let buffer = base_column_pool.take_or_alloc(domain.log_size());
-                    B::evaluate_into(poly, domain, twiddles, buffer).values
-                }
-            })
-            .collect_vec();
-        let mut scratch = polynomials
-            .iter()
-            .map(|poly| base_column_pool.take_or_alloc(poly.log_size() - sub))
-            .collect_vec();
-        let mut coeffs = polynomials.into_iter().map(Some).collect_vec();
-
-        // Stripe 0, the only one a prefix column keeps, last and in place.
-        let n_first = 1usize << sub;
-        let order = (n_first..n_stripes).chain(0..n_first).collect_vec();
-        let mut stripe_layers: Vec<Option<Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>>>> =
-            (0..n_stripes).map(|_| None).collect();
-        // A tree that keeps its coefficients and whose stripe scratch is small (the composition
-        // trees) fills and hashes several stripes at once: the stripes are independent, and one
-        // stripe of a few columns leaves most workers idle.
-        #[cfg(feature = "parallel")]
-        let batch = if keep_coef && sub == 0 {
-            (PARALLEL_STRIPES_SCRATCH_BYTES / whole_stripe_scratch.max(1)).clamp(1, n_stripes)
-        } else {
-            1
-        };
-        #[cfg(not(feature = "parallel"))]
-        let batch = 1;
-        if batch > 1 {
-            #[cfg(feature = "parallel")]
-            {
-                use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator};
-                let mut sets = vec![std::mem::take(&mut scratch)];
-                for _ in 1..batch {
-                    sets.push(
-                        coeffs
-                            .iter()
-                            .map(|poly| base_column_pool.take_or_alloc(poly.as_ref().unwrap().log_size()))
-                            .collect_vec(),
-                    );
-                }
-                for chunk in order.chunks(batch) {
-                    let layers: Vec<_> = chunk
-                        .par_iter()
-                        .zip(sets.par_iter_mut())
-                        .map(|(&stripe, set)| {
-                            set.par_iter_mut().enumerate().for_each(|(i, column)| {
-                                let poly = coeffs[i].as_ref().unwrap();
-                                if prefix[i] {
-                                    B::evaluate_block_into(
-                                        poly,
-                                        domains[i],
-                                        twiddles,
-                                        poly.log_size(),
-                                        stripe,
-                                        column,
-                                    );
-                                } else {
-                                    let len = 1usize << poly.log_size();
-                                    B::copy_block(&evals[i], stripe * len, column, 0, len);
-                                }
-                            });
-                            let columns = set.iter().sorted_by_key(|column| column.len()).collect_vec();
-                            B::build_layers_sparse(&columns, stripe_lifting_log_size)
-                        })
-                        .collect();
-                    for (&stripe, layers) in chunk.iter().zip(layers) {
-                        stripe_layers[stripe] = Some(layers);
-                    }
-                }
-                scratch = sets.swap_remove(0);
-                for set in sets {
-                    for (poly, column) in coeffs.iter().zip(set) {
-                        base_column_pool.give_back(poly.as_ref().unwrap().log_size(), column);
-                    }
-                }
-            }
-        } else {
-            for &stripe in &order {
-                if stripe == 0 && sub == 0 && !keep_coef {
-                    // Stripe 0 is written in place, so the prefix columns' scratch is dead: free it
-                    // first.
-                    for (i, column) in scratch.iter_mut().enumerate() {
-                        if prefix[i] && !sourced[i] {
-                            drop(std::mem::replace(column, Col::<B, BaseField>::zeros(0)));
-                        }
-                    }
-                    base_column_pool.release_all_idle();
-                }
-                let fill = |(((((poly, &domain), &prefix), &sourced), eval), column): (
-                    (
-                        (((&Option<CircleCoefficients<B>>, &CircleDomain), &bool), &bool),
-                        &mut Col<B, BaseField>,
-                    ),
-                    &mut Col<B, BaseField>,
-                )| {
-                    let poly = poly.as_ref().unwrap();
-                    let len = 1usize << (poly.log_size() - sub);
-                    if !prefix {
-                        B::copy_block(eval, stripe * len, column, 0, len);
-                    } else if keep_coef {
-                        B::evaluate_block_into(poly, domain, twiddles, poly.log_size() - sub, stripe, column);
-                    } else if sub > 0 {
-                        B::evaluate_block_into(poly, domain, twiddles, poly.log_size() - sub, stripe, column);
-                        if stripe < n_first && !sourced {
-                            B::copy_block(column, 0, eval, stripe * len, len);
-                        }
-                    } else if stripe == 0 && !sourced {
-                        B::evaluate_stripe_into(poly, domain, twiddles, 0, eval);
+        // them back beside the commitment (the trim runs on another worker).
+        crate::prover::backend::simd::column::beside_trim_heap(move || {
+            // Each stripe is committed as `2^sub` blocks, so that the scratch of every column is a
+            // block, not a stripe. The tree is the same: its leaves are rows.
+            // A tree that keeps its coefficients evaluates whole stripes: every block folds all of a
+            // column's coefficients again, which made its fill (at 2^23 circuit rows) about twice as
+            // slow as one FFT per stripe, and with the circuit's lookup data kept narrow its stripe
+            // scratch fits under the proof's peak. So does a tree whose whole-stripe scratch takes at
+            // most 2 GiB (the circuit's preprocessed tree, 1.5 GB, committed beside the Cairo proof
+            // far below the peak): its fill then costs no fold and it takes fewer cores from the
+            // Cairo proof.
+            let whole_stripe_scratch: usize =
+                polynomials.iter().map(|poly| 4usize << poly.log_size()).sum();
+            let sub = if keep_coef || whole_stripe_scratch <= 2 << 30 {
+                0
+            } else {
+                1u32.min(polynomials.iter().map(|poly| poly.log_size()).min().unwrap() - 4)
+            };
+            let n_stripes = 1usize << (log_blowup_factor + sub);
+            let stripe_lifting_log_size = lifting_log_size - log_blowup_factor - sub;
+            let domains = polynomials
+                .iter()
+                .map(|poly| CanonicCoset::new(poly.log_size() + log_blowup_factor).circle_domain())
+                .collect_vec();
+            let prefix = domains.iter().map(|&domain| keeps_prefix(domain, log_blowup_factor)).collect_vec();
+            // A prefix column with a source keeps nothing but the source: every stripe of it, stripe 0
+            // included, is hashed from its scratch column.
+            let sourced = prefix
+                .iter()
+                .zip(&sources)
+                .map(|(&prefix, source): (&bool, &Option<SharedTraceSource>)| {
+                    prefix && !keep_coef && source.is_some()
+                })
+                .collect_vec();
+            // With `keep_coef`, a prefix column keeps its coefficients instead of stripe 0 (the same size):
+            // composition, the samples, the quotients (which combine the columns of a size before their
+            // transforms) and the decommitment read coefficients.
+            // Prefix columns get their stripe-0 buffer now (the last stripe hashed, which the FFT writes
+            // in place). Whole-extension columns are evaluated now.
+            let mut evals = polynomials
+                .iter()
+                .zip(&domains)
+                .zip(&prefix)
+                .zip(&sourced)
+                .map(|(((poly, &domain), &prefix), &sourced)| {
+                    if (prefix && keep_coef) || sourced {
+                        Col::<B, BaseField>::zeros(0)
+                    } else if prefix {
+                        base_column_pool.take_or_alloc(poly.log_size())
                     } else {
-                        B::evaluate_stripe_into(poly, domain, twiddles, stripe, column);
+                        let buffer = base_column_pool.take_or_alloc(domain.log_size());
+                        B::evaluate_into(poly, domain, twiddles, buffer).values
                     }
-                };
-                #[cfg(feature = "parallel")]
-                {
-                    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator};
-                    coeffs
-                        .par_iter()
-                        .zip(domains.par_iter())
-                        .zip(prefix.par_iter())
-                        .zip(sourced.par_iter())
-                        .zip(evals.par_iter_mut())
-                        .zip(scratch.par_iter_mut())
-                        .for_each(fill);
-                }
-                #[cfg(not(feature = "parallel"))]
-                coeffs
-                    .iter()
-                    .zip(&domains)
-                    .zip(&prefix)
-                    .zip(&sourced)
-                    .zip(evals.iter_mut())
-                    .zip(scratch.iter_mut())
-                    .for_each(fill);
-                let columns = (0..coeffs.len())
-                    .map(|i| {
-                        if prefix[i] && !sourced[i] && stripe == 0 && sub == 0 && !keep_coef {
-                            &evals[i]
-                        } else {
-                            &scratch[i]
-                        }
-                    })
-                    .sorted_by_key(|column| column.len())
-                    .collect_vec();
-                stripe_layers[stripe] = Some(B::build_layers_sparse(&columns, stripe_lifting_log_size));
-            }
-        }
-        // A prefix column's coefficients are regrown from stripe 0 where they are needed (the
-        // out-of-domain samples, composition and the decommitment), one column or tree at a time.
-        let log_sizes = coeffs.iter().map(|poly| poly.as_ref().unwrap().log_size()).collect_vec();
-        for (poly, &prefix) in coeffs.iter_mut().zip(&prefix) {
-            if prefix && !keep_coef {
-                drop(poly.take());
-            }
-        }
-        for (&log_size, column) in log_sizes.iter().zip(scratch) {
-            if column.len() == 1 << (log_size - sub) {
-                base_column_pool.give_back(log_size - sub, column);
-            }
-        }
-        base_column_pool.release_all_idle();
-        crate::prover::backend::simd::column::trim_heap();
-        let stripe_layers = stripe_layers.into_iter().map(Option::unwrap).collect_vec();
+                })
+                .collect_vec();
+            let mut scratch = polynomials
+                .iter()
+                .map(|poly| base_column_pool.take_or_alloc(poly.log_size() - sub))
+                .collect_vec();
+            let mut coeffs = polynomials.into_iter().map(Some).collect_vec();
 
-        // Level `l` of the tree, up to the stripes' roots, is the concatenation of the stripes'
-        // levels `l`, in stripe order: gathered at its final size, on the pool.
-        let gather = |level: usize| -> Col<B, <MC::H as MerkleHasherLifted>::Hash> {
-            let parts = stripe_layers.iter().map(|layers| &layers[level]).collect_vec();
-            let len = parts[0].len();
-            let at = |i: usize| parts[i / len].at(i % len);
+            // Stripe 0, the only one a prefix column keeps, last and in place.
+            let n_first = 1usize << sub;
+            let order = (n_first..n_stripes).chain(0..n_first).collect_vec();
+            let mut stripe_layers: Vec<Option<Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>>>> =
+                (0..n_stripes).map(|_| None).collect();
+            // A tree that keeps its coefficients and whose stripe scratch is small (the composition
+            // trees) fills and hashes several stripes at once: the stripes are independent, and one
+            // stripe of a few columns leaves most workers idle.
             #[cfg(feature = "parallel")]
-            let values: Vec<_> = {
-                use rayon::iter::IntoParallelIterator;
-                (0..parts.len() * len).into_par_iter().map(at).collect()
+            let batch = if keep_coef && sub == 0 {
+                (PARALLEL_STRIPES_SCRATCH_BYTES / whole_stripe_scratch.max(1)).clamp(1, n_stripes)
+            } else {
+                1
             };
             #[cfg(not(feature = "parallel"))]
-            let values: Vec<_> = (0..parts.len() * len).map(at).collect();
-            values.into_iter().collect()
-        };
-        let mut layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> =
-            (0..=stripe_lifting_log_size as usize).map(gather).collect();
-        drop(stripe_layers);
-        for _ in stripe_lifting_log_size..lifting_log_size {
-            let next = B::build_next_layer(layers.last().unwrap());
-            layers.push(next);
-        }
-        layers.reverse();
-
-        let polynomials = coeffs
-            .into_iter()
-            .zip(domains)
-            .zip(evals)
-            .zip(sources.into_iter().zip(sourced))
-            .map(|(((coeffs, domain), values), (source, sourced))| {
-                if sourced {
-                    return Poly::from_source(domain, source.unwrap());
+            let batch = 1;
+            if batch > 1 {
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator};
+                    let mut sets = vec![std::mem::take(&mut scratch)];
+                    for _ in 1..batch {
+                        sets.push(
+                            coeffs
+                                .iter()
+                                .map(|poly| base_column_pool.take_or_alloc(poly.as_ref().unwrap().log_size()))
+                                .collect_vec(),
+                        );
+                    }
+                    for chunk in order.chunks(batch) {
+                        let layers: Vec<_> = chunk
+                            .par_iter()
+                            .zip(sets.par_iter_mut())
+                            .map(|(&stripe, set)| {
+                                set.par_iter_mut().enumerate().for_each(|(i, column)| {
+                                    let poly = coeffs[i].as_ref().unwrap();
+                                    if prefix[i] {
+                                        B::evaluate_block_into(
+                                            poly,
+                                            domains[i],
+                                            twiddles,
+                                            poly.log_size(),
+                                            stripe,
+                                            column,
+                                        );
+                                    } else {
+                                        let len = 1usize << poly.log_size();
+                                        B::copy_block(&evals[i], stripe * len, column, 0, len);
+                                    }
+                                });
+                                let columns = set.iter().sorted_by_key(|column| column.len()).collect_vec();
+                                B::build_layers_sparse(&columns, stripe_lifting_log_size)
+                            })
+                            .collect();
+                        for (&stripe, layers) in chunk.iter().zip(layers) {
+                            stripe_layers[stripe] = Some(layers);
+                        }
+                    }
+                    scratch = sets.swap_remove(0);
+                    for set in sets {
+                        for (poly, column) in coeffs.iter().zip(set) {
+                            base_column_pool.give_back(poly.as_ref().unwrap().log_size(), column);
+                        }
+                    }
                 }
-                // (A column that kept its coefficients holds no evaluation yet.)
-                let mut evals = CircleEvaluation::new(
-                    CanonicCoset::new(1).circle_domain(),
-                    Col::<B, BaseField>::zeros(2),
-                );
-                evals.values = values;
-                evals.domain = domain;
-                Poly::new(coeffs, evals)
+            } else {
+                for &stripe in &order {
+                    if stripe == 0 && sub == 0 && !keep_coef {
+                        // Stripe 0 is written in place, so the prefix columns' scratch is dead: free it
+                        // first.
+                        for (i, column) in scratch.iter_mut().enumerate() {
+                            if prefix[i] && !sourced[i] {
+                                drop(std::mem::replace(column, Col::<B, BaseField>::zeros(0)));
+                            }
+                        }
+                        base_column_pool.release_all_idle();
+                    }
+                    let fill = |(((((poly, &domain), &prefix), &sourced), eval), column): (
+                        (
+                            (((&Option<CircleCoefficients<B>>, &CircleDomain), &bool), &bool),
+                            &mut Col<B, BaseField>,
+                        ),
+                        &mut Col<B, BaseField>,
+                    )| {
+                        let poly = poly.as_ref().unwrap();
+                        let len = 1usize << (poly.log_size() - sub);
+                        if !prefix {
+                            B::copy_block(eval, stripe * len, column, 0, len);
+                        } else if keep_coef {
+                            B::evaluate_block_into(poly, domain, twiddles, poly.log_size() - sub, stripe, column);
+                        } else if sub > 0 {
+                            B::evaluate_block_into(poly, domain, twiddles, poly.log_size() - sub, stripe, column);
+                            if stripe < n_first && !sourced {
+                                B::copy_block(column, 0, eval, stripe * len, len);
+                            }
+                        } else if stripe == 0 && !sourced {
+                            B::evaluate_stripe_into(poly, domain, twiddles, 0, eval);
+                        } else {
+                            B::evaluate_stripe_into(poly, domain, twiddles, stripe, column);
+                        }
+                    };
+                    #[cfg(feature = "parallel")]
+                    {
+                        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator};
+                        coeffs
+                            .par_iter()
+                            .zip(domains.par_iter())
+                            .zip(prefix.par_iter())
+                            .zip(sourced.par_iter())
+                            .zip(evals.par_iter_mut())
+                            .zip(scratch.par_iter_mut())
+                            .for_each(fill);
+                    }
+                    #[cfg(not(feature = "parallel"))]
+                    coeffs
+                        .iter()
+                        .zip(&domains)
+                        .zip(&prefix)
+                        .zip(&sourced)
+                        .zip(evals.iter_mut())
+                        .zip(scratch.iter_mut())
+                        .for_each(fill);
+                    let columns = (0..coeffs.len())
+                        .map(|i| {
+                            if prefix[i] && !sourced[i] && stripe == 0 && sub == 0 && !keep_coef {
+                                &evals[i]
+                            } else {
+                                &scratch[i]
+                            }
+                        })
+                        .sorted_by_key(|column| column.len())
+                        .collect_vec();
+                    stripe_layers[stripe] = Some(B::build_layers_sparse(&columns, stripe_lifting_log_size));
+                }
+            }
+            // A prefix column's coefficients are regrown from stripe 0 where they are needed (the
+            // out-of-domain samples, composition and the decommitment), one column or tree at a time.
+            let log_sizes = coeffs.iter().map(|poly| poly.as_ref().unwrap().log_size()).collect_vec();
+            for (poly, &prefix) in coeffs.iter_mut().zip(&prefix) {
+                if prefix && !keep_coef {
+                    drop(poly.take());
+                }
+            }
+            for (&log_size, column) in log_sizes.iter().zip(scratch) {
+                if column.len() == 1 << (log_size - sub) {
+                    base_column_pool.give_back(log_size - sub, column);
+                }
+            }
+            base_column_pool.release_all_idle();
+            // The second trim runs beside the gather of the upper levels.
+            crate::prover::backend::simd::column::beside_trim_heap(move || {
+                let stripe_layers = stripe_layers.into_iter().map(Option::unwrap).collect_vec();
+
+                // Level `l` of the tree, up to the stripes' roots, is the concatenation of the stripes'
+                // levels `l`, in stripe order: gathered at its final size, on the pool.
+                let gather = |level: usize| -> Col<B, <MC::H as MerkleHasherLifted>::Hash> {
+                    let parts = stripe_layers.iter().map(|layers| &layers[level]).collect_vec();
+                    let len = parts[0].len();
+                    let at = |i: usize| parts[i / len].at(i % len);
+                    #[cfg(feature = "parallel")]
+                    let values: Vec<_> = {
+                        use rayon::iter::IntoParallelIterator;
+                        (0..parts.len() * len).into_par_iter().map(at).collect()
+                    };
+                    #[cfg(not(feature = "parallel"))]
+                    let values: Vec<_> = (0..parts.len() * len).map(at).collect();
+                    values.into_iter().collect()
+                };
+                let mut layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> =
+                    (0..=stripe_lifting_log_size as usize).map(gather).collect();
+                drop(stripe_layers);
+                for _ in stripe_lifting_log_size..lifting_log_size {
+                    let next = B::build_next_layer(layers.last().unwrap());
+                    layers.push(next);
+                }
+                layers.reverse();
+
+                let polynomials = coeffs
+                    .into_iter()
+                    .zip(domains)
+                    .zip(evals)
+                    .zip(sources.into_iter().zip(sourced))
+                    .map(|(((coeffs, domain), values), (source, sourced))| {
+                        if sourced {
+                            return Poly::from_source(domain, source.unwrap());
+                        }
+                        // (A column that kept its coefficients holds no evaluation yet.)
+                        let mut evals = CircleEvaluation::new(
+                            CanonicCoset::new(1).circle_domain(),
+                            Col::<B, BaseField>::zeros(2),
+                        );
+                        evals.values = values;
+                        evals.domain = domain;
+                        Poly::new(coeffs, evals)
+                    })
+                    .collect();
+                CommitmentTreeProver { polynomials, commitment: MerkleProverLifted { layers } }
             })
-            .collect();
-        CommitmentTreeProver { polynomials, commitment: MerkleProverLifted { layers } }
+        })
     }
 
     /// Whether the tree was committed by [`Self::new_striped`] with a column that keeps only a

@@ -143,7 +143,8 @@ where
     commitment_scheme.commit_tree(preprocessed_tree, channel);
 
     // A context released at padding hands its values over instead of `values` (see
-    // `FinalizedContext::release_on_padding`); they are freed once the base trace is written.
+    // `FinalizedContext::release_on_padding`); they are freed once the interaction trace is
+    // written.
     let released_values =
         if values.is_empty() { circuits::ivalue::take_released_values() } else { None };
     let values = released_values.as_deref().unwrap_or(values);
@@ -166,7 +167,6 @@ where
     );
     mix_circuit_hash(channel, &circuit_hash);
     claim.mix_into(channel);
-    drop(released_values);
     tree_builder.commit(channel);
 
     // Draw interaction elements.
@@ -179,10 +179,16 @@ where
     let interaction_claim = write_interaction_trace(
         &component_log_sizes,
         interaction_generator,
+        values,
+        *first_permutation_row,
         &mut tree_builder,
         &interaction_elements,
         twiddles,
     );
+
+    // The qm31_ops interaction trace gathered its operands from the values again (instead of
+    // re-evaluating its committed columns); they are not read after it.
+    drop(released_values);
 
     // Validate lookup argument.
     assert_eq!(lookup_sum(&claim, &interaction_claim, &interaction_elements), QM31::zero());

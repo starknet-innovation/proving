@@ -55,6 +55,19 @@ pub fn trim_heap() {
     malloc_trim(0);
 }
 
+/// Runs `f` with [`trim_heap`] beside it on rayon's pool, so that the trim, which walks every
+/// arena and hands its free pages back one system call at a time (about 70 ms over a privacy
+/// proof, on one core while the others waited), overlaps `f` instead of running ahead of it.
+pub fn beside_trim_heap<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    #[cfg(feature = "parallel")]
+    return rayon::join(f, trim_heap).0;
+    #[cfg(not(feature = "parallel"))]
+    {
+        trim_heap();
+        f()
+    }
+}
+
 /// Advises the kernel about a large buffer: `MADV_HUGEPAGE` on the whole pages it covers, so that
 /// transparent huge pages back it where the kernel allows them, and with `populate` also
 /// `MADV_POPULATE_WRITE`, which maps all of its pages in one call instead of one fault per page.

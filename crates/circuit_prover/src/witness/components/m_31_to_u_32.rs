@@ -55,17 +55,16 @@ pub fn write_trace(
         (m31_input, UInt32::from(m31_input.0))
     };
 
-    let (trace, lookup_data, sub_component_inputs) = write_trace_simd(n_rows, input, &columns);
-    for inputs in sub_component_inputs.range_check_16 {
-        range_check_16_state.add_packed_inputs(&inputs, 0);
-    }
+    let (trace, lookup_data) = write_trace_simd(n_rows, input, &columns);
+    // The range-checked values are counted straight from the lookup tuples, the three columns in
+    // one pass, instead of from a staged copy of them (omarespejel, rgr1_3f4875e7).
+    range_check_16_state.add_lookup_columns([
+        &lookup_data.range_check_16_0[..],
+        &lookup_data.range_check_16_1[..],
+        &lookup_data.range_check_16_2[..],
+    ]);
 
     (trace, Claim { log_size }, InteractionClaimGenerator { log_size, lookup_data })
-}
-
-#[derive(Uninitialized, IterMut, ParIterMut)]
-struct SubComponentInputs {
-    range_check_16: [Vec<range_check_16::PackedInputType>; 3],
 }
 
 #[allow(clippy::useless_conversion)]
@@ -76,14 +75,13 @@ fn write_trace_simd(
     n_rows: usize,
     input: impl Fn(usize) -> InputType + Sync,
     columns: &[circuit_common::preprocessed::ColumnRows<'_>; 3],
-) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData, SubComponentInputs) {
+) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData) {
     let log_n_packed_rows = (n_rows / N_LANES).ilog2();
     let log_size = log_n_packed_rows + LOG_N_LANES;
-    let (mut trace, mut lookup_data, mut sub_component_inputs) = unsafe {
+    let (mut trace, mut lookup_data) = unsafe {
         (
             ComponentTrace::<N_TRACE_COLUMNS>::uninitialized(log_size),
             LookupData::uninitialized(log_n_packed_rows),
-            SubComponentInputs::uninitialized(log_n_packed_rows),
         )
     };
 
@@ -93,15 +91,11 @@ fn write_trace_simd(
     let M31_32767 = PackedM31::broadcast(M31::from(32767));
     let M31_378353459 = PackedM31::broadcast(M31::from(378353459));
 
-    (
-        trace.par_iter_mut(),
-        lookup_data.par_iter_mut(),
-        sub_component_inputs.par_iter_mut(),
-    )
+    (trace.par_iter_mut(), lookup_data.par_iter_mut())
         .into_par_iter()
         .enumerate()
         .for_each(
-            |(row_index, (row, lookup_data, sub_component_inputs))| {
+            |(row_index, (row, lookup_data))| {
                 let first = row_index * N_LANES;
                 let m_31_to_u_32_input: PackedInputType =
                     crate::witness::utils::packed_input(&input, first);
@@ -113,11 +107,8 @@ fn write_trace_simd(
                 *row[1] = input_u32_limb_0_col1;
                 let input_u32_limb_1_col2 = m_31_to_u_32_input.1.high().as_m31();
                 *row[2] = input_u32_limb_1_col2;
-                *sub_component_inputs.range_check_16[0] = [input_u32_limb_0_col1];
                 *lookup_data.range_check_16_0 = [M31_1008385708, input_u32_limb_0_col1];
-                *sub_component_inputs.range_check_16[1] = [input_u32_limb_1_col2];
                 *lookup_data.range_check_16_1 = [M31_1008385708, input_u32_limb_1_col2];
-                *sub_component_inputs.range_check_16[2] = [((M31_32767) - (input_u32_limb_1_col2))];
                 *lookup_data.range_check_16_2 =
                     [M31_1008385708, ((M31_32767) - (input_u32_limb_1_col2))];
                 let input_is_zero_tmp_c1f7a_0 = M31_0.eq(input_m31_col0);
@@ -135,7 +126,7 @@ fn write_trace_simd(
             },
         );
 
-    (trace, lookup_data, sub_component_inputs)
+    (trace, lookup_data)
 }
 
 #[derive(Uninitialized, IterMut, ParIterMut)]

@@ -140,18 +140,13 @@ impl InteractionClaimGenerator {
         let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(LOG_SIZE) };
 
         // Sum last logup term.
-        let mut col_gen = logup_gen.new_col();
-        (
-            col_gen.par_iter_mut(),
-            &self.lookup_data.verify_bitwise_xor_9_0,
-            self.lookup_data.mults_0,
-        )
-            .into_par_iter()
-            .for_each(|(writer, values, mults_0)| {
-                let denom = common_lookup_elements.combine(values);
-                writer.write_frac(-PackedQM31::one() * mults_0, denom);
-            });
-        col_gen.finalize_col();
+        // In one pass per chunk of rows (fractions, inverses and the running sum), as the
+        // gate components' columns are written (omarespejel, rgr1_3f4875e7).
+        let lookup_data = &self.lookup_data;
+        logup_gen.write_frac_cols(1, |_, row| {
+            let denom = common_lookup_elements.combine(&lookup_data.verify_bitwise_xor_9_0[row]);
+            (-PackedQM31::one() * lookup_data.mults_0[row], denom)
+        });
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
 

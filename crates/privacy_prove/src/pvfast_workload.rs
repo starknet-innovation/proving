@@ -65,57 +65,46 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
     // The circuit's preprocessing and its committed tree (both built on first use, see
     // `LazyPreprocessedCircuit`) are independent of the Cairo proof and are needed only by the
     // circuit proof: they are built beside the Cairo proof, whose witness windows leave workers
-    // idle, instead of beside the verifier-circuit fill, which they outlast.
-    let (cairo_proof, ()) = rayon::join(
-        || {
-            prove_cairo_with_precompute(
+    // idle, and the tree, when it outlasts the Cairo proof, beside the verifier-circuit fill (which
+    // is mostly sequential) instead of ahead of it.
+    let (filled, ()) = rayon::join(
+        || -> Result<_> {
+            let cairo_proof = prove_cairo_with_precompute(
                 &precomputes.base_column_pool,
                 &precomputes.twiddles,
                 precomputes.cairo_preprocessed_trace.clone(),
                 MaybeOwned::Borrowed(&precomputes.cairo_preprocessed_tree),
                 prover_input,
                 CAIRO_PROVER_PARAMS,
-            )
-        },
-        || {
-            let _ = &**precomputes.circuit_preprocessed_tree;
-        },
-    );
-    let cairo_proof = cairo_proof.map_err(|e| anyhow!("cairo proof failed: {e:?}"))?;
-    eprintln!("pvfast-phase cairo_to_circuit");
-    let component_enable_bits = cairo_proof.claim.flatten_claim().component_enable_bits;
-    let zk_blinding_seed = cairo_proof.extended_stark_proof.proof.commitments.0[1].0;
-    let (proof, aux) = prepare_cairo_proof_for_circuit_verifier(&cairo_proof, &component_enable_bits);
-    // Everything the circuit proof needs from the Cairo proof is in `proof`, `aux` and the seed.
-    drop(cairo_proof);
-    let output_hash = compute_privacy_bootloader_output_hash(output_preimage);
-    eprintln!("pvfast-phase verifier_fill");
-    // The circuit's preprocessing and its committed tree (both built on first use, see
-    // `LazyPreprocessedCircuit`) are built while the verifier circuit is filled: they are
-    // independent of it, and the fill is mostly sequential, so the tree's commitment runs on the
-    // workers the fill leaves idle.
-    let (mut context, ()) = rayon::join(
-        || {
+            );
+            let cairo_proof = cairo_proof.map_err(|e| anyhow!("cairo proof failed: {e:?}"))?;
+            eprintln!("pvfast-phase cairo_to_circuit");
+            let component_enable_bits = cairo_proof.claim.flatten_claim().component_enable_bits;
+            let zk_blinding_seed = cairo_proof.extended_stark_proof.proof.commitments.0[1].0;
+            let (proof, aux) =
+                prepare_cairo_proof_for_circuit_verifier(&cairo_proof, &component_enable_bits);
+            // Everything the circuit proof needs from the Cairo proof is in `proof`, `aux` and the
+            // seed.
+            drop(cairo_proof);
+            let output_hash = compute_privacy_bootloader_output_hash(output_preimage);
+            eprintln!("pvfast-phase verifier_fill");
             // The circuit's variable count is known from its preprocessing (built beside the Cairo
             // proof): the fill reserves its values once.
-            build_and_fill_cairo_verifier_circuit_with_capacity(
+            let context = build_and_fill_cairo_verifier_circuit_with_capacity(
                 &precomputes.cairo_verifier_config,
                 proof,
                 aux,
                 output_hash,
                 precomputes.preprocessed_circuit.n_vars,
                 &precomputes.preprocessed_circuit.gate_counts,
-            )
+            );
+            Ok((context, zk_blinding_seed))
         },
         || {
             let _ = &**precomputes.circuit_preprocessed_tree;
-            // The columns the base trace's first writers read are built here, on the workers the
-            // fill leaves idle, instead of one after the other once it is done.
-            circuit_prover::witness::trace::warm_writer_columns(
-                &precomputes.preprocessed_circuit.preprocessed_trace,
-            );
         },
     );
+    let (mut context, zk_blinding_seed) = filled?;
     eprintln!("pvfast-phase validity_check");
     ensure!(context.is_circuit_valid(), "Circuit is not valid");
     eprintln!("pvfast-phase blinding_padding");

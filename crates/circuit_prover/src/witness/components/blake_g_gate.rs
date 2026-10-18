@@ -143,7 +143,8 @@ pub fn write_trace(
 
     let (trace, lookup_data) = write_trace_simd(n_rows, input, &columns);
     // The small xor tables count their rows per task from the narrow tuples, every column of a
-    // table in one pass (see `count_table_rows`); the 2^24-row xor_12 table keeps its atomic adds.
+    // table in one pass (see `count_table_rows`); the 2^24-row xor_12 table keeps its atomic adds,
+    // from the narrow tuples widened in turn.
     let d = &lookup_data;
     verify_bitwise_xor_8_state.add_counted_inputs(
         &[
@@ -158,8 +159,10 @@ pub fn write_trace(
         ],
         Widen::widen,
     );
-    verify_bitwise_xor_12_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_12_0), 0);
-    verify_bitwise_xor_12_state.add_packed_inputs(&widen_all(&lookup_data.verify_bitwise_xor_12_1), 0);
+    verify_bitwise_xor_12_state.add_widened_inputs(
+        [&d.verify_bitwise_xor_12_0[..], &d.verify_bitwise_xor_12_1[..]],
+        Widen::widen,
+    );
     verify_bitwise_xor_4_state.add_counted_inputs(
         &[(&d.verify_bitwise_xor_4_0[..], 0), (&d.verify_bitwise_xor_4_1[..], 0)],
         Widen::widen,
@@ -690,11 +693,6 @@ impl Widen for NarrowTriple {
     fn widen(&self) -> [PackedM31; 3] {
         self.0.map(widen_lanes)
     }
-}
-
-/// The tuples of a column, as written, for the xor states to read.
-fn widen_all(column: &[NarrowTriple]) -> Vec<[PackedM31; 3]> {
-    column.par_iter().map(Widen::widen).collect()
 }
 
 pub struct InteractionClaimGenerator {

@@ -44,15 +44,35 @@ impl ClaimGenerator {
     }
 
     pub fn add_packed_inputs(&self, packed_inputs: &[PackedInputType], _relation_index: usize) {
-        packed_inputs.into_par_iter().for_each(|packed_input| {
-            let [a, b] = [packed_input[0].into_simd(), packed_input[1].into_simd()];
-            let mask = std::simd::Simd::splat((1 << LIMB_BITS) - 1);
-            let column_index = ((a >> LIMB_BITS) << EXPAND_BITS) + (b >> LIMB_BITS);
-            let row_index = ((a & mask) << LIMB_BITS) + (b & mask);
-            for (column, row) in column_index.to_array().into_iter().zip(row_index.to_array()) {
-                self.mults[column as usize].increase_at(row);
+        packed_inputs.into_par_iter().for_each(|packed_input| self.add_packed_input(packed_input));
+    }
+
+    /// [`Self::add_packed_inputs`] of the tuples of several columns that `widen` turns into packed
+    /// inputs, each widened in turn instead of into a copy of its column, in one pass over the
+    /// columns' rows (omarespejel, rgr1_3f4875e7).
+    pub fn add_widened_inputs<T: Sync, const K: usize>(
+        &self,
+        columns: [&[T]; K],
+        widen: impl Fn(&T) -> PackedInputType + Sync,
+    ) {
+        let n_rows = columns[0].len();
+        assert!(columns.iter().all(|column| column.len() == n_rows));
+        (0..n_rows).into_par_iter().for_each(|row| {
+            for column in &columns {
+                self.add_packed_input(&widen(&column[row]));
             }
         });
+    }
+
+    #[inline]
+    fn add_packed_input(&self, packed_input: &PackedInputType) {
+        let [a, b] = [packed_input[0].into_simd(), packed_input[1].into_simd()];
+        let mask = std::simd::Simd::splat((1 << LIMB_BITS) - 1);
+        let column_index = ((a >> LIMB_BITS) << EXPAND_BITS) + (b >> LIMB_BITS);
+        let row_index = ((a & mask) << LIMB_BITS) + (b & mask);
+        for (column, row) in column_index.to_array().into_iter().zip(row_index.to_array()) {
+            self.mults[column as usize].increase_at(row);
+        }
     }
 }
 

@@ -12,6 +12,7 @@ impl BitwiseXorNumBits7 {
     #[allow(clippy::unused_unit)]
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn evaluate<E: EvalAtRow>(
         [bitwise_xor_num_bits_7_input_limb_0, bitwise_xor_num_bits_7_input_limb_1]: [E::F; 2],
         enabler: E::F,

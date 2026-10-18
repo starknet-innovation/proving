@@ -14,6 +14,7 @@ impl MemVerify {
     #[allow(clippy::unused_unit)]
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn evaluate<E: EvalAtRow>(
         [
             mem_verify_input_address,

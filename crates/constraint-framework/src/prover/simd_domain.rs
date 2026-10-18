@@ -17,7 +17,7 @@ use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::CircleEvaluation;
 
 use crate::logup::LogupAtRow;
-use crate::{EvalAtRow, INTERACTION_TRACE_IDX, MAX_N_INTERACTIONS};
+use crate::{EvalAtRow, INTERACTION_TRACE_IDX, MAX_N_INTERACTIONS, Relation, RelationEntry};
 
 /// Evaluates constraints at an evaluation domain points.
 pub struct SimdDomainEvaluator<'a> {
@@ -40,8 +40,46 @@ pub struct SimdDomainEvaluator<'a> {
     /// `block + vec_row`, a column of the block's size at `vec_row`.
     pub block: usize,
     pub logup: LogupAtRow<Self>,
+    /// Base-field constraints not yet added to `row_res`, with their coefficient indices (see
+    /// [`Self::flush_deferred`]).
+    pub deferred: Vec<(VeryPackedBaseField, u32)>,
 }
+
+/// The deferred constraints added to the row result at a time: their values stay in L1.
+const DEFERRED_CHUNK: usize = 32;
+
 impl<'a> SimdDomainEvaluator<'a> {
+    /// Adds the deferred base-field constraints to `row_res`, one coordinate at a time.
+    ///
+    /// Added one by one, each constraint loads and stores the whole row accumulator (a very packed
+    /// secure value: more registers than AVX2 has), so the store pipe bounds the evaluators on
+    /// Zen 3. Here each coordinate's accumulator stays in registers over the chunk. The products
+    /// are the same field products and the sums are exact, so the result is unchanged.
+    #[inline(always)]
+    pub fn flush_deferred(&mut self) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let coords = self.row_res.into_very_packed_m31s();
+        let coords: [VeryPackedBaseField; SECURE_EXTENSION_DEGREE] = std::array::from_fn(|j| {
+            let mut acc = coords[j];
+            for &(value, index) in &self.deferred {
+                let coeff = self.random_coeff_powers[index as usize].to_m31_array()[j];
+                acc += value * VeryPackedBaseField::broadcast(coeff);
+            }
+            acc
+        });
+        self.row_res = VeryPackedSecureField::from_very_packed_m31s(coords);
+        self.deferred.clear();
+    }
+
+    /// The row's result: `row_res` with the deferred constraints added.
+    #[inline(always)]
+    pub fn row_result(&mut self) -> VeryPackedSecureField {
+        self.flush_deferred();
+        self.row_res
+    }
+
     pub fn new(
         trace_eval: &'a TreeVec<Vec<&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>>,
         vec_row: usize,
@@ -66,6 +104,7 @@ impl<'a> SimdDomainEvaluator<'a> {
             window: None,
             block: 0,
             logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size),
+            deferred: Vec::new(),
         }
     }
 
@@ -89,6 +128,7 @@ impl<'a> SimdDomainEvaluator<'a> {
             window: None,
             block: 0,
             logup,
+            deferred: Vec::new(),
         }
     }
 
@@ -167,13 +207,30 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
             }
         })
     }
+    // Inlined into each component's evaluate: called out of line, every constraint stored and
+    // reloaded the row accumulator (two packed secure values) around the call.
+    #[inline(always)]
     fn add_constraint<G>(&mut self, constraint: G)
     where
         Self::EF: Mul<G, Output = Self::EF> + From<G>,
     {
-        self.row_res +=
-            VeryPackedSecureField::broadcast(self.random_coeff_powers[self.constraint_index])
-                * constraint;
+        // A base-field constraint (its upper coordinates are known zeros once inlined) is
+        // deferred; a secure-field one is added at once.
+        let value = Self::EF::from(constraint);
+        match as_base(&value) {
+            Some(base) => {
+                self.deferred.push((base, self.constraint_index as u32));
+                if self.deferred.len() == DEFERRED_CHUNK {
+                    self.flush_deferred();
+                }
+            }
+            None => {
+                self.row_res += <VeryPackedSecureField as Mul<VeryPackedSecureField>>::mul(
+                    VeryPackedSecureField::broadcast(self.random_coeff_powers[self.constraint_index]),
+                    value,
+                );
+            }
+        }
         self.constraint_index += 1;
     }
 
@@ -181,6 +238,22 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
         VeryPackedSecureField::from_very_packed_m31s(values)
     }
 
+    // The default `add_to_relation`, inlined into each component's evaluate: called out of line
+    // (hundreds of call sites in the Cairo components), every lookup entry went through memory.
+    #[inline(always)]
+    fn add_to_relation<R: Relation<Self::F, Self::EF>>(
+        &mut self,
+        entry: RelationEntry<'_, Self::F, Self::EF, R>,
+    ) {
+        let denominator = match entry.relation.lookup_elements() {
+            Some((alpha_powers, z)) => combine_by_coordinates(alpha_powers, z, entry.values),
+            None => entry.relation.combine(entry.values),
+        };
+        let frac = Fraction::new(entry.multiplicity.clone(), denominator);
+        self.write_logup_frac(frac);
+    }
+
+    #[inline(always)]
     fn write_logup_frac(&mut self, fraction: Fraction<Self::EF, Self::EF>) {
         if self.logup.fracs.is_empty() {
             self.logup.is_finalized = false;
@@ -224,6 +297,30 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
     fn finalize_logup_in_pairs(&mut self) {
         self.finalize_logup_batched(2)
     }
+}
+
+/// [`crate::logup::LookupElements::combine`] of base-field values, one coordinate at a time.
+///
+/// Folded in the secure field, every term adds into a very packed secure accumulator (more
+/// registers than AVX2 has), so each term stores and reloads it. One coordinate's accumulator fits
+/// in registers. The same field products and exact sums: the result is unchanged.
+#[inline(always)]
+fn combine_by_coordinates(
+    alpha_powers: &[SecureField],
+    z: SecureField,
+    values: &[VeryPackedBaseField],
+) -> VeryPackedSecureField {
+    assert!(alpha_powers.len() >= values.len(), "Not enough alpha powers to combine values");
+    // As `LookupElements::combine`: a first power of one takes the first value as it is.
+    let start = usize::from(!values.is_empty() && alpha_powers[0] == SecureField::from(BaseField::from(1)));
+    let z = z.to_m31_array();
+    VeryPackedSecureField::from_very_packed_m31s(std::array::from_fn(|j| {
+        let mut acc = if start == 1 && j == 0 { values[0] } else { VeryPackedBaseField::zero() };
+        for (value, power) in values[start..].iter().zip(&alpha_powers[start..]) {
+            acc += *value * VeryPackedBaseField::broadcast(power.to_m31_array()[j]);
+        }
+        acc - VeryPackedBaseField::broadcast(z[j])
+    }))
 }
 
 #[inline(always)]

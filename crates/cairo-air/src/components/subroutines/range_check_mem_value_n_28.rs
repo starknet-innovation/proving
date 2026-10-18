@@ -12,6 +12,7 @@ impl RangeCheckMemValueN28 {
     #[allow(clippy::unused_unit)]
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn evaluate<E: EvalAtRow>(
         [
             range_check_mem_value_n_28_input_limb_0,

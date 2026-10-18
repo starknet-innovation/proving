@@ -26,27 +26,6 @@ use crate::witness::components::{
     verify_bitwise_xor_7, verify_bitwise_xor_8, verify_bitwise_xor_9, verify_bitwise_xor_12,
 };
 
-/// The preprocessed columns the eq and qm31_ops writers materialize first: those writers run
-/// alone at the start of the base trace, one column after the other. (The qm31_ops flags are not
-/// read by its writer: warming them would leave them in the take-once cache.)
-const WRITER_FIRST_COLUMNS: [&str; 6] = [
-    "qm31_ops_in0_address",
-    "qm31_ops_in1_address",
-    "qm31_ops_out_address",
-    "qm31_ops_mults",
-    "eq_in0_address",
-    "eq_in1_address",
-];
-
-/// Materializes [`WRITER_FIRST_COLUMNS`] on the thread pool ahead of the base trace (see
-/// [`PreProcessedTrace::warm_columns`]); the writers then take them instead of building them.
-pub fn warm_writer_columns(preprocessed_trace: &PreProcessedTrace) {
-    let ids = WRITER_FIRST_COLUMNS.map(|id| {
-        stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId { id: id.to_owned() }
-    });
-    preprocessed_trace.warm_columns(&ids);
-}
-
 /// Interpolates the columns of one component. Columns above 2^16 values (all of a component's
 /// columns have one size) are interpolated one after another, each parallel inside, through
 /// [`PolyOps::interpolate_pooled`]: the fused out-of-place inverse FFT writes the coefficients
@@ -110,13 +89,13 @@ where
         // their temporaries do not overlap the gate components' inputs and lookup data.
         scope(|s| {
         s.spawn(|_| {
-            let (trace, log_size, lookup_data) = qm31_ops::write_trace(
+            let (trace, log_size) = qm31_ops::write_trace(
                 context_values,
                 preprocessed_trace_ref,
                 &trace_generator.qm31_ops_trace_generator,
             );
             let polys = interpolate_in_turn(trace.to_evals(), twiddles);
-            qm31_ops_result.write((polys, log_size, lookup_data));
+            qm31_ops_result.write((polys, log_size));
         });
         s.spawn(|_| {
             let (trace, log_size, lookup_data) =
@@ -255,7 +234,7 @@ where
     // SAFETY: All MaybeUninit values were initialized by the scope above.
     let (
         (eq_polys, eq_log_size, eq_lookup_data),
-        (qm31_ops_polys, qm31_ops_log_size, qm31_ops_lookup_data),
+        (qm31_ops_polys, qm31_ops_log_size),
         triple_xor_polys,
         (triple_xor_claim, triple_xor_interaction_claim_gen),
         m_31_to_u_32_polys,
@@ -335,7 +314,6 @@ where
         log_sizes,
         CircuitInteractionClaimGenerator {
             eq_lookup_data,
-            qm31_ops_lookup_data,
             qm31_ops_columns,
             preprocessed_trace: preprocessed_trace.clone(),
             triple_xor: triple_xor_interaction_claim_gen,
@@ -354,7 +332,6 @@ where
 
 pub struct CircuitInteractionClaimGenerator {
     pub eq_lookup_data: eq::LookupData,
-    pub qm31_ops_lookup_data: qm31_ops::LookupData,
     /// The base tree's columns of qm31_ops, which its interaction write reads back.
     pub qm31_ops_columns: std::ops::Range<usize>,
     pub preprocessed_trace: Arc<PreProcessedTrace>,
@@ -372,6 +349,8 @@ pub struct CircuitInteractionClaimGenerator {
 pub fn write_interaction_trace<MC: MerkleChannel>(
     component_log_sizes: &PerComponent<u32>,
     circuit_interaction_claim_generator: CircuitInteractionClaimGenerator,
+    context_values: &[QM31],
+    first_permutation_row: usize,
     tree_builder: &mut TreeBuilder<'_, '_, SimdBackend, MC>,
     interaction_elements: &CircuitInteractionElements,
     twiddles: &TwiddleTree<SimdBackend>,
@@ -391,8 +370,7 @@ where
     let mut claimed_sums = PerComponent::default();
     let CircuitInteractionClaimGenerator {
         eq_lookup_data,
-        qm31_ops_lookup_data,
-        qm31_ops_columns,
+        qm31_ops_columns: _,
         preprocessed_trace,
         triple_xor,
         m_31_to_u_32,
@@ -418,20 +396,17 @@ where
             let (trace, claimed_sum) = eq::write_interaction_trace(
                 eq_log_size,
                 eq_lookup_data,
+                &preprocessed_trace,
                 &interaction_elements.common_lookup_elements,
             );
             all_polys.eq = interpolate_in_turn(trace, twiddles);
             claimed_sums.eq = claimed_sum;
         });
         s.spawn(|_| {
-            let start = qm31_ops_columns.start;
-            let read = |columns: std::ops::Range<usize>| {
-                tree_builder.committed_trace_values(1, start + columns.start..start + columns.end)
-            };
             let (trace, claimed_sum) = qm31_ops::write_interaction_trace(
                 qm31_ops_log_size,
-                qm31_ops_lookup_data,
-                &read,
+                context_values,
+                first_permutation_row,
                 &preprocessed_trace,
                 &interaction_elements.common_lookup_elements,
             );

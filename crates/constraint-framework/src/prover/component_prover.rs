@@ -331,7 +331,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
             VeryPackedBaseField::from_array(std::array::from_fn(|i| denom_inv[i & 1]))
         });
 
-        let body = |fracs: &mut Vec<_>,
+        let body = |(fracs, deferred): &mut (Vec<_>, Vec<_>),
                     (chunk_idx, mut chunk): (usize, VeryPackedSecureColumnByCoordsMutSlice<'_>)| {
             for idx_in_chunk in 0..CHUNK_SIZE {
                 let vec_row = chunk_idx * CHUNK_SIZE + idx_in_chunk;
@@ -351,10 +351,12 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                 );
                 eval.window = window;
                 eval.block = block;
+                eval.deferred = std::mem::take(deferred);
                 let mut eval = self_eval.evaluate(eval);
-                let row_res = eval.row_res;
+                let row_res = eval.row_result();
                 *fracs = std::mem::take(&mut eval.logup.fracs);
                 fracs.clear();
+                *deferred = std::mem::take(&mut eval.deferred);
 
                 // Finalize row.
                 unsafe {
@@ -372,14 +374,14 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         #[cfg(not(feature = "parallel"))]
         {
             let _ = serial;
-            let mut fracs = Vec::new();
-            iter.for_each(|item| body(&mut fracs, item));
+            let mut bufs = (Vec::new(), Vec::new());
+            iter.for_each(|item| body(&mut bufs, item));
         }
 
         #[cfg(feature = "parallel")]
         if serial {
             // The rows in order on this thread (a caller already running in parallel).
-            let mut fracs = Vec::new();
+            let mut bufs = (Vec::new(), Vec::new());
             range.step_by(CHUNK_SIZE)
                 .zip(itertools::izip!(
                     c0.chunks_mut(CHUNK_SIZE),
@@ -389,7 +391,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                 ))
                 .for_each(|(chunk_idx, (a, b, c, d))| {
                     body(
-                        &mut fracs,
+                        &mut bufs,
                         (
                             chunk_idx,
                             VeryPackedSecureColumnByCoordsMutSlice([
@@ -419,7 +421,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                             ])
                         }),
                 )
-                .for_each_init(Vec::new, body);
+                .for_each_init(|| (Vec::new(), Vec::new()), body);
         }
     }
 

@@ -15,6 +15,43 @@ pub const CACHED_FFT_LOG_SIZE: u32 = 16;
 
 pub const MIN_FFT_LOG_SIZE: u32 = 5;
 
+/// Columns of at least `2^STREAM_SCATTER_LOG_SIZE` elements scatter the vectors of their first
+/// phase with streaming stores (rukafe0x, lead rgr1_f9de8efd): the destinations are far apart in a
+/// column larger than any cache, and a regular store would first read each line in for
+/// ownership, which the second phase does not use. Smaller columns can still be in a cache when the
+/// second phase reads them and keep regular stores.
+pub const STREAM_SCATTER_LOG_SIZE: usize = 21;
+
+/// Stores `value` at `dst` (aligned to 64 bytes), streaming when `stream` on AVX2.
+///
+/// # Safety
+///
+/// `dst` must be valid for a write of a [`PackedBaseField`] and aligned to 64 bytes. With
+/// `stream`, the task must call [`scattered_stores_done`] before its stores are read.
+#[inline(always)]
+pub unsafe fn store_scattered(dst: *mut u32, value: PackedBaseField, stream: bool) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if stream {
+        use std::arch::x86_64::{__m256i, _mm256_stream_si256};
+        let [lo, hi] = std::mem::transmute::<PackedBaseField, [__m256i; 2]>(value);
+        _mm256_stream_si256(dst as *mut __m256i, lo);
+        _mm256_stream_si256((dst as *mut __m256i).add(1), hi);
+        return;
+    }
+    let _ = stream;
+    value.store(dst);
+}
+
+/// Orders a task's streaming stores before anything that can read them (one `sfence`).
+#[inline(always)]
+pub fn scattered_stores_done(stream: bool) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if stream {
+        unsafe { std::arch::x86_64::_mm_sfence() };
+    }
+    let _ = stream;
+}
+
 // TODO(andrew): FFTs return a redundant representation, that can get the value P. need to deal with
 // it. Either: reduce before commitment or regenerate proof with new seed if redundant value
 // decommitted.

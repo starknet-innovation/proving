@@ -14,6 +14,7 @@ impl VerifyU32 {
     #[allow(clippy::unused_unit)]
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn evaluate<E: EvalAtRow>(
         [verify_u_32_input_limb_0, verify_u_32_input_limb_1, verify_u_32_input_limb_2]: [E::F; 3],
         enabler: E::F,

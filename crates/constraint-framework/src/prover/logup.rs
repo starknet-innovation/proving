@@ -76,7 +76,12 @@ impl LogupTraceGenerator {
         if n_columns == 0 {
             return;
         }
-        const CHUNK_SIZE: usize = 1024;
+        // 128 packed rows per chunk: the chunk's four temporaries (numerators, denominators,
+        // inverses and running sums, 128 secure packed values each) take 128 KiB, which stays in
+        // a core's L2 through the three passes even when two threads share a 512 KiB L2. At 1024
+        // rows they take 1 MiB and go out to L3 between passes on such cores. The chunking does
+        // not change any value: each row's fraction and running sum are computed alike.
+        const CHUNK_SIZE: usize = 128;
         let n_rows: usize = 1 << (self.log_size - LOG_N_LANES);
         // Every value of the columns is written below (each task writes every row of its chunk of
         // every column): their buffers are taken as the commitment's FFT buffers are, unzeroed.

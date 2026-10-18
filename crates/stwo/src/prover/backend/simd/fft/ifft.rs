@@ -8,7 +8,8 @@ use itertools::Itertools;
 use rayon::prelude::*;
 
 use super::{
-    CACHED_FFT_LOG_SIZE, MIN_FFT_LOG_SIZE, compute_first_twiddles, mul_twiddle, transpose_vecs,
+    CACHED_FFT_LOG_SIZE, MIN_FFT_LOG_SIZE, STREAM_SCATTER_LOG_SIZE, compute_first_twiddles,
+    mul_twiddle, scattered_stores_done, store_scattered, transpose_vecs,
 };
 use crate::core::circle::Coset;
 use crate::core::utils::bit_reverse;
@@ -260,6 +261,7 @@ pub unsafe fn ifft_out_of_place(
         }
     });
 
+    let stream = log_n_elements >= STREAM_SCATTER_LOG_SIZE;
     parallel_iter!(0..n_tasks).for_each(|task| {
         let src = src.get();
         let dst = dst.get();
@@ -316,11 +318,15 @@ pub unsafe fn ifft_out_of_place(
                 let c = bc & ((1 << post) - 1);
                 let out = dst.add(((c << pre) | (b << post) | a0) << LOG_N_LANES);
                 for i in 0..group_size {
-                    PackedBaseField::load(scr.add(i * block_elems + (bc << LOG_N_LANES)))
-                        .store(out.add(i << LOG_N_LANES));
+                    store_scattered(
+                        out.add(i << LOG_N_LANES),
+                        PackedBaseField::load(scr.add(i * block_elems + (bc << LOG_N_LANES))),
+                        stream,
+                    );
                 }
             }
         });
+        scattered_stores_done(stream);
     });
 
     ifft_lower_without_vecwise(

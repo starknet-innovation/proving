@@ -959,27 +959,47 @@ impl PolyOps for SimdBackend {
             return compute_small_coset_twiddles(root_coset);
         }
 
-        let mut twiddles = Vec::with_capacity(coset.size() / N_LANES);
+        // The layers' twiddles, in order, each computed in chunks on rayon's workers: every chunk
+        // starts from its own first points (`Coset::at`), which the sequential walk would reach
+        // after the chunks before it, so the values are the same. The inverses (unique) and the
+        // doubled values are computed in chunks too.
+        let mut layers = vec![];
         while coset.log_size() > LOG_N_LANES {
-            compute_coset_twiddles(coset, &mut twiddles);
+            layers.push(coset);
             coset = coset.double();
+        }
+        let n_vecs = |coset: &Coset| 1 << (coset.log_size() - 1 - LOG_N_LANES);
+        let total = layers.iter().map(n_vecs).sum::<usize>() + 1;
+        let mut twiddles: Vec<PackedM31> = unsafe { crate::core::utils::uninit_vec(total) };
+        let mut rest = &mut twiddles[..];
+        for layer in &layers {
+            let (dst, tail) = rest.split_at_mut(n_vecs(layer));
+            rest = tail;
+            dst.par_chunks_mut(TWIDDLE_CHUNK).enumerate().for_each(|(k, chunk)| {
+                compute_coset_twiddles_into(*layer, k * TWIDDLE_CHUNK, chunk);
+            });
         }
 
         // Handle cosets smaller than `N_LANES`.
         let remaining_twiddles = slow_precompute_twiddles(coset);
 
-        twiddles.push(PackedM31::from_array(remaining_twiddles.try_into().unwrap()));
+        rest[0] = PackedM31::from_array(remaining_twiddles.try_into().unwrap());
 
-        let itwiddles = PackedBaseField::batch_inverse(&twiddles);
+        let mut itwiddles: Vec<PackedM31> = unsafe { crate::core::utils::uninit_vec(total) };
+        crate::core::fields::batch_inverse_chunked(&twiddles, &mut itwiddles, TWIDDLE_CHUNK);
 
-        let dbl_twiddles = twiddles
-            .into_iter()
-            .flat_map(|x| (x.into_simd() * Simd::splat(2)).to_array())
-            .collect();
-        let dbl_itwiddles = itwiddles
-            .into_iter()
-            .flat_map(|x| (x.into_simd() * Simd::splat(2)).to_array())
-            .collect();
+        let double = |values: &[PackedM31]| -> Vec<u32> {
+            let mut dbl: Vec<u32> = unsafe { crate::core::utils::uninit_vec(values.len() * N_LANES) };
+            dbl.par_chunks_mut(N_LANES * TWIDDLE_CHUNK).zip(values.par_chunks(TWIDDLE_CHUNK)).for_each(
+                |(dst, src)| {
+                    for (dst, x) in dst.chunks_exact_mut(N_LANES).zip(src) {
+                        dst.copy_from_slice(&(x.into_simd() * Simd::splat(2)).to_array());
+                    }
+                },
+            );
+            dbl
+        };
+        let (dbl_twiddles, dbl_itwiddles) = rayon::join(|| double(&twiddles), || double(&itwiddles));
 
         TwiddleTree { root_coset, twiddles: dbl_twiddles, itwiddles: dbl_itwiddles }
     }
@@ -1630,13 +1650,18 @@ fn compute_small_coset_twiddles(coset: Coset) -> TwiddleTree<SimdBackend> {
     TwiddleTree { root_coset: coset, twiddles: dbl_twiddles, itwiddles: dbl_itwiddles }
 }
 
-/// Computes the twiddles of the coset in bit-reversed order. Optimized for SIMD.
-fn compute_coset_twiddles(coset: Coset, twiddles: &mut Vec<PackedM31>) {
+/// Packed twiddles per task of [`SimdBackend::precompute_twiddles`].
+const TWIDDLE_CHUNK: usize = 1 << 12;
+
+/// The packed twiddles `first..first + dst.len()` of [`compute_coset_twiddles`]: the same walk,
+/// started from the circle points of packed twiddle `first`.
+fn compute_coset_twiddles_into(coset: Coset, first: usize, dst: &mut [PackedM31]) {
     let log_size = coset.log_size() - 1;
     assert!(log_size >= LOG_N_LANES);
 
-    // Compute the first `N_LANES` circle points.
-    let initial_points = std::array::from_fn(|i| coset.at(bit_reverse_index(i, log_size)));
+    // The circle points of packed twiddle `first`.
+    let initial_points =
+        std::array::from_fn(|i| coset.at(bit_reverse_index(first * N_LANES + i, log_size)));
     let mut current = CirclePoint {
         x: PackedM31::from_array(initial_points.each_ref().map(|p| p.x)),
         y: PackedM31::from_array(initial_points.each_ref().map(|p| p.y)),
@@ -1651,16 +1676,16 @@ fn compute_coset_twiddles(coset: Coset, twiddles: &mut Vec<PackedM31>) {
         steps[i as usize] = step;
     }
 
-    for i in 0u32..1 << (log_size - LOG_N_LANES) {
+    for (k, twiddle) in dst.iter_mut().enumerate() {
         // Extract twiddle and compute the next `N_LANES` circle points.
-        let x = current.x;
+        let i = (first + k) as u32;
+        *twiddle = current.x;
         let step_index = i.trailing_ones() as usize;
         let step = CirclePoint {
             x: PackedM31::broadcast(steps[step_index].x),
             y: PackedM31::broadcast(steps[step_index].y),
         };
         current = current + step;
-        twiddles.push(x);
     }
 }
 

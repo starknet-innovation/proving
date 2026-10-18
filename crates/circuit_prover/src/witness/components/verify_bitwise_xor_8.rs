@@ -148,21 +148,15 @@ impl InteractionClaimGenerator {
         let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(LOG_SIZE) };
 
         // Sum logup terms in pairs.
-        let mut col_gen = logup_gen.new_col();
-        (
-            col_gen.par_iter_mut(),
-            &self.lookup_data.verify_bitwise_xor_8_0,
-            &self.lookup_data.verify_bitwise_xor_8_b_0,
-            self.lookup_data.mults_0,
-            self.lookup_data.mults_1,
-        )
-            .into_par_iter()
-            .for_each(|(writer, values0, values1, mults_0, mults_1)| {
-                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
-                writer.write_frac(-(denom0 * mults_1 + denom1 * mults_0), denom0 * denom1);
-            });
-        col_gen.finalize_col();
+        // In one pass per chunk of rows (fractions, inverses and the running sum), as the
+        // gate components' columns are written (omarespejel, rgr1_3f4875e7).
+        let lookup_data = &self.lookup_data;
+        logup_gen.write_frac_cols(1, |_, row| {
+            let denom0: PackedQM31 = common_lookup_elements.combine(&lookup_data.verify_bitwise_xor_8_0[row]);
+            let denom1: PackedQM31 = common_lookup_elements.combine(&lookup_data.verify_bitwise_xor_8_b_0[row]);
+            let (mults_0, mults_1) = (lookup_data.mults_0[row], lookup_data.mults_1[row]);
+            (-(denom0 * mults_1 + denom1 * mults_0), denom0 * denom1)
+        });
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
 
