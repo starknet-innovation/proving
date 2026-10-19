@@ -69,6 +69,15 @@ pub const JUMP_OPCODE_REL: Expect = expect![[r#"
 pub const JUMP_OPCODE_ABS: Expect = expect![[r#"
     (1972441933 + 101320373i) + (1726947360 + 722287191i)u
 "#]];
+pub const KECCAK_AGGREGATOR: Expect = expect![[r#"
+    (1843893065 + 1130349103i) + (1912757170 + 1904825522i)u
+"#]];
+pub const KECCAK_BUILTIN: Expect = expect![[r#"
+    (1035531095 + 1908770765i) + (1152884948 + 270965815i)u
+"#]];
+pub const KECCAK_ROUND: Expect = expect![[r#"
+    (1544315943 + 296933707i) + (830224999 + 557362586i)u
+"#]];
 pub const MEMORY_ADDRESS_TO_ID: Expect = expect![[r#"
     (1460493255 + 551209186i) + (489757161 + 239600975i)u
 "#]];

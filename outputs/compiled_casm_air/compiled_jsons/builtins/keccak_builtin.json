@@ -1,0 +1,2707 @@
+{
+  "name": "keccak_builtin",
+  "relation_names": [],
+  "relation_size": null,
+  "log_height": null,
+  "description": "Keccak Builtin",
+  "instance_definition": "{}",
+  "type": "Builtin",
+  "padding_type": "None",
+  "prover_input": [
+    "keccak_builtin_input",
+    "()",
+    "()"
+  ],
+  "verifier_input_limbs": [],
+  "input_const_columns": [],
+  "prover_output": [
+    {
+      "Tuple": []
+    },
+    "keccak_builtin_output",
+    "()",
+    "()"
+  ],
+  "verifier_output": [
+    {
+      "Array": []
+    },
+    []
+  ],
+  "state_names": [
+    "input_0_id_col0",
+    "input_1_id_col1",
+    "input_2_id_col2",
+    "input_3_id_col3",
+    "input_4_id_col4",
+    "input_5_id_col5",
+    "input_6_id_col6",
+    "input_7_id_col7",
+    "output_0_id_col8",
+    "output_1_id_col9",
+    "output_2_id_col10",
+    "output_3_id_col11",
+    "output_4_id_col12",
+    "output_5_id_col13",
+    "output_6_id_col14",
+    "output_7_id_col15"
+  ],
+  "constraint_lookups": [
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "MemoryAddressToId",
+      "Use"
+    ],
+    [
+      "KeccakAggregator",
+      "Use"
+    ]
+  ],
+  "sub_components": {
+    "memory_address_to_id": "Multiplicity",
+    "keccak_aggregator": "Multiplicity"
+  },
+  "n_inputs_added_per_relation": {
+    "MemoryAddressToId": [
+      "memory_address_to_id",
+      0,
+      16
+    ],
+    "KeccakAggregator": [
+      "keccak_aggregator",
+      0,
+      1
+    ]
+  },
+  "inline_calls": {
+    "read_id": [
+      [
+        [
+          "MemoryAddressToId",
+          "Use"
+        ]
+      ],
+      [],
+      []
+    ]
+  },
+  "public_params": [
+    "keccak_builtin_segment_start"
+  ],
+  "external_states": [
+    "Seq"
+  ],
+  "constraints": [
+    {
+      "Intermediate": {
+        "felt_names": [
+          "instance_addr_tmp_24554_0"
+        ],
+        "var": {
+          "BinaryOp": [
+            {
+              "BinaryOp": [
+                {
+                  "ExternalState": "Seq"
+                },
+                "*",
+                {
+                  "Const": [
+                    "M31",
+                    "16"
+                  ]
+                }
+              ]
+            },
+            "+",
+            {
+              "PublicParam": "keccak_builtin_segment_start"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "input_0_id_col0"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "1"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "input_1_id_col1"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "2"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "input_2_id_col2"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "3"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "input_3_id_col3"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "4"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "input_4_id_col4"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "5"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "input_5_id_col5"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "6"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "input_6_id_col6"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "7"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "input_7_id_col7"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "8"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "output_0_id_col8"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "9"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "output_1_id_col9"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "10"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "output_2_id_col10"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "11"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "output_3_id_col11"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "12"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "output_4_id_col12"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "13"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "output_5_id_col13"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "14"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "output_6_id_col14"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Intermediate": {
+        "felt_names": [],
+        "var": {
+          "StaticCall": [
+            "read_id::evaluate",
+            [
+              {
+                "Array": [
+                  {
+                    "BinaryOp": [
+                      {
+                        "Var": [
+                          "M31",
+                          "instance_addr_tmp_24554_0"
+                        ]
+                      },
+                      "+",
+                      {
+                        "Const": [
+                          "M31",
+                          "15"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              },
+              {
+                "State": "output_7_id_col15"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "KeccakAggregator",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1973115366"
+            ]
+          },
+          {
+            "State": "input_0_id_col0"
+          },
+          {
+            "State": "input_1_id_col1"
+          },
+          {
+            "State": "input_2_id_col2"
+          },
+          {
+            "State": "input_3_id_col3"
+          },
+          {
+            "State": "input_4_id_col4"
+          },
+          {
+            "State": "input_5_id_col5"
+          },
+          {
+            "State": "input_6_id_col6"
+          },
+          {
+            "State": "input_7_id_col7"
+          },
+          {
+            "State": "output_0_id_col8"
+          },
+          {
+            "State": "output_1_id_col9"
+          },
+          {
+            "State": "output_2_id_col10"
+          },
+          {
+            "State": "output_3_id_col11"
+          },
+          {
+            "State": "output_4_id_col12"
+          },
+          {
+            "State": "output_5_id_col13"
+          },
+          {
+            "State": "output_6_id_col14"
+          },
+          {
+            "State": "output_7_id_col15"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    }
+  ],
+  "deductions": [
+    {
+      "Intermediate": {
+        "name": "instance_addr_tmp_24554_0",
+        "type": "M31",
+        "var": {
+          "BinaryOp": [
+            {
+              "BinaryOp": [
+                {
+                  "ExternalState": "Seq"
+                },
+                "*",
+                {
+                  "Const": [
+                    "M31",
+                    "16"
+                  ]
+                }
+              ]
+            },
+            "+",
+            {
+              "PublicParam": "keccak_builtin_segment_start"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_1",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_1"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "Var": [
+            "M31",
+            "instance_addr_tmp_24554_0"
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "Var": [
+              "M31",
+              "instance_addr_tmp_24554_0"
+            ]
+          },
+          {
+            "State": "input_0_id_col0"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_3",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "1"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_3"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "1"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "1"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "input_1_id_col1"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_5",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "2"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_5"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "2"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "2"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "input_2_id_col2"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_7",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "3"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_7"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "3"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "3"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "input_3_id_col3"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_9",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "4"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_9"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "4"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "4"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "input_4_id_col4"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_11",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "5"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_11"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "5"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "5"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "input_5_id_col5"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_13",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "6"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_13"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "6"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "6"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "input_6_id_col6"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_15",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "7"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_15"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "7"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "7"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "input_7_id_col7"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_17",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "8"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_17"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "8"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "8"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "output_0_id_col8"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_19",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "9"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_19"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "9"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "9"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "output_1_id_col9"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_21",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "10"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_21"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "10"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "10"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "output_2_id_col10"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_23",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "11"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_23"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "11"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "11"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "output_3_id_col11"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_25",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "12"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_25"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "12"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "12"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "output_4_id_col12"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_27",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "13"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_27"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "13"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "13"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "output_5_id_col13"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_29",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "14"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_29"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "14"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "14"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "output_6_id_col14"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "StartBlock": "Read Id"
+    },
+    {
+      "Intermediate": {
+        "name": "memory_address_to_id_value_tmp_24554_31",
+        "type": "M31",
+        "var": {
+          "StaticCall": [
+            "MemoryAddressToId::deduce_output",
+            [
+              {
+                "BinaryOp": [
+                  {
+                    "Var": [
+                      "M31",
+                      "instance_addr_tmp_24554_0"
+                    ]
+                  },
+                  "+",
+                  {
+                    "Const": [
+                      "M31",
+                      "15"
+                    ]
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "Deduction": {
+        "Var": [
+          "M31",
+          "memory_address_to_id_value_tmp_24554_31"
+        ]
+      }
+    },
+    {
+      "LookupAddInput": {
+        "relation_name": "MemoryAddressToId",
+        "input": {
+          "BinaryOp": [
+            {
+              "Var": [
+                "M31",
+                "instance_addr_tmp_24554_0"
+              ]
+            },
+            "+",
+            {
+              "Const": [
+                "M31",
+                "15"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "MemoryAddressToId",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1444891767"
+            ]
+          },
+          {
+            "BinaryOp": [
+              {
+                "Var": [
+                  "M31",
+                  "instance_addr_tmp_24554_0"
+                ]
+              },
+              "+",
+              {
+                "Const": [
+                  "M31",
+                  "15"
+                ]
+              }
+            ]
+          },
+          {
+            "State": "output_7_id_col15"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    },
+    "EndBlock",
+    {
+      "LookupAddInput": {
+        "relation_name": "KeccakAggregator",
+        "input": {
+          "Tuple": [
+            {
+              "Array": [
+                {
+                  "State": "input_0_id_col0"
+                },
+                {
+                  "State": "input_1_id_col1"
+                },
+                {
+                  "State": "input_2_id_col2"
+                },
+                {
+                  "State": "input_3_id_col3"
+                },
+                {
+                  "State": "input_4_id_col4"
+                },
+                {
+                  "State": "input_5_id_col5"
+                },
+                {
+                  "State": "input_6_id_col6"
+                },
+                {
+                  "State": "input_7_id_col7"
+                }
+              ]
+            },
+            {
+              "Array": [
+                {
+                  "State": "output_0_id_col8"
+                },
+                {
+                  "State": "output_1_id_col9"
+                },
+                {
+                  "State": "output_2_id_col10"
+                },
+                {
+                  "State": "output_3_id_col11"
+                },
+                {
+                  "State": "output_4_id_col12"
+                },
+                {
+                  "State": "output_5_id_col13"
+                },
+                {
+                  "State": "output_6_id_col14"
+                },
+                {
+                  "State": "output_7_id_col15"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "LookupTerm": {
+        "relation_name": "KeccakAggregator",
+        "felts": [
+          {
+            "Const": [
+              "M31",
+              "1973115366"
+            ]
+          },
+          {
+            "State": "input_0_id_col0"
+          },
+          {
+            "State": "input_1_id_col1"
+          },
+          {
+            "State": "input_2_id_col2"
+          },
+          {
+            "State": "input_3_id_col3"
+          },
+          {
+            "State": "input_4_id_col4"
+          },
+          {
+            "State": "input_5_id_col5"
+          },
+          {
+            "State": "input_6_id_col6"
+          },
+          {
+            "State": "input_7_id_col7"
+          },
+          {
+            "State": "output_0_id_col8"
+          },
+          {
+            "State": "output_1_id_col9"
+          },
+          {
+            "State": "output_2_id_col10"
+          },
+          {
+            "State": "output_3_id_col11"
+          },
+          {
+            "State": "output_4_id_col12"
+          },
+          {
+            "State": "output_5_id_col13"
+          },
+          {
+            "State": "output_6_id_col14"
+          },
+          {
+            "State": "output_7_id_col15"
+          }
+        ],
+        "use_or_yield": "Use",
+        "multiplicity": {
+          "Const": [
+            "M31",
+            "1"
+          ]
+        }
+      }
+    }
+  ]
+}

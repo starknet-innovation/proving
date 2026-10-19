@@ -3,6 +3,7 @@ pub mod bitwise;
 pub mod bitwise_test;
 pub mod ec_op;
 pub mod ec_utils;
+pub mod keccak;
 pub mod modulo;
 pub mod pedersen;
 pub mod poseidon;

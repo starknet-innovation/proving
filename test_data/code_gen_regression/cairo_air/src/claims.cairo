@@ -14,19 +14,19 @@ use crate::components::{
     assert_eq_opcode_double_deref, assert_eq_opcode_imm, bitwise_builtin, blake_compress_opcode,
     blake_g, blake_round, blake_round_sigma, call_opcode_abs, call_opcode_rel_imm, cube_252,
     ec_op_builtin, generic_opcode, jnz_opcode_non_taken, jnz_opcode_taken, jump_opcode_abs,
-    jump_opcode_double_deref, jump_opcode_rel, jump_opcode_rel_imm, memory_address_to_id,
-    memory_id_to_big, memory_id_to_small, mul_mod_builtin, mul_opcode, mul_opcode_small,
-    partial_ec_mul_generic, partial_ec_mul_window_bits_18, partial_ec_mul_window_bits_9,
-    pedersen_aggregator_window_bits_18, pedersen_aggregator_window_bits_9, pedersen_builtin,
-    pedersen_builtin_narrow_windows, pedersen_points_table_window_bits_18,
-    pedersen_points_table_window_bits_9, poseidon_3_partial_rounds_chain, poseidon_aggregator,
-    poseidon_builtin, poseidon_full_round_chain, poseidon_round_keys, qm_31_add_mul_opcode,
-    range_check96_builtin, range_check_11, range_check_12, range_check_18, range_check_20,
-    range_check_252_width_27, range_check_3_3_3_3_3, range_check_3_6_6_3, range_check_4_3,
-    range_check_4_4, range_check_4_4_4_4, range_check_6, range_check_7_2_5, range_check_8,
-    range_check_9_9, range_check_builtin, ret_opcode, triple_xor_32, verify_bitwise_xor_12,
-    verify_bitwise_xor_4, verify_bitwise_xor_7, verify_bitwise_xor_8, verify_bitwise_xor_9,
-    verify_instruction,
+    jump_opcode_double_deref, jump_opcode_rel, jump_opcode_rel_imm, keccak_aggregator,
+    keccak_builtin, keccak_round, memory_address_to_id, memory_id_to_big, memory_id_to_small,
+    mul_mod_builtin, mul_opcode, mul_opcode_small, partial_ec_mul_generic,
+    partial_ec_mul_window_bits_18, partial_ec_mul_window_bits_9, pedersen_aggregator_window_bits_18,
+    pedersen_aggregator_window_bits_9, pedersen_builtin, pedersen_builtin_narrow_windows,
+    pedersen_points_table_window_bits_18, pedersen_points_table_window_bits_9,
+    poseidon_3_partial_rounds_chain, poseidon_aggregator, poseidon_builtin,
+    poseidon_full_round_chain, poseidon_round_keys, qm_31_add_mul_opcode, range_check96_builtin,
+    range_check_11, range_check_12, range_check_18, range_check_20, range_check_252_width_27,
+    range_check_3_3_3_3_3, range_check_3_6_6_3, range_check_4_3, range_check_4_4,
+    range_check_4_4_4_4, range_check_6, range_check_7_2_5, range_check_8, range_check_9_9,
+    range_check_builtin, ret_opcode, triple_xor_32, verify_bitwise_xor_12, verify_bitwise_xor_4,
+    verify_bitwise_xor_7, verify_bitwise_xor_8, verify_bitwise_xor_9, verify_instruction,
 };
 use super::claim::{FlatClaim, FlatClaimTrait};
 
@@ -68,6 +68,7 @@ pub struct CairoClaim {
     pub range_check96_builtin: Option<components::range_check96_builtin::Claim>,
     pub range_check_builtin: Option<components::range_check_builtin::Claim>,
     pub ec_op_builtin: Option<components::ec_op_builtin::Claim>,
+    pub keccak_builtin: Option<components::keccak_builtin::Claim>,
     pub partial_ec_mul_generic: Option<components::partial_ec_mul_generic::Claim>,
     pub pedersen_aggregator_window_bits_18: Option<
         components::pedersen_aggregator_window_bits_18::Claim,
@@ -83,6 +84,8 @@ pub struct CairoClaim {
     pub pedersen_points_table_window_bits_9: Option<
         components::pedersen_points_table_window_bits_9::Claim,
     >,
+    pub keccak_aggregator: Option<components::keccak_aggregator::Claim>,
+    pub keccak_round: Option<components::keccak_round::Claim>,
     pub poseidon_aggregator: Option<components::poseidon_aggregator::Claim>,
     pub poseidon_3_partial_rounds_chain: Option<components::poseidon_3_partial_rounds_chain::Claim>,
     pub poseidon_full_round_chain: Option<components::poseidon_full_round_chain::Claim>,
@@ -219,6 +222,9 @@ pub impl CairoClaimImpl of ClaimTrait<CairoClaim> {
         if let Some(claim) = self.ec_op_builtin {
             log_sizes_list.append(claim.log_sizes());
         }
+        if let Some(claim) = self.keccak_builtin {
+            log_sizes_list.append(claim.log_sizes());
+        }
         if let Some(claim) = self.partial_ec_mul_generic {
             log_sizes_list.append(claim.log_sizes());
         }
@@ -238,6 +244,12 @@ pub impl CairoClaimImpl of ClaimTrait<CairoClaim> {
             log_sizes_list.append(claim.log_sizes());
         }
         if let Some(claim) = self.pedersen_points_table_window_bits_9 {
+            log_sizes_list.append(claim.log_sizes());
+        }
+        if let Some(claim) = self.keccak_aggregator {
+            log_sizes_list.append(claim.log_sizes());
+        }
+        if let Some(claim) = self.keccak_round {
             log_sizes_list.append(claim.log_sizes());
         }
         if let Some(claim) = self.poseidon_aggregator {
@@ -427,6 +439,9 @@ pub impl CairoClaimImpl of ClaimTrait<CairoClaim> {
         if let Some(claim) = self.ec_op_builtin {
             claim.accumulate_relation_uses(ref relation_uses);
         }
+        if let Some(claim) = self.keccak_builtin {
+            claim.accumulate_relation_uses(ref relation_uses);
+        }
         if let Some(claim) = self.partial_ec_mul_generic {
             claim.accumulate_relation_uses(ref relation_uses);
         }
@@ -440,6 +455,12 @@ pub impl CairoClaimImpl of ClaimTrait<CairoClaim> {
             claim.accumulate_relation_uses(ref relation_uses);
         }
         if let Some(claim) = self.partial_ec_mul_window_bits_9 {
+            claim.accumulate_relation_uses(ref relation_uses);
+        }
+        if let Some(claim) = self.keccak_aggregator {
+            claim.accumulate_relation_uses(ref relation_uses);
+        }
+        if let Some(claim) = self.keccak_round {
             claim.accumulate_relation_uses(ref relation_uses);
         }
         if let Some(claim) = self.poseidon_aggregator {
@@ -686,6 +707,12 @@ pub impl CairoClaimFlattenImpl of CairoClaimFlattenTrait {
         } else {
             component_enable_bits.append(false);
         }
+        if let Some(c) = self.keccak_builtin {
+            component_log_sizes.append(*c.log_size);
+            component_enable_bits.append(true);
+        } else {
+            component_enable_bits.append(false);
+        }
         if let Some(c) = self.partial_ec_mul_generic {
             component_log_sizes.append(*c.log_size);
             component_enable_bits.append(true);
@@ -724,6 +751,18 @@ pub impl CairoClaimFlattenImpl of CairoClaimFlattenTrait {
         }
         if let Some(_c) = self.pedersen_points_table_window_bits_9 {
             component_log_sizes.append(pedersen_points_table_window_bits_9::LOG_SIZE);
+            component_enable_bits.append(true);
+        } else {
+            component_enable_bits.append(false);
+        }
+        if let Some(c) = self.keccak_aggregator {
+            component_log_sizes.append(*c.log_size);
+            component_enable_bits.append(true);
+        } else {
+            component_enable_bits.append(false);
+        }
+        if let Some(c) = self.keccak_round {
+            component_log_sizes.append(*c.log_size);
             component_enable_bits.append(true);
         } else {
             component_enable_bits.append(false);

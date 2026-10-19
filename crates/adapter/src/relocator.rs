@@ -107,8 +107,11 @@ impl Relocator {
                 BuiltinName::mul_mod => res.mul_mod_builtin = segment,
                 BuiltinName::output => res.output = segment,
                 BuiltinName::ec_op => res.ec_op_builtin = segment,
-                BuiltinName::ecdsa | BuiltinName::keccak => {
-                    panic!("Builtin {builtin_name} is not supported in Stwo")
+                BuiltinName::keccak => res.keccak_builtin = segment,
+                // Layouts with the keccak builtin (all_cairo) also have ecdsa, which must stay
+                // unused.
+                BuiltinName::ecdsa => {
+                    assert!(segment.is_none(), "Builtin {builtin_name} is not supported in Stwo")
                 }
                 // Not builtins.
                 BuiltinName::segment_arena => {}

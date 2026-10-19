@@ -82,11 +82,11 @@ impl AddInputs for ClaimGenerator {
         let merged: HashMap<InputType, u32> = packed_inputs
             .par_iter()
             .flat_map(|p| p.unpack())
-            .fold_with(HashMap::new(), |mut local, input| {
+            .fold_with(HashMap::default(), |mut local, input| {
                 *local.entry(input).or_insert(0) += 1;
                 local
             })
-            .reduce(HashMap::new, |mut a, b| {
+            .reduce(HashMap::default, |mut a, b| {
                 for (k, v) in b {
                     *a.entry(k).or_insert(0) += v;
                 }

@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use cairo_air::CairoProofForRustVerifier;
-use cairo_air::verifier::verify_cairo;
+use cairo_air::verifier::{CairoVerificationError, verify_cairo};
 use cairo_vm::types::layout_name::LayoutName;
 use itertools::Itertools;
 use stwo::core::fri::FriConfig;
@@ -69,11 +69,9 @@ fn test_small_canonical_preprocessed_root_regression() {
     assert_eq!(root, expected);
 }
 
-fn test_proof_stability(path: &str, n_proofs_to_compare: usize) {
+fn test_proof_stability(path: &str, layout: LayoutName, n_proofs_to_compare: usize) {
     let compiled_program = get_compiled_cairo_program_path(path);
-    let input =
-        run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo_stwo, None)
-            .unwrap();
+    let input = run_and_adapt(&compiled_program, ProgramType::Json, layout, None).unwrap();
     let prover_params = ProverParameters {
         channel_hash: ChannelHash::Blake2s,
         fri_config: FriConfig::default(),
@@ -97,12 +95,12 @@ fn test_proof_stability(path: &str, n_proofs_to_compare: usize) {
 
 #[test]
 fn test_opcodes_proof_stability() {
-    test_proof_stability("test_prove_verify_all_opcode_components", 2);
+    test_proof_stability("test_prove_verify_all_opcode_components", LayoutName::all_cairo_stwo, 2);
 }
 
 #[test]
 fn test_builtins_proof_stability() {
-    test_proof_stability("test_prove_verify_all_builtins", 2);
+    test_proof_stability("test_prove_verify_all_builtins", LayoutName::all_cairo, 2);
 }
 
 /// These tests' inputs were generated using cairo-vm with 50 instances of each builtin.
@@ -153,7 +151,7 @@ pub mod builtin_tests {
     /// *unsorted* preprocessed query positions that the Merkle verifier must
     /// sort.
     ///
-    /// `channel_salt = 12` with `n_queries = 1000` is a seed where the folded positions
+    /// `channel_salt = 0` with `n_queries = 1000` is a seed where the folded positions
     /// come out unsorted.
     #[test]
     fn test_prove_verify_large_trace_canonical_small() {
@@ -166,7 +164,7 @@ pub mod builtin_tests {
             channel_hash: ChannelHash::Blake2s,
             fri_config: FriConfig::new(10, 0, 1, 1000, 1),
             preprocessed_trace: PreProcessedTraceVariant::CanonicalSmall,
-            channel_salt: 12,
+            channel_salt: 0,
             store_polynomials_coefficients: false,
             include_all_preprocessed_columns: false,
             opt_n_id_to_big_components: None,
@@ -229,6 +227,87 @@ pub mod builtin_tests {
             run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo_stwo, None)
                 .unwrap();
         assert_cairo_constraints(input, Arc::new(testing_preprocessed_tree(20)));
+    }
+
+    #[test]
+    fn test_keccak_builtin_constraints() {
+        let compiled_program = get_compiled_cairo_program_path("test_prove_verify_keccak_builtin");
+        let input =
+            run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo, None)
+                .unwrap();
+        assert_cairo_constraints(input, Arc::new(testing_preprocessed_tree(20)));
+    }
+
+    #[test]
+    fn test_prove_verify_keccak_builtin() {
+        let prover_params = ProverParameters {
+            channel_hash: ChannelHash::Blake2s,
+            fri_config: FriConfig::default(),
+            preprocessed_trace: PreProcessedTraceVariant::Canonical,
+            channel_salt: 0,
+            store_polynomials_coefficients: false,
+            include_all_preprocessed_columns: false,
+            opt_n_id_to_big_components: None,
+            lifting_size_policy: LiftingSizePolicy::Auto,
+        };
+        // 21 permutations: 20 chained from a full state, and the all-zero state.
+        let compiled_program = get_compiled_cairo_program_path("test_prove_verify_keccak_builtin");
+        let input =
+            run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo, None)
+                .unwrap();
+        let proof = prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
+        let keccak =
+            proof.claim.keccak_builtin.expect("Keccak builtin is not present in the claim");
+        assert_eq!(keccak.log_size, 5, "Expected 21 keccak instances, padded to 32");
+        // The aggregator pads its 21 rows to 32 and runs each through 24 rounds: 768 round rows.
+        let rounds = proof.claim.keccak_round.expect("Keccak rounds are not present in the claim");
+        assert_eq!(rounds.log_size, 10, "Expected 768 round rows, padded to 1024");
+        verify_cairo::<Blake2sMerkleChannel>(proof.into()).unwrap();
+    }
+
+    /// A wrong Keccak output must not verify: flips the lowest bit of the first output felt.
+    #[test]
+    fn test_prove_verify_keccak_builtin_wrong_output() {
+        use stwo_cairo_adapter::memory::MemoryValueId;
+
+        let prover_params = ProverParameters {
+            channel_hash: ChannelHash::Blake2s,
+            fri_config: FriConfig::default(),
+            preprocessed_trace: PreProcessedTraceVariant::Canonical,
+            channel_salt: 0,
+            store_polynomials_coefficients: false,
+            include_all_preprocessed_columns: false,
+            opt_n_id_to_big_components: None,
+            lifting_size_policy: LiftingSizePolicy::Auto,
+        };
+        let compiled_program = get_compiled_cairo_program_path("test_prove_verify_keccak_builtin");
+        let mut input =
+            run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo, None)
+                .unwrap();
+        let segment = input.builtin_segments.keccak_builtin.as_ref().expect("no keccak segment");
+        let first_output = segment.begin_addr + 8;
+        match input.memory.address_to_id[first_output].decode() {
+            MemoryValueId::F252(id) => input.memory.f252_values[id as usize][0] ^= 1,
+            MemoryValueId::Small(id) => input.memory.small_values[id as usize] ^= 1,
+            MemoryValueId::Empty => panic!("the first keccak output is empty"),
+        }
+
+        // With debug assertions the prover rejects the lookup sum itself; without them, the
+        // verifier does.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let proof = prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
+            verify_cairo::<Blake2sMerkleChannel>(proof.into())
+        }));
+        match result {
+            Ok(verification) => assert!(
+                matches!(verification, Err(CairoVerificationError::InvalidLogupSum)),
+                "a wrong keccak output verified"
+            ),
+            Err(panic) => {
+                let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or("");
+                assert!(message.contains("left == right"), "unexpected panic: {message}");
+            }
+        }
     }
 
     #[test]
@@ -481,8 +560,7 @@ fn test_prove_all_opcode_components_proof_regression() {
 fn test_prove_verify_all_builtins_non_default_fri_config() {
     let compiled_program = get_compiled_cairo_program_path("test_prove_verify_all_builtins");
     let input =
-        run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo_stwo, None)
-            .unwrap();
+        run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo, None).unwrap();
     let prover_params = ProverParameters {
         channel_hash: ChannelHash::Blake2s,
         fri_config: FriConfig::new(26, 0, 1, 70, 1),
@@ -581,8 +659,7 @@ mod pedersen_fast_deduction {
 fn test_prove_verify_all_builtins() {
     let compiled_program = get_compiled_cairo_program_path("test_prove_verify_all_builtins");
     let input =
-        run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo_stwo, None)
-            .unwrap();
+        run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo, None).unwrap();
     assert_all_builtins_in_input(&input);
     let prover_params = ProverParameters {
         channel_hash: ChannelHash::Blake2s,

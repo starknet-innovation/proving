@@ -67,13 +67,12 @@ mod tests {
 
     use crate::test_utils::get_prover_input_path;
 
-    fn test_compare_prover_input_to_expected_file(test_name: &str) {
+    fn test_compare_prover_input_to_expected_file(test_name: &str, layout: LayoutName) {
         let is_fix_mode = std::env::var("FIX") == Ok("1".to_string());
 
         let compiled_program = get_compiled_cairo_program_path(test_name);
         let mut prover_input =
-            run_and_adapt(&compiled_program, ProgramType::Json, LayoutName::all_cairo_stwo, None)
-                .unwrap();
+            run_and_adapt(&compiled_program, ProgramType::Json, layout, None).unwrap();
         // Public memory addresses are not deterministic, sort them.
         prover_input.public_memory_addresses.sort();
 
@@ -97,11 +96,18 @@ mod tests {
 
     #[test]
     fn test_compare_prover_input_to_expected_file_all_opcodes() {
-        test_compare_prover_input_to_expected_file("test_prove_verify_all_opcode_components");
+        test_compare_prover_input_to_expected_file(
+            "test_prove_verify_all_opcode_components",
+            LayoutName::all_cairo_stwo,
+        );
     }
 
     #[test]
     fn test_compare_prover_input_to_expected_file_all_builtins() {
-        test_compare_prover_input_to_expected_file("test_prove_verify_all_builtins");
+        // The program uses the keccak builtin, which only the all_cairo layout has.
+        test_compare_prover_input_to_expected_file(
+            "test_prove_verify_all_builtins",
+            LayoutName::all_cairo,
+        );
     }
 }

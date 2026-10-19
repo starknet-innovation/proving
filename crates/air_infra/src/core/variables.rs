@@ -592,6 +592,10 @@ impl_air_var!((CasmAddress, Offsets, FlagsFelts, FeltExpr));
 type PoseidonInputIds = [CasmId; 3];
 type PoseidonOutputIds = [CasmId; 3];
 impl_air_var!((PoseidonInputIds, PoseidonOutputIds));
+// KeccakAggregator
+type KeccakInputIds = [CasmId; 8];
+type KeccakOutputIds = [CasmId; 8];
+impl_air_var!((KeccakInputIds, KeccakOutputIds));
 // PedersenAggregator
 type PedersenInputIds = [CasmId; 2];
 type PedersenOutputId = CasmId;
@@ -610,6 +614,9 @@ impl_air_var!((ChainIdVar, RoundNumVar, PoseidonFullRoundState));
 type PoseidonPartialRoundState = [Felt252Width27Expr; 4];
 impl_air_var!((PoseidonPartialRoundState, Felt252Width27Expr));
 impl_air_var!((ChainIdVar, RoundNumVar, PoseidonPartialRoundState));
+// KeccakRound
+type KeccakState<const N: usize> = [FeltExpr; N];
+impl_air_var!((ChainIdVar, RoundNumVar, KeccakState<const N: usize>));
 // PartialECMul
 type ECPoint = [Felt252Expr; 2];
 type PackedECMultiplier<const NUM_WINDOWS: usize> = [FeltExpr; NUM_WINDOWS];

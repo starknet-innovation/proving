@@ -3,8 +3,9 @@ use std::sync::Arc;
 use stwo_cairo_adapter::builtins::BuiltinSegments;
 use stwo_cairo_common::builtins::{
     ADD_MOD_BUILTIN_MEMORY_CELLS, BITWISE_BUILTIN_MEMORY_CELLS, EC_OP_BUILTIN_MEMORY_CELLS,
-    MUL_MOD_BUILTIN_MEMORY_CELLS, PEDERSEN_BUILTIN_MEMORY_CELLS, POSEIDON_BUILTIN_MEMORY_CELLS,
-    RANGE_CHECK_96_BUILTIN_MEMORY_CELLS, RANGE_CHECK_BUILTIN_MEMORY_CELLS,
+    KECCAK_BUILTIN_MEMORY_CELLS, MUL_MOD_BUILTIN_MEMORY_CELLS, PEDERSEN_BUILTIN_MEMORY_CELLS,
+    POSEIDON_BUILTIN_MEMORY_CELLS, RANGE_CHECK_96_BUILTIN_MEMORY_CELLS,
+    RANGE_CHECK_BUILTIN_MEMORY_CELLS,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
@@ -111,6 +112,16 @@ pub fn get_builtins(
         let n_instances = segment_length / EC_OP_BUILTIN_MEMORY_CELLS;
         assert!(n_instances.is_power_of_two(), "ec_op instances number is not a power of two");
         builtins.push("ec_op_builtin");
+    }
+    if let Some(segment) = builtin_segments.keccak_builtin {
+        let segment_length = segment.stop_ptr - segment.begin_addr;
+        assert!(
+            segment_length.is_multiple_of(KECCAK_BUILTIN_MEMORY_CELLS),
+            "keccak segment length is not a multiple of it's cells_per_instance"
+        );
+        let n_instances = segment_length / KECCAK_BUILTIN_MEMORY_CELLS;
+        assert!(n_instances.is_power_of_two(), "keccak instances number is not a power of two");
+        builtins.push("keccak_builtin");
     }
 
     builtins

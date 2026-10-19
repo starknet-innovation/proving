@@ -51,6 +51,7 @@ pub struct CairoClaim {
     pub range_check96_builtin: Option<range_check96_builtin::Claim>,
     pub range_check_builtin: Option<range_check_builtin::Claim>,
     pub ec_op_builtin: Option<ec_op_builtin::Claim>,
+    pub keccak_builtin: Option<keccak_builtin::Claim>,
     pub partial_ec_mul_generic: Option<partial_ec_mul_generic::Claim>,
     pub pedersen_aggregator_window_bits_18: Option<pedersen_aggregator_window_bits_18::Claim>,
     pub partial_ec_mul_window_bits_18: Option<partial_ec_mul_window_bits_18::Claim>,
@@ -58,6 +59,8 @@ pub struct CairoClaim {
     pub pedersen_aggregator_window_bits_9: Option<pedersen_aggregator_window_bits_9::Claim>,
     pub partial_ec_mul_window_bits_9: Option<partial_ec_mul_window_bits_9::Claim>,
     pub pedersen_points_table_window_bits_9: Option<pedersen_points_table_window_bits_9::Claim>,
+    pub keccak_aggregator: Option<keccak_aggregator::Claim>,
+    pub keccak_round: Option<keccak_round::Claim>,
     pub poseidon_aggregator: Option<poseidon_aggregator::Claim>,
     pub poseidon_3_partial_rounds_chain: Option<poseidon_3_partial_rounds_chain::Claim>,
     pub poseidon_full_round_chain: Option<poseidon_full_round_chain::Claim>,
@@ -304,6 +307,13 @@ impl CairoClaim {
                 c.log_size,
             )
         });
+        self.keccak_builtin.as_ref().inspect(|c| {
+            accumulate_relation_uses(
+                relation_uses,
+                keccak_builtin::RELATION_USES_PER_ROW,
+                c.log_size,
+            )
+        });
         self.partial_ec_mul_generic.as_ref().inspect(|c| {
             accumulate_relation_uses(
                 relation_uses,
@@ -338,6 +348,16 @@ impl CairoClaim {
                 partial_ec_mul_window_bits_9::RELATION_USES_PER_ROW,
                 c.log_size,
             )
+        });
+        self.keccak_aggregator.as_ref().inspect(|c| {
+            accumulate_relation_uses(
+                relation_uses,
+                keccak_aggregator::RELATION_USES_PER_ROW,
+                c.log_size,
+            )
+        });
+        self.keccak_round.as_ref().inspect(|c| {
+            accumulate_relation_uses(relation_uses, keccak_round::RELATION_USES_PER_ROW, c.log_size)
         });
         self.poseidon_aggregator.as_ref().inspect(|c| {
             accumulate_relation_uses(
@@ -426,6 +446,7 @@ impl CairoClaim {
         self.range_check96_builtin.as_ref().inspect(|c| log_sizes_list.push(c.log_sizes()));
         self.range_check_builtin.as_ref().inspect(|c| log_sizes_list.push(c.log_sizes()));
         self.ec_op_builtin.as_ref().inspect(|c| log_sizes_list.push(c.log_sizes()));
+        self.keccak_builtin.as_ref().inspect(|c| log_sizes_list.push(c.log_sizes()));
         self.partial_ec_mul_generic.as_ref().inspect(|c| log_sizes_list.push(c.log_sizes()));
         self.pedersen_aggregator_window_bits_18
             .as_ref()
@@ -441,6 +462,8 @@ impl CairoClaim {
         self.pedersen_points_table_window_bits_9
             .as_ref()
             .inspect(|c| log_sizes_list.push(c.log_sizes()));
+        self.keccak_aggregator.as_ref().inspect(|c| log_sizes_list.push(c.log_sizes()));
+        self.keccak_round.as_ref().inspect(|c| log_sizes_list.push(c.log_sizes()));
         self.poseidon_aggregator.as_ref().inspect(|c| log_sizes_list.push(c.log_sizes()));
         self.poseidon_3_partial_rounds_chain
             .as_ref()
@@ -686,6 +709,12 @@ impl CairoClaim {
         } else {
             component_enable_bits.push(false);
         }
+        if let Some(c) = self.keccak_builtin {
+            component_log_sizes.push(c.log_size);
+            component_enable_bits.push(true);
+        } else {
+            component_enable_bits.push(false);
+        }
         if let Some(c) = self.partial_ec_mul_generic {
             component_log_sizes.push(c.log_size);
             component_enable_bits.push(true);
@@ -724,6 +753,18 @@ impl CairoClaim {
         }
         if let Some(_c) = self.pedersen_points_table_window_bits_9 {
             component_log_sizes.push(pedersen_points_table_window_bits_9::LOG_SIZE);
+            component_enable_bits.push(true);
+        } else {
+            component_enable_bits.push(false);
+        }
+        if let Some(c) = self.keccak_aggregator {
+            component_log_sizes.push(c.log_size);
+            component_enable_bits.push(true);
+        } else {
+            component_enable_bits.push(false);
+        }
+        if let Some(c) = self.keccak_round {
+            component_log_sizes.push(c.log_size);
             component_enable_bits.push(true);
         } else {
             component_enable_bits.push(false);
@@ -932,6 +973,7 @@ pub struct CairoInteractionClaim {
     pub range_check96_builtin: Option<range_check96_builtin::InteractionClaim>,
     pub range_check_builtin: Option<range_check_builtin::InteractionClaim>,
     pub ec_op_builtin: Option<ec_op_builtin::InteractionClaim>,
+    pub keccak_builtin: Option<keccak_builtin::InteractionClaim>,
     pub partial_ec_mul_generic: Option<partial_ec_mul_generic::InteractionClaim>,
     pub pedersen_aggregator_window_bits_18:
         Option<pedersen_aggregator_window_bits_18::InteractionClaim>,
@@ -943,6 +985,8 @@ pub struct CairoInteractionClaim {
     pub partial_ec_mul_window_bits_9: Option<partial_ec_mul_window_bits_9::InteractionClaim>,
     pub pedersen_points_table_window_bits_9:
         Option<pedersen_points_table_window_bits_9::InteractionClaim>,
+    pub keccak_aggregator: Option<keccak_aggregator::InteractionClaim>,
+    pub keccak_round: Option<keccak_round::InteractionClaim>,
     pub poseidon_aggregator: Option<poseidon_aggregator::InteractionClaim>,
     pub poseidon_3_partial_rounds_chain: Option<poseidon_3_partial_rounds_chain::InteractionClaim>,
     pub poseidon_full_round_chain: Option<poseidon_full_round_chain::InteractionClaim>,
@@ -1089,6 +1133,9 @@ impl CairoInteractionClaim {
         if let Some(c) = self.ec_op_builtin {
             claimed_sums.push(c.claimed_sum);
         }
+        if let Some(c) = self.keccak_builtin {
+            claimed_sums.push(c.claimed_sum);
+        }
         if let Some(c) = self.partial_ec_mul_generic {
             claimed_sums.push(c.claimed_sum);
         }
@@ -1108,6 +1155,12 @@ impl CairoInteractionClaim {
             claimed_sums.push(c.claimed_sum);
         }
         if let Some(c) = self.pedersen_points_table_window_bits_9 {
+            claimed_sums.push(c.claimed_sum);
+        }
+        if let Some(c) = self.keccak_aggregator {
+            claimed_sums.push(c.claimed_sum);
+        }
+        if let Some(c) = self.keccak_round {
             claimed_sums.push(c.claimed_sum);
         }
         if let Some(c) = self.poseidon_aggregator {
@@ -1308,6 +1361,9 @@ pub fn lookup_sum(
     interaction_claim.ec_op_builtin.as_ref().inspect(|ic| {
         sum += ic.claimed_sum;
     });
+    interaction_claim.keccak_builtin.as_ref().inspect(|ic| {
+        sum += ic.claimed_sum;
+    });
     interaction_claim.partial_ec_mul_generic.as_ref().inspect(|ic| {
         sum += ic.claimed_sum;
     });
@@ -1327,6 +1383,12 @@ pub fn lookup_sum(
         sum += ic.claimed_sum;
     });
     interaction_claim.pedersen_points_table_window_bits_9.as_ref().inspect(|ic| {
+        sum += ic.claimed_sum;
+    });
+    interaction_claim.keccak_aggregator.as_ref().inspect(|ic| {
+        sum += ic.claimed_sum;
+    });
+    interaction_claim.keccak_round.as_ref().inspect(|ic| {
         sum += ic.claimed_sum;
     });
     interaction_claim.poseidon_aggregator.as_ref().inspect(|ic| {

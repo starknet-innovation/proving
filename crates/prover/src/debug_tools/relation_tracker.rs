@@ -198,6 +198,15 @@ fn cairo_relation_entries(
     if let Some(component) = &cairo_components.ec_op_builtin {
         entries.extend(add_to_relation_entries(component, trace));
     }
+    if let Some(component) = &cairo_components.keccak_builtin {
+        entries.extend(add_to_relation_entries(component, trace));
+    }
+    if let Some(component) = &cairo_components.keccak_aggregator {
+        entries.extend(add_to_relation_entries(component, trace));
+    }
+    if let Some(component) = &cairo_components.keccak_round {
+        entries.extend(add_to_relation_entries(component, trace));
+    }
     if let Some(component) = &cairo_components.partial_ec_mul_generic {
         entries.extend(add_to_relation_entries(component, trace));
     }

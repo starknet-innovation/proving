@@ -38,6 +38,8 @@ pub fn get_manual_rust_constraints_components() -> Vec<String> {
         "circuit_blake_round".into(),
         "qm_31_into_u_32".into(),
         "blake_gate".into(),
+        // Generated, its 3049 constraints over 2402 columns are one function too large to compile.
+        "keccak_round".into(),
     ]
 }
 
@@ -71,6 +73,7 @@ fn get_manual_circuit_constraints_components() -> Vec<String> {
         // CASM components
         "memory_address_to_id".into(),
         "memory_id_to_big".into(),
+        "keccak_round".into(),
         // Gates components
         "qm_31_ops".into(),
         // The circuit version requires applying the enabler to the reading of the message,
@@ -91,6 +94,7 @@ fn get_manual_witness_components() -> Vec<String> {
         "partial_ec_mul_window_bits_18".into(),
         "partial_ec_mul_window_bits_9".into(),
         "verify_bitwise_xor_12".into(),
+        "keccak_round".into(),
     ]
 }
 
