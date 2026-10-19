@@ -64,6 +64,7 @@ pub mod range_check_mem_value_n_8;
 pub mod read_id;
 pub mod read_positive_known_id_num_bits_128;
 pub mod read_positive_known_id_num_bits_144;
+pub mod read_positive_known_id_num_bits_200;
 pub mod read_positive_known_id_num_bits_252;
 pub mod read_positive_known_id_num_bits_29;
 pub mod read_positive_known_id_num_bits_36;

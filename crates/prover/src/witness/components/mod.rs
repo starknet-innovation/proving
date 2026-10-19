@@ -1,3 +1,6 @@
+pub mod keccak_aggregator;
+pub mod keccak_builtin;
+pub mod keccak_round;
 pub mod memory_address_to_id;
 pub mod memory_id_to_big;
 

@@ -13,18 +13,19 @@ use crate::components::{
     blake_g, blake_round, blake_round_sigma, call_opcode_abs, call_opcode_rel_imm, cube_252,
     ec_op_builtin, generic_opcode, indented_component_display, jnz_opcode_non_taken,
     jnz_opcode_taken, jump_opcode_abs, jump_opcode_double_deref, jump_opcode_rel,
-    jump_opcode_rel_imm, memory_address_to_id, memory_id_to_big, memory_id_to_small,
-    mul_mod_builtin, mul_opcode, mul_opcode_small, partial_ec_mul_generic,
-    partial_ec_mul_window_bits_9, partial_ec_mul_window_bits_18, pedersen_aggregator_window_bits_9,
-    pedersen_aggregator_window_bits_18, pedersen_builtin, pedersen_builtin_narrow_windows,
-    pedersen_points_table_window_bits_9, pedersen_points_table_window_bits_18,
-    poseidon_3_partial_rounds_chain, poseidon_aggregator, poseidon_builtin,
-    poseidon_full_round_chain, poseidon_round_keys, qm_31_add_mul_opcode, range_check_3_3_3_3_3,
-    range_check_3_6_6_3, range_check_4_3, range_check_4_4, range_check_4_4_4_4, range_check_6,
-    range_check_7_2_5, range_check_8, range_check_9_9, range_check_11, range_check_12,
-    range_check_18, range_check_20, range_check_252_width_27, range_check_builtin,
-    range_check96_builtin, ret_opcode, triple_xor_32, verify_bitwise_xor_4, verify_bitwise_xor_7,
-    verify_bitwise_xor_8, verify_bitwise_xor_9, verify_bitwise_xor_12, verify_instruction,
+    jump_opcode_rel_imm, keccak_aggregator, keccak_builtin, keccak_round, memory_address_to_id,
+    memory_id_to_big, memory_id_to_small, mul_mod_builtin, mul_opcode, mul_opcode_small,
+    partial_ec_mul_generic, partial_ec_mul_window_bits_9, partial_ec_mul_window_bits_18,
+    pedersen_aggregator_window_bits_9, pedersen_aggregator_window_bits_18, pedersen_builtin,
+    pedersen_builtin_narrow_windows, pedersen_points_table_window_bits_9,
+    pedersen_points_table_window_bits_18, poseidon_3_partial_rounds_chain, poseidon_aggregator,
+    poseidon_builtin, poseidon_full_round_chain, poseidon_round_keys, qm_31_add_mul_opcode,
+    range_check_3_3_3_3_3, range_check_3_6_6_3, range_check_4_3, range_check_4_4,
+    range_check_4_4_4_4, range_check_6, range_check_7_2_5, range_check_8, range_check_9_9,
+    range_check_11, range_check_12, range_check_18, range_check_20, range_check_252_width_27,
+    range_check_builtin, range_check96_builtin, ret_opcode, triple_xor_32, verify_bitwise_xor_4,
+    verify_bitwise_xor_7, verify_bitwise_xor_8, verify_bitwise_xor_9, verify_bitwise_xor_12,
+    verify_instruction,
 };
 use crate::relations::CommonLookupElements;
 
@@ -64,6 +65,7 @@ pub struct CairoComponents {
     pub range_check96_builtin: Option<range_check96_builtin::Component>,
     pub range_check_builtin: Option<range_check_builtin::Component>,
     pub ec_op_builtin: Option<ec_op_builtin::Component>,
+    pub keccak_builtin: Option<keccak_builtin::Component>,
     pub partial_ec_mul_generic: Option<partial_ec_mul_generic::Component>,
     pub pedersen_aggregator_window_bits_18: Option<pedersen_aggregator_window_bits_18::Component>,
     pub partial_ec_mul_window_bits_18: Option<partial_ec_mul_window_bits_18::Component>,
@@ -72,6 +74,8 @@ pub struct CairoComponents {
     pub pedersen_aggregator_window_bits_9: Option<pedersen_aggregator_window_bits_9::Component>,
     pub partial_ec_mul_window_bits_9: Option<partial_ec_mul_window_bits_9::Component>,
     pub pedersen_points_table_window_bits_9: Option<pedersen_points_table_window_bits_9::Component>,
+    pub keccak_aggregator: Option<keccak_aggregator::Component>,
+    pub keccak_round: Option<keccak_round::Component>,
     pub poseidon_aggregator: Option<poseidon_aggregator::Component>,
     pub poseidon_3_partial_rounds_chain: Option<poseidon_3_partial_rounds_chain::Component>,
     pub poseidon_full_round_chain: Option<poseidon_full_round_chain::Component>,
@@ -546,6 +550,24 @@ impl CairoComponents {
                 interaction_claim.ec_op_builtin.unwrap().claimed_sum,
             )
         });
+        let keccak_builtin_component = cairo_claim.keccak_builtin.map(|keccak_builtin| {
+            keccak_builtin::Component::new(
+                tree_span_provider,
+                keccak_builtin::Eval {
+                    claim: keccak_builtin,
+                    common_lookup_elements: common_lookup_elements.clone(),
+                    keccak_builtin_segment_start: cairo_claim
+                        .public_data
+                        .public_memory
+                        .public_segments
+                        .get_segment_range_by_name("keccak_builtin")
+                        .unwrap()
+                        .start_ptr
+                        .value,
+                },
+                interaction_claim.keccak_builtin.unwrap().claimed_sum,
+            )
+        });
         let partial_ec_mul_generic_component =
             cairo_claim.partial_ec_mul_generic.map(|partial_ec_mul_generic| {
                 partial_ec_mul_generic::Component::new(
@@ -627,6 +649,26 @@ impl CairoComponents {
                     interaction_claim.pedersen_points_table_window_bits_9.unwrap().claimed_sum,
                 )
             });
+        let keccak_aggregator_component = cairo_claim.keccak_aggregator.map(|keccak_aggregator| {
+            keccak_aggregator::Component::new(
+                tree_span_provider,
+                keccak_aggregator::Eval {
+                    claim: keccak_aggregator,
+                    common_lookup_elements: common_lookup_elements.clone(),
+                },
+                interaction_claim.keccak_aggregator.unwrap().claimed_sum,
+            )
+        });
+        let keccak_round_component = cairo_claim.keccak_round.map(|keccak_round| {
+            keccak_round::Component::new(
+                tree_span_provider,
+                keccak_round::Eval {
+                    claim: keccak_round,
+                    common_lookup_elements: common_lookup_elements.clone(),
+                },
+                interaction_claim.keccak_round.unwrap().claimed_sum,
+            )
+        });
         let poseidon_aggregator_component =
             cairo_claim.poseidon_aggregator.map(|poseidon_aggregator| {
                 poseidon_aggregator::Component::new(
@@ -934,6 +976,7 @@ impl CairoComponents {
             range_check96_builtin: range_check96_builtin_component,
             range_check_builtin: range_check_builtin_component,
             ec_op_builtin: ec_op_builtin_component,
+            keccak_builtin: keccak_builtin_component,
             partial_ec_mul_generic: partial_ec_mul_generic_component,
             pedersen_aggregator_window_bits_18: pedersen_aggregator_window_bits_18_component,
             partial_ec_mul_window_bits_18: partial_ec_mul_window_bits_18_component,
@@ -941,6 +984,8 @@ impl CairoComponents {
             pedersen_aggregator_window_bits_9: pedersen_aggregator_window_bits_9_component,
             partial_ec_mul_window_bits_9: partial_ec_mul_window_bits_9_component,
             pedersen_points_table_window_bits_9: pedersen_points_table_window_bits_9_component,
+            keccak_aggregator: keccak_aggregator_component,
+            keccak_round: keccak_round_component,
             poseidon_aggregator: poseidon_aggregator_component,
             poseidon_3_partial_rounds_chain: poseidon_3_partial_rounds_chain_component,
             poseidon_full_round_chain: poseidon_full_round_chain_component,
@@ -1077,6 +1122,9 @@ impl CairoComponents {
         if let Some(component) = &self.ec_op_builtin {
             vec.push(component as &dyn Component);
         }
+        if let Some(component) = &self.keccak_builtin {
+            vec.push(component as &dyn Component);
+        }
         if let Some(component) = &self.partial_ec_mul_generic {
             vec.push(component as &dyn Component);
         }
@@ -1096,6 +1144,12 @@ impl CairoComponents {
             vec.push(component as &dyn Component);
         }
         if let Some(component) = &self.pedersen_points_table_window_bits_9 {
+            vec.push(component as &dyn Component);
+        }
+        if let Some(component) = &self.keccak_aggregator {
+            vec.push(component as &dyn Component);
+        }
+        if let Some(component) = &self.keccak_round {
             vec.push(component as &dyn Component);
         }
         if let Some(component) = &self.poseidon_aggregator {
@@ -1288,6 +1342,9 @@ impl Display for CairoComponents {
         if let Some(ref component) = self.ec_op_builtin {
             writeln!(f, "EcOpBuiltin: {}", indented_component_display(component))?;
         }
+        if let Some(ref component) = self.keccak_builtin {
+            writeln!(f, "KeccakBuiltin: {}", indented_component_display(component))?;
+        }
         if let Some(ref component) = self.partial_ec_mul_generic {
             writeln!(f, "PartialEcMulGeneric: {}", indented_component_display(component))?;
         }
@@ -1324,6 +1381,12 @@ impl Display for CairoComponents {
                 "PedersenPointsTableWindowBits9: {}",
                 indented_component_display(component)
             )?;
+        }
+        if let Some(ref component) = self.keccak_aggregator {
+            writeln!(f, "KeccakAggregator: {}", indented_component_display(component))?;
+        }
+        if let Some(ref component) = self.keccak_round {
+            writeln!(f, "KeccakRound: {}", indented_component_display(component))?;
         }
         if let Some(ref component) = self.poseidon_aggregator {
             writeln!(f, "PoseidonAggregator: {}", indented_component_display(component))?;

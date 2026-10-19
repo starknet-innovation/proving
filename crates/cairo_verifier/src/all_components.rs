@@ -152,6 +152,10 @@ pub fn all_components<Value: IValue>() -> IndexMap<&'static str, Box<dyn Circuit
             Box::new(components::ec_op_builtin::Component {}) as Box<dyn CircuitEval<Value>>,
         ),
         (
+            "keccak_builtin",
+            Box::new(components::keccak_builtin::Component {}) as Box<dyn CircuitEval<Value>>,
+        ),
+        (
             "partial_ec_mul_generic",
             Box::new(components::partial_ec_mul_generic::Component {})
                 as Box<dyn CircuitEval<Value>>,
@@ -185,6 +189,14 @@ pub fn all_components<Value: IValue>() -> IndexMap<&'static str, Box<dyn Circuit
             "pedersen_points_table_window_bits_9",
             Box::new(components::pedersen_points_table_window_bits_9::Component {})
                 as Box<dyn CircuitEval<Value>>,
+        ),
+        (
+            "keccak_aggregator",
+            Box::new(components::keccak_aggregator::Component {}) as Box<dyn CircuitEval<Value>>,
+        ),
+        (
+            "keccak_round",
+            Box::new(components::keccak_round::Component {}) as Box<dyn CircuitEval<Value>>,
         ),
         (
             "poseidon_aggregator",

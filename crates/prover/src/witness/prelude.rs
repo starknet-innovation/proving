@@ -38,6 +38,7 @@ pub use crate::witness::fast_deduction::blake::{
     BlakeRound, PackedBlakeG, PackedBlakeRoundSigma, PackedTripleXor32,
 };
 pub use crate::witness::fast_deduction::ec_op::PackedPartialEcMulGeneric;
+pub use crate::witness::fast_deduction::keccak::PackedKeccakRound;
 pub use crate::witness::fast_deduction::pedersen::{
     PackedPartialEcMulWindowBits9, PackedPartialEcMulWindowBits18,
     PackedPedersenPointsTableWindowBits9, PackedPedersenPointsTableWindowBits18,

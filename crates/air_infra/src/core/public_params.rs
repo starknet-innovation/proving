@@ -49,6 +49,7 @@ pub enum PublicParam {
     RangeCheck96BuiltinSegmentStart,
     PedersenBuiltinSegmentStart,
     ECOpBuiltinSegmentStart,
+    KeccakBuiltinSegmentStart,
 }
 
 impl PublicParam {
@@ -70,6 +71,7 @@ impl PublicParam {
                 "pedersen_builtin_segment_start".to_string()
             }
             PublicParam::ECOpBuiltinSegmentStart => "ec_op_builtin_segment_start".to_string(),
+            PublicParam::KeccakBuiltinSegmentStart => "keccak_builtin_segment_start".to_string(),
         }
     }
 }

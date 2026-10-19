@@ -26,7 +26,7 @@ use stwo::core::fields::m31::{M31, P as M31_P};
 use stwo::core::fields::qm31::QM31;
 use stwo_cairo_common::builtins::{
     ADD_MOD_BUILTIN_MEMORY_CELLS, BITWISE_BUILTIN_MEMORY_CELLS, EC_OP_BUILTIN_MEMORY_CELLS,
-    ECDSA_MEMORY_CELLS, KECCAK_MEMORY_CELLS, MUL_MOD_BUILTIN_MEMORY_CELLS,
+    ECDSA_MEMORY_CELLS, KECCAK_BUILTIN_MEMORY_CELLS, MUL_MOD_BUILTIN_MEMORY_CELLS,
     PEDERSEN_BUILTIN_MEMORY_CELLS, POSEIDON_BUILTIN_MEMORY_CELLS,
     RANGE_CHECK_96_BUILTIN_MEMORY_CELLS, RANGE_CHECK_BUILTIN_MEMORY_CELLS,
 };
@@ -68,6 +68,9 @@ pub const N_WORDS_PER_OUTPUT_CELL: usize = u128::BITS as usize / u32::BITS as us
 const _: () = assert!(N_OUTPUTS * N_WORDS_PER_OUTPUT_CELL == BLAKE2S_DIGEST_N_WORDS);
 const MEMORY_ADDRESS_BITS: u32 = 29;
 const BUILTIN_USAGE_BITS: u32 = 27;
+/// The bound on the uses of a builtin whose instances are too large for `BUILTIN_USAGE_BITS`: the
+/// Keccak builtin's 16 cells. Its segment holds fewer than 2^29 / 16 = 2^25 instances.
+const LARGE_BUILTIN_USAGE_BITS: u32 = 25;
 
 pub struct CasmState<T> {
     pub pc: T,
@@ -274,7 +277,7 @@ impl<Value: IValue> CairoStatement<Value> {
             ("poseidon_builtin", POSEIDON_BUILTIN_MEMORY_CELLS),
             ("ec_op_builtin", EC_OP_BUILTIN_MEMORY_CELLS),
             ("ecdsa_builtin", ECDSA_MEMORY_CELLS),
-            ("keccak_builtin", KECCAK_MEMORY_CELLS),
+            ("keccak_builtin", KECCAK_BUILTIN_MEMORY_CELLS),
             ("range_check96_builtin", RANGE_CHECK_96_BUILTIN_MEMORY_CELLS),
             ("add_mod_builtin", ADD_MOD_BUILTIN_MEMORY_CELLS),
             ("mul_mod_builtin", MUL_MOD_BUILTIN_MEMORY_CELLS),
@@ -293,16 +296,14 @@ impl<Value: IValue> CairoStatement<Value> {
 
         // Range-check the number of times each builtin is used.
         // n_uses = (end - start) / instance_size, which implies end = start + n_uses *
-        // instance_size (mod M31_P). Since end and start are 29 bits and n_uses is 27 bits,
-        // start + n_uses * instance_size < 2^29 + 2^27 * max_supported_builtin_instance_size <
-        // M31_P, so this equality also holds over the integers.
-        // Note that there is an assertion involving max_supported_builtin_instance_size that
-        // guarantees this doesn't overflow.
+        // instance_size (mod M31_P). Since end and start are 29 bits and n_uses is 27 bits (25 for
+        // the Keccak builtin, below), start + n_uses * instance_size < M31_P, so this equality also
+        // holds over the integers. The loop below asserts the bound for each builtin.
         extract_bits(context, &n_uses_simd, BUILTIN_USAGE_BITS);
 
         let actual_uses_iter = Simd::unpack(context, &n_uses_simd).into_iter();
         let mut range_checks = vec![];
-        let mut max_supported_builtin_instance_size = 0_usize;
+        let m31_p = usize::try_from(M31_P).unwrap();
         for ((name, size), actual_uses) in zip_eq(builtin_instance_sizes, actual_uses_iter) {
             let Some(index) = self.components.get_index_of(name) else {
                 // The component is not supported by the circuit - actual_uses must be 0.
@@ -310,20 +311,24 @@ impl<Value: IValue> CairoStatement<Value> {
                 continue;
             };
 
-            if size > max_supported_builtin_instance_size {
-                max_supported_builtin_instance_size = size;
-            }
+            // end = start + n_uses * instance_size must hold over the integers, so start + n_uses *
+            // instance_size < 2^29 + 2^usage_bits * instance_size must stay below M31_P. A large
+            // instance (Keccak's) gets a tighter bound on its count.
+            let usage_bits =
+                if (1 << MEMORY_ADDRESS_BITS) + (1 << BUILTIN_USAGE_BITS) * size < m31_p {
+                    BUILTIN_USAGE_BITS
+                } else {
+                    let uses = Simd::from_packed(vec![actual_uses], 1);
+                    extract_bits(context, &uses, LARGE_BUILTIN_USAGE_BITS);
+                    LARGE_BUILTIN_USAGE_BITS
+                };
+            assert!((1 << MEMORY_ADDRESS_BITS) + (1 << usage_bits) * size < m31_p);
 
             let component_size = component_sizes[index];
             // Check that 0 <= component_size - actual_uses < 2^27 => actual_uses <= component_size.
             let diff = eval!(context, (component_size) - (actual_uses));
             range_checks.push(M31Wrapper::new_unsafe(diff));
         }
-        assert!(
-            (1 << MEMORY_ADDRESS_BITS)
-                + (1 << BUILTIN_USAGE_BITS) * max_supported_builtin_instance_size
-                < usize::try_from(M31_P).unwrap(),
-        );
 
         let rc_simd = Simd::pack(context, &range_checks);
         extract_bits(context, &rc_simd, BUILTIN_USAGE_BITS);

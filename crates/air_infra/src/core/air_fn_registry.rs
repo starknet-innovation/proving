@@ -662,13 +662,19 @@ impl AirFnRegistry {
             // Update uses upper bound for the lowest level lookup components (that have no
             // callees).
             if entry_stats.uses_upper_bound.is_empty() {
-                // The called AirFn is a leaf AirFn (doesn't use other AirFns)
-                assert!(
-                    compiled_called_entry.padding_type == PaddingType::Multiplicity,
-                    "If the entry doesn't use any other components, it must be padded with \
-                     multiplicity."
-                );
-                *uses_upper_bound.entry(name.clone()).or_default() += cnt;
+                // The called AirFn is a leaf AirFn (doesn't use other AirFns). A leaf padded with
+                // multiplicity is a table, whose multiplicities are bounded here. A leaf padded
+                // with an enabler, such as a self-contained chain round, has no multiplicities.
+                match compiled_called_entry.padding_type {
+                    PaddingType::Multiplicity => {
+                        *uses_upper_bound.entry(name.clone()).or_default() += cnt;
+                    }
+                    PaddingType::Enabler => {}
+                    PaddingType::None => panic!(
+                        "If the entry doesn't use any other components, it must be padded with \
+                         multiplicity or an enabler."
+                    ),
+                }
             } else {
                 // The called AirFn is not a leaf AirFn
                 entry_stats.uses_upper_bound.iter().for_each(|(use_name, use_bound)| {

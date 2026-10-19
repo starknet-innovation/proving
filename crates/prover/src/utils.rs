@@ -111,6 +111,9 @@ pub fn cairo_provers(components: &CairoComponents) -> Vec<&dyn ComponentProver<S
     if let Some(component) = &components.ec_op_builtin {
         vec.push(component as &dyn ComponentProver<SimdBackend>);
     }
+    if let Some(component) = &components.keccak_builtin {
+        vec.push(component as &dyn ComponentProver<SimdBackend>);
+    }
     if let Some(component) = &components.partial_ec_mul_generic {
         vec.push(component as &dyn ComponentProver<SimdBackend>);
     }
@@ -130,6 +133,12 @@ pub fn cairo_provers(components: &CairoComponents) -> Vec<&dyn ComponentProver<S
         vec.push(component as &dyn ComponentProver<SimdBackend>);
     }
     if let Some(component) = &components.pedersen_points_table_window_bits_9 {
+        vec.push(component as &dyn ComponentProver<SimdBackend>);
+    }
+    if let Some(component) = &components.keccak_aggregator {
+        vec.push(component as &dyn ComponentProver<SimdBackend>);
+    }
+    if let Some(component) = &components.keccak_round {
         vec.push(component as &dyn ComponentProver<SimdBackend>);
     }
     if let Some(component) = &components.poseidon_aggregator {

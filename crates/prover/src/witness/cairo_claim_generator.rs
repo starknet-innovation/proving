@@ -58,6 +58,7 @@ pub struct CairoClaimGenerator {
     pub range_check96_builtin: Option<range_check96_builtin::ClaimGenerator>,
     pub range_check_builtin: Option<range_check_builtin::ClaimGenerator>,
     pub ec_op_builtin: Option<ec_op_builtin::ClaimGenerator>,
+    pub keccak_builtin: Option<keccak_builtin::ClaimGenerator>,
     pub partial_ec_mul_generic: Option<partial_ec_mul_generic::ClaimGenerator>,
     pub pedersen_aggregator_window_bits_18:
         Option<pedersen_aggregator_window_bits_18::ClaimGenerator>,
@@ -69,6 +70,8 @@ pub struct CairoClaimGenerator {
     pub partial_ec_mul_window_bits_9: Option<partial_ec_mul_window_bits_9::ClaimGenerator>,
     pub pedersen_points_table_window_bits_9:
         Option<pedersen_points_table_window_bits_9::ClaimGenerator>,
+    pub keccak_aggregator: Option<keccak_aggregator::ClaimGenerator>,
+    pub keccak_round: Option<keccak_round::ClaimGenerator>,
     pub poseidon_aggregator: Option<poseidon_aggregator::ClaimGenerator>,
     pub poseidon_3_partial_rounds_chain: Option<poseidon_3_partial_rounds_chain::ClaimGenerator>,
     pub poseidon_full_round_chain: Option<poseidon_full_round_chain::ClaimGenerator>,
@@ -142,6 +145,7 @@ impl CairoClaimGenerator {
             range_check96_builtin: range_check96_builtin_ref,
             range_check_builtin: range_check_builtin_ref,
             ec_op_builtin: ec_op_builtin_ref,
+            keccak_builtin: keccak_builtin_ref,
             partial_ec_mul_generic: partial_ec_mul_generic_ref,
             pedersen_aggregator_window_bits_18: pedersen_aggregator_window_bits_18_ref,
             partial_ec_mul_window_bits_18: partial_ec_mul_window_bits_18_ref,
@@ -149,6 +153,8 @@ impl CairoClaimGenerator {
             pedersen_aggregator_window_bits_9: pedersen_aggregator_window_bits_9_ref,
             partial_ec_mul_window_bits_9: partial_ec_mul_window_bits_9_ref,
             pedersen_points_table_window_bits_9: pedersen_points_table_window_bits_9_ref,
+            keccak_aggregator: keccak_aggregator_ref,
+            keccak_round: keccak_round_ref,
             poseidon_aggregator: poseidon_aggregator_ref,
             poseidon_3_partial_rounds_chain: poseidon_3_partial_rounds_chain_ref,
             poseidon_full_round_chain: poseidon_full_round_chain_ref,
@@ -534,6 +540,26 @@ impl CairoClaimGenerator {
                     ));
                 });
             }
+            if components.contains(&"keccak_builtin") {
+                s.spawn(|_| {
+                    let segment = builtin_segments.get_segment_by_name("keccak_builtin").unwrap();
+                    let segment_length = segment.stop_ptr - segment.begin_addr;
+                    assert!(
+                        segment_length.is_multiple_of(KECCAK_BUILTIN_MEMORY_CELLS),
+                        "keccak_builtin segment length is not a multiple of it's \
+                         cells_per_instance"
+                    );
+                    let n_instances = segment_length / KECCAK_BUILTIN_MEMORY_CELLS;
+                    assert!(
+                        n_instances.is_power_of_two(),
+                        "keccak_builtin instances number is not a power of two"
+                    );
+                    *keccak_builtin_ref = Some(keccak_builtin::ClaimGenerator::new(
+                        n_instances.ilog2(),
+                        segment.begin_addr as u32,
+                    ));
+                });
+            }
             if components.contains(&"partial_ec_mul_generic") {
                 s.spawn(|_| {
                     *partial_ec_mul_generic_ref =
@@ -578,6 +604,16 @@ impl CairoClaimGenerator {
                         Some(pedersen_points_table_window_bits_9::ClaimGenerator::new(
                             preprocessed_trace.clone(),
                         ));
+                });
+            }
+            if components.contains(&"keccak_aggregator") {
+                s.spawn(|_| {
+                    *keccak_aggregator_ref = Some(keccak_aggregator::ClaimGenerator::new());
+                });
+            }
+            if components.contains(&"keccak_round") {
+                s.spawn(|_| {
+                    *keccak_round_ref = Some(keccak_round::ClaimGenerator::new());
                 });
             }
             if components.contains(&"poseidon_aggregator") {
@@ -1263,6 +1299,17 @@ impl CairoClaimGenerator {
                 (claim, interaction_gen)
             })
             .unzip();
+        let (keccak_builtin_claim, keccak_builtin_interaction_gen) = self
+            .keccak_builtin
+            .map(|generator| {
+                let (trace, claim, interaction_gen) = generator.write_trace(
+                    self.memory_address_to_id.as_ref().unwrap(),
+                    self.keccak_aggregator.as_ref().unwrap(),
+                );
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
         let (partial_ec_mul_generic_claim, partial_ec_mul_generic_interaction_gen) = self
             .partial_ec_mul_generic
             .map(|generator| {
@@ -1345,6 +1392,25 @@ impl CairoClaimGenerator {
             pedersen_points_table_window_bits_9_interaction_gen,
         ) = self
             .pedersen_points_table_window_bits_9
+            .map(|generator| {
+                let (trace, claim, interaction_gen) = generator.write_trace();
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (keccak_aggregator_claim, keccak_aggregator_interaction_gen) = self
+            .keccak_aggregator
+            .map(|generator| {
+                let (trace, claim, interaction_gen) = generator.write_trace(
+                    self.memory_id_to_big.as_ref().unwrap(),
+                    self.keccak_round.as_ref().unwrap(),
+                );
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (keccak_round_claim, keccak_round_interaction_gen) = self
+            .keccak_round
             .map(|generator| {
                 let (trace, claim, interaction_gen) = generator.write_trace();
                 evals.extend(trace.to_evals());
@@ -1628,6 +1694,7 @@ impl CairoClaimGenerator {
                 range_check96_builtin: range_check96_builtin_claim,
                 range_check_builtin: range_check_builtin_claim,
                 ec_op_builtin: ec_op_builtin_claim,
+                keccak_builtin: keccak_builtin_claim,
                 partial_ec_mul_generic: partial_ec_mul_generic_claim,
                 pedersen_aggregator_window_bits_18: pedersen_aggregator_window_bits_18_claim,
                 partial_ec_mul_window_bits_18: partial_ec_mul_window_bits_18_claim,
@@ -1635,6 +1702,8 @@ impl CairoClaimGenerator {
                 pedersen_aggregator_window_bits_9: pedersen_aggregator_window_bits_9_claim,
                 partial_ec_mul_window_bits_9: partial_ec_mul_window_bits_9_claim,
                 pedersen_points_table_window_bits_9: pedersen_points_table_window_bits_9_claim,
+                keccak_aggregator: keccak_aggregator_claim,
+                keccak_round: keccak_round_claim,
                 poseidon_aggregator: poseidon_aggregator_claim,
                 poseidon_3_partial_rounds_chain: poseidon_3_partial_rounds_chain_claim,
                 poseidon_full_round_chain: poseidon_full_round_chain_claim,
@@ -1698,6 +1767,7 @@ impl CairoClaimGenerator {
                 range_check96_builtin: range_check96_builtin_interaction_gen,
                 range_check_builtin: range_check_builtin_interaction_gen,
                 ec_op_builtin: ec_op_builtin_interaction_gen,
+                keccak_builtin: keccak_builtin_interaction_gen,
                 partial_ec_mul_generic: partial_ec_mul_generic_interaction_gen,
                 pedersen_aggregator_window_bits_18:
                     pedersen_aggregator_window_bits_18_interaction_gen,
@@ -1709,6 +1779,8 @@ impl CairoClaimGenerator {
                 partial_ec_mul_window_bits_9: partial_ec_mul_window_bits_9_interaction_gen,
                 pedersen_points_table_window_bits_9:
                     pedersen_points_table_window_bits_9_interaction_gen,
+                keccak_aggregator: keccak_aggregator_interaction_gen,
+                keccak_round: keccak_round_interaction_gen,
                 poseidon_aggregator: poseidon_aggregator_interaction_gen,
                 poseidon_3_partial_rounds_chain: poseidon_3_partial_rounds_chain_interaction_gen,
                 poseidon_full_round_chain: poseidon_full_round_chain_interaction_gen,
@@ -1778,6 +1850,7 @@ pub struct CairoInteractionClaimGenerator {
     pub range_check96_builtin: Option<range_check96_builtin::InteractionClaimGenerator>,
     pub range_check_builtin: Option<range_check_builtin::InteractionClaimGenerator>,
     pub ec_op_builtin: Option<ec_op_builtin::InteractionClaimGenerator>,
+    pub keccak_builtin: Option<keccak_builtin::InteractionClaimGenerator>,
     pub partial_ec_mul_generic: Option<partial_ec_mul_generic::InteractionClaimGenerator>,
     pub pedersen_aggregator_window_bits_18:
         Option<pedersen_aggregator_window_bits_18::InteractionClaimGenerator>,
@@ -1791,6 +1864,8 @@ pub struct CairoInteractionClaimGenerator {
         Option<partial_ec_mul_window_bits_9::InteractionClaimGenerator>,
     pub pedersen_points_table_window_bits_9:
         Option<pedersen_points_table_window_bits_9::InteractionClaimGenerator>,
+    pub keccak_aggregator: Option<keccak_aggregator::InteractionClaimGenerator>,
+    pub keccak_round: Option<keccak_round::InteractionClaimGenerator>,
     pub poseidon_aggregator: Option<poseidon_aggregator::InteractionClaimGenerator>,
     pub poseidon_3_partial_rounds_chain:
         Option<poseidon_3_partial_rounds_chain::InteractionClaimGenerator>,
@@ -1861,6 +1936,7 @@ impl CairoInteractionClaimGenerator {
         let mut range_check96_builtin_result = None;
         let mut range_check_builtin_result = None;
         let mut ec_op_builtin_result = None;
+        let mut keccak_builtin_result = None;
         let mut partial_ec_mul_generic_result = None;
         let mut pedersen_aggregator_window_bits_18_result = None;
         let mut partial_ec_mul_window_bits_18_result = None;
@@ -1868,6 +1944,8 @@ impl CairoInteractionClaimGenerator {
         let mut pedersen_aggregator_window_bits_9_result = None;
         let mut partial_ec_mul_window_bits_9_result = None;
         let mut pedersen_points_table_window_bits_9_result = None;
+        let mut keccak_aggregator_result = None;
+        let mut keccak_round_result = None;
         let mut poseidon_aggregator_result = None;
         let mut poseidon_3_partial_rounds_chain_result = None;
         let mut poseidon_full_round_chain_result = None;
@@ -2105,6 +2183,12 @@ impl CairoInteractionClaimGenerator {
                         Some(generator.write_interaction_trace(common_lookup_elements));
                 });
             }
+            if let Some(generator) = self.keccak_builtin {
+                s.spawn(|_| {
+                    keccak_builtin_result =
+                        Some(generator.write_interaction_trace(common_lookup_elements));
+                });
+            }
             if let Some(generator) = self.partial_ec_mul_generic {
                 s.spawn(|_| {
                     partial_ec_mul_generic_result =
@@ -2144,6 +2228,18 @@ impl CairoInteractionClaimGenerator {
             if let Some(generator) = self.pedersen_points_table_window_bits_9 {
                 s.spawn(|_| {
                     pedersen_points_table_window_bits_9_result =
+                        Some(generator.write_interaction_trace(common_lookup_elements));
+                });
+            }
+            if let Some(generator) = self.keccak_aggregator {
+                s.spawn(|_| {
+                    keccak_aggregator_result =
+                        Some(generator.write_interaction_trace(common_lookup_elements));
+                });
+            }
+            if let Some(generator) = self.keccak_round {
+                s.spawn(|_| {
+                    keccak_round_result =
                         Some(generator.write_interaction_trace(common_lookup_elements));
                 });
             }
@@ -2469,6 +2565,11 @@ impl CairoInteractionClaimGenerator {
                 evals.extend(trace);
                 interaction_claim
             });
+        let keccak_builtin_interaction_claim =
+            keccak_builtin_result.map(|(trace, interaction_claim)| {
+                evals.extend(trace);
+                interaction_claim
+            });
         let partial_ec_mul_generic_interaction_claim =
             partial_ec_mul_generic_result.map(|(trace, interaction_claim)| {
                 evals.extend(trace);
@@ -2501,6 +2602,16 @@ impl CairoInteractionClaimGenerator {
             });
         let pedersen_points_table_window_bits_9_interaction_claim =
             pedersen_points_table_window_bits_9_result.map(|(trace, interaction_claim)| {
+                evals.extend(trace);
+                interaction_claim
+            });
+        let keccak_aggregator_interaction_claim =
+            keccak_aggregator_result.map(|(trace, interaction_claim)| {
+                evals.extend(trace);
+                interaction_claim
+            });
+        let keccak_round_interaction_claim =
+            keccak_round_result.map(|(trace, interaction_claim)| {
                 evals.extend(trace);
                 interaction_claim
             });
@@ -2672,6 +2783,7 @@ impl CairoInteractionClaimGenerator {
                 range_check96_builtin: range_check96_builtin_interaction_claim,
                 range_check_builtin: range_check_builtin_interaction_claim,
                 ec_op_builtin: ec_op_builtin_interaction_claim,
+                keccak_builtin: keccak_builtin_interaction_claim,
                 partial_ec_mul_generic: partial_ec_mul_generic_interaction_claim,
                 pedersen_aggregator_window_bits_18:
                     pedersen_aggregator_window_bits_18_interaction_claim,
@@ -2683,6 +2795,8 @@ impl CairoInteractionClaimGenerator {
                 partial_ec_mul_window_bits_9: partial_ec_mul_window_bits_9_interaction_claim,
                 pedersen_points_table_window_bits_9:
                     pedersen_points_table_window_bits_9_interaction_claim,
+                keccak_aggregator: keccak_aggregator_interaction_claim,
+                keccak_round: keccak_round_interaction_claim,
                 poseidon_aggregator: poseidon_aggregator_interaction_claim,
                 poseidon_3_partial_rounds_chain: poseidon_3_partial_rounds_chain_interaction_claim,
                 poseidon_full_round_chain: poseidon_full_round_chain_interaction_claim,
@@ -3047,6 +3161,16 @@ pub fn get_sub_components(component_name: &str) -> Vec<&'static str> {
                 "range_check_20",
                 "partial_ec_mul_generic",
                 "ec_op_builtin",
+            ]
+        }
+        "keccak_builtin" => {
+            vec![
+                "memory_address_to_id",
+                "range_check_9_9",
+                "memory_id_to_big",
+                "keccak_round",
+                "keccak_aggregator",
+                "keccak_builtin",
             ]
         }
         _ => panic!("Unknown component: {component_name}"),

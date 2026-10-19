@@ -1,5 +1,6 @@
 #![cfg_attr(feature = "prover", feature(portable_simd))]
 pub mod builtins;
+pub mod keccak;
 pub mod memory;
 pub mod preprocessed_columns;
 pub mod prover_params;
