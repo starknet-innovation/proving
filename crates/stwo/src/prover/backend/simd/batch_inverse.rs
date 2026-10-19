@@ -21,7 +21,7 @@ pub(super) struct BatchInverseScratch {
 }
 
 impl BatchInverseScratch {
-    fn new(len: usize) -> Self {
+    pub(super) fn new(len: usize) -> Self {
         Self { base_norms: unsafe { uninit_vec(len) }, base_norm_invs: unsafe { uninit_vec(len) } }
     }
 

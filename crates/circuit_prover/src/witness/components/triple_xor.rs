@@ -22,33 +22,26 @@ pub fn extract_component_inputs(
     assert_eq!(n_rows, input_addr_col_2.len());
     assert_eq!(n_rows, output_addr_col.len());
 
-    let mut inputs = Vec::with_capacity(n_rows);
-    unsafe {
-        inputs.set_len(n_rows);
-    }
-
     (
-        inputs.par_iter_mut(),
         input_addr_col_0.par_iter(),
         input_addr_col_1.par_iter(),
         input_addr_col_2.par_iter(),
         output_addr_col.par_iter(),
     )
         .into_par_iter()
-        .for_each(|(input, &addr_0, &addr_1, &addr_2, &out_addr)| {
+        .map(|(&addr_0, &addr_1, &addr_2, &out_addr)| {
             let qm31_in_addr_0 = context_values[addr_0].to_m31_array();
             let qm31_in_addr_1 = context_values[addr_1].to_m31_array();
             let qm31_in_addr_2 = context_values[addr_2].to_m31_array();
             let qm31_out_addr = context_values[out_addr].to_m31_array();
-            *input = [
+            [
                 UInt32::from(qm31_in_addr_0[0].0 | (qm31_in_addr_0[1].0 << 16)),
                 UInt32::from(qm31_in_addr_1[0].0 | (qm31_in_addr_1[1].0 << 16)),
                 UInt32::from(qm31_in_addr_2[0].0 | (qm31_in_addr_2[1].0 << 16)),
                 UInt32::from(qm31_out_addr[0].0 | (qm31_out_addr[1].0 << 16)),
-            ];
-        });
-
-    inputs
+            ]
+        })
+        .collect()
 }
 
 pub fn write_trace(
@@ -76,15 +69,7 @@ pub fn write_trace(
     let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
     let log_size = size.ilog2();
 
-    // A row's inputs, as `extract_component_inputs` stages them.
-    let input = |row: usize| -> InputType {
-        from_fn(|i| {
-            let value = context_values[columns[i].at(row)].to_m31_array();
-            UInt32::from(value[0].0 | (value[1].0 << 16))
-        })
-    };
-
-    let (trace, lookup_data) = write_trace_simd(n_rows, input, &columns);
+    let (trace, lookup_data) = write_trace_simd(n_rows, context_values, &columns);
     // The xor_8 rows are counted per task straight from the lookup tuples, the eight columns in
     // one pass (see `count_table_rows`), instead of from a staged copy of them with atomic adds
     // (omarespejel, rgr1_3f4875e7).
@@ -100,7 +85,7 @@ pub fn write_trace(
             (&d.verify_bitwise_xor_8_6[..], 0),
             (&d.verify_bitwise_xor_8_7[..], 0),
         ],
-        |&[_, a, b, c]: &[PackedM31; 4]| [a, b, c],
+        Widen::widen,
     );
 
     (trace, Claim { log_size }, InteractionClaimGenerator { log_size, lookup_data })
@@ -112,7 +97,7 @@ pub fn write_trace(
 #[allow(non_snake_case)]
 fn write_trace_simd(
     n_rows: usize,
-    input: impl Fn(usize) -> InputType + Sync,
+    context_values: &[QM31],
     columns: &[circuit_common::preprocessed::ColumnRows<'_>; 5],
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData) {
     let log_n_packed_rows = (n_rows / N_LANES).ilog2();
@@ -124,185 +109,98 @@ fn write_trace_simd(
         )
     };
 
-    let M31_112558620 = PackedM31::broadcast(M31::from(112558620));
-    let M31_256 = PackedM31::broadcast(M31::from(256));
-    let M31_378353459 = PackedM31::broadcast(M31::from(378353459));
-    let UInt16_8 = PackedUInt16::broadcast(UInt16::from(8));
+    let mask16 = u32x16::splat(0xFFFF);
+    let mask8 = u32x16::splat(0xFF);
 
     (trace.par_iter_mut(), lookup_data.par_iter_mut())
         .into_par_iter()
         .enumerate()
         .for_each(|(row_index, (row, lookup_data))| {
             let first = row_index * N_LANES;
-            let triple_xor_input: PackedInputType =
-                crate::witness::utils::packed_input(&input, first);
-            let [
-                triple_xor_input_addr_0,
-                triple_xor_input_addr_1,
-                triple_xor_input_addr_2,
-                triple_xor_output_addr,
-                mults,
-            ] = crate::witness::utils::packed_column_rows(columns, first);
+            let addr_arrays: [[u32; N_LANES]; 4] =
+                from_fn(|i| columns[i].packed_m31_at(first).into_simd().to_array());
+            let mults = columns[4].packed_m31_at(first);
+            let w: [u32x16; 4] = from_fn(|i| {
+                u32x16::from_array(addr_arrays[i].map(|addr| {
+                    let value = context_values[addr as usize].0;
+                    value.0.0 | (value.1.0 << 16)
+                }))
+            });
 
-            let input_a_limb_0_col0 = triple_xor_input[0].low().as_m31();
-            *row[0] = input_a_limb_0_col0;
-            let input_a_limb_1_col1 = triple_xor_input[0].high().as_m31();
-            *row[1] = input_a_limb_1_col1;
-            let input_b_limb_0_col2 = triple_xor_input[1].low().as_m31();
-            *row[2] = input_b_limb_0_col2;
-            let input_b_limb_1_col3 = triple_xor_input[1].high().as_m31();
-            *row[3] = input_b_limb_1_col3;
-            let input_c_limb_0_col4 = triple_xor_input[2].low().as_m31();
-            *row[4] = input_c_limb_0_col4;
-            let input_c_limb_1_col5 = triple_xor_input[2].high().as_m31();
-            *row[5] = input_c_limb_1_col5;
-            let input_a_xor_b_xor_c_limb_0_col6 = triple_xor_input[3].low().as_m31();
-            *row[6] = input_a_xor_b_xor_c_limb_0_col6;
-            let input_a_xor_b_xor_c_limb_1_col7 = triple_xor_input[3].high().as_m31();
-            *row[7] = input_a_xor_b_xor_c_limb_1_col7;
+            let a_lo = w[0] & mask16;
+            let a_hi = w[0] >> 16;
+            let b_lo = w[1] & mask16;
+            let b_hi = w[1] >> 16;
+            let c_lo = w[2] & mask16;
+            let c_hi = w[2] >> 16;
+            let out_lo = w[3] & mask16;
+            let out_hi = w[3] >> 16;
 
-            // Split 16 Low Part Size 8.
+            *row[0] = simd_to_m31(a_lo);
+            *row[1] = simd_to_m31(a_hi);
+            *row[2] = simd_to_m31(b_lo);
+            *row[3] = simd_to_m31(b_hi);
+            *row[4] = simd_to_m31(c_lo);
+            *row[5] = simd_to_m31(c_hi);
+            *row[6] = simd_to_m31(out_lo);
+            *row[7] = simd_to_m31(out_hi);
 
-            let ms_8_bits_tmp_b1429_0 = (triple_xor_input[0].low() >> (UInt16_8));
-            let ms_8_bits_col8 = ms_8_bits_tmp_b1429_0.as_m31();
-            *row[8] = ms_8_bits_col8;
-            let split_16_low_part_size_8_output_tmp_b1429_1 =
-                [((input_a_limb_0_col0) - ((ms_8_bits_col8) * (M31_256))), ms_8_bits_col8];
+            let col8 = a_lo >> 8;
+            let a_lo_8 = a_lo & mask8;
+            *row[8] = simd_to_m31(col8);
 
-            // Split 16 Low Part Size 8.
+            let col9 = a_hi >> 8;
+            let a_hi_8 = a_hi & mask8;
+            *row[9] = simd_to_m31(col9);
 
-            let ms_8_bits_tmp_b1429_2 = (triple_xor_input[0].high() >> (UInt16_8));
-            let ms_8_bits_col9 = ms_8_bits_tmp_b1429_2.as_m31();
-            *row[9] = ms_8_bits_col9;
-            let split_16_low_part_size_8_output_tmp_b1429_3 =
-                [((input_a_limb_1_col1) - ((ms_8_bits_col9) * (M31_256))), ms_8_bits_col9];
+            let col10 = b_lo >> 8;
+            let b_lo_8 = b_lo & mask8;
+            *row[10] = simd_to_m31(col10);
 
-            // Split 16 Low Part Size 8.
+            let col11 = b_hi >> 8;
+            let b_hi_8 = b_hi & mask8;
+            *row[11] = simd_to_m31(col11);
 
-            let ms_8_bits_tmp_b1429_4 = (triple_xor_input[1].low() >> (UInt16_8));
-            let ms_8_bits_col10 = ms_8_bits_tmp_b1429_4.as_m31();
-            *row[10] = ms_8_bits_col10;
-            let split_16_low_part_size_8_output_tmp_b1429_5 =
-                [((input_b_limb_0_col2) - ((ms_8_bits_col10) * (M31_256))), ms_8_bits_col10];
+            let col12 = c_lo >> 8;
+            let c_lo_8 = c_lo & mask8;
+            *row[12] = simd_to_m31(col12);
 
-            // Split 16 Low Part Size 8.
+            let col13 = c_hi >> 8;
+            let c_hi_8 = c_hi & mask8;
+            *row[13] = simd_to_m31(col13);
 
-            let ms_8_bits_tmp_b1429_6 = (triple_xor_input[1].high() >> (UInt16_8));
-            let ms_8_bits_col11 = ms_8_bits_tmp_b1429_6.as_m31();
-            *row[11] = ms_8_bits_col11;
-            let split_16_low_part_size_8_output_tmp_b1429_7 =
-                [((input_b_limb_1_col3) - ((ms_8_bits_col11) * (M31_256))), ms_8_bits_col11];
+            let col14 = out_lo >> 8;
+            let out_lo_8 = out_lo & mask8;
+            *row[14] = simd_to_m31(col14);
 
-            // Split 16 Low Part Size 8.
+            let col15 = out_hi >> 8;
+            let out_hi_8 = out_hi & mask8;
+            *row[15] = simd_to_m31(col15);
 
-            let ms_8_bits_tmp_b1429_8 = (triple_xor_input[2].low() >> (UInt16_8));
-            let ms_8_bits_col12 = ms_8_bits_tmp_b1429_8.as_m31();
-            *row[12] = ms_8_bits_col12;
-            let split_16_low_part_size_8_output_tmp_b1429_9 =
-                [((input_c_limb_0_col4) - ((ms_8_bits_col12) * (M31_256))), ms_8_bits_col12];
+            let col16 = a_lo_8 ^ b_lo_8;
+            *row[16] = simd_to_m31(col16);
+            *lookup_data.verify_bitwise_xor_8_0 = NarrowTriple::new([a_lo_8, b_lo_8, col16]);
 
-            // Split 16 Low Part Size 8.
+            let col17 = col8 ^ col10;
+            *row[17] = simd_to_m31(col17);
+            *lookup_data.verify_bitwise_xor_8_1 = NarrowTriple::new([col8, col10, col17]);
 
-            let ms_8_bits_tmp_b1429_10 = (triple_xor_input[2].high() >> (UInt16_8));
-            let ms_8_bits_col13 = ms_8_bits_tmp_b1429_10.as_m31();
-            *row[13] = ms_8_bits_col13;
-            let split_16_low_part_size_8_output_tmp_b1429_11 =
-                [((input_c_limb_1_col5) - ((ms_8_bits_col13) * (M31_256))), ms_8_bits_col13];
+            let col18 = a_hi_8 ^ b_hi_8;
+            *row[18] = simd_to_m31(col18);
+            *lookup_data.verify_bitwise_xor_8_2 = NarrowTriple::new([a_hi_8, b_hi_8, col18]);
 
-            // Split 16 Low Part Size 8.
+            let col19 = col9 ^ col11;
+            *row[19] = simd_to_m31(col19);
+            *lookup_data.verify_bitwise_xor_8_3 = NarrowTriple::new([col9, col11, col19]);
+            *lookup_data.verify_bitwise_xor_8_4 = NarrowTriple::new([col16, c_lo_8, out_lo_8]);
+            *lookup_data.verify_bitwise_xor_8_5 = NarrowTriple::new([col17, col12, col14]);
+            *lookup_data.verify_bitwise_xor_8_6 = NarrowTriple::new([col18, c_hi_8, out_hi_8]);
+            *lookup_data.verify_bitwise_xor_8_7 = NarrowTriple::new([col19, col13, col15]);
 
-            let ms_8_bits_tmp_b1429_12 = (triple_xor_input[3].low() >> (UInt16_8));
-            let ms_8_bits_col14 = ms_8_bits_tmp_b1429_12.as_m31();
-            *row[14] = ms_8_bits_col14;
-            let split_16_low_part_size_8_output_tmp_b1429_13 = [
-                ((input_a_xor_b_xor_c_limb_0_col6) - ((ms_8_bits_col14) * (M31_256))),
-                ms_8_bits_col14,
-            ];
-
-            // Split 16 Low Part Size 8.
-
-            let ms_8_bits_tmp_b1429_14 = (triple_xor_input[3].high() >> (UInt16_8));
-            let ms_8_bits_col15 = ms_8_bits_tmp_b1429_14.as_m31();
-            *row[15] = ms_8_bits_col15;
-            let split_16_low_part_size_8_output_tmp_b1429_15 = [
-                ((input_a_xor_b_xor_c_limb_1_col7) - ((ms_8_bits_col15) * (M31_256))),
-                ms_8_bits_col15,
-            ];
-
-            // Bitwise Xor Num Bits 8.
-
-            let xor_tmp_b1429_16 =
-                ((PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_b1429_1[0]))
-                    ^ (PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_b1429_5[0])));
-            let xor_col16 = xor_tmp_b1429_16.as_m31();
-            *row[16] = xor_col16;
-            *lookup_data.verify_bitwise_xor_8_0 = [
-                M31_112558620,
-                split_16_low_part_size_8_output_tmp_b1429_1[0],
-                split_16_low_part_size_8_output_tmp_b1429_5[0],
-                xor_col16,
-            ];
-
-            // Bitwise Xor Num Bits 8.
-
-            let xor_tmp_b1429_18 = ((PackedUInt16::from_m31(ms_8_bits_col8))
-                ^ (PackedUInt16::from_m31(ms_8_bits_col10)));
-            let xor_col17 = xor_tmp_b1429_18.as_m31();
-            *row[17] = xor_col17;
-            *lookup_data.verify_bitwise_xor_8_1 =
-                [M31_112558620, ms_8_bits_col8, ms_8_bits_col10, xor_col17];
-
-            // Bitwise Xor Num Bits 8.
-
-            let xor_tmp_b1429_20 =
-                ((PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_b1429_3[0]))
-                    ^ (PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_b1429_7[0])));
-            let xor_col18 = xor_tmp_b1429_20.as_m31();
-            *row[18] = xor_col18;
-            *lookup_data.verify_bitwise_xor_8_2 = [
-                M31_112558620,
-                split_16_low_part_size_8_output_tmp_b1429_3[0],
-                split_16_low_part_size_8_output_tmp_b1429_7[0],
-                xor_col18,
-            ];
-
-            // Bitwise Xor Num Bits 8.
-
-            let xor_tmp_b1429_22 = ((PackedUInt16::from_m31(ms_8_bits_col9))
-                ^ (PackedUInt16::from_m31(ms_8_bits_col11)));
-            let xor_col19 = xor_tmp_b1429_22.as_m31();
-            *row[19] = xor_col19;
-            *lookup_data.verify_bitwise_xor_8_3 =
-                [M31_112558620, ms_8_bits_col9, ms_8_bits_col11, xor_col19];
-            *lookup_data.verify_bitwise_xor_8_4 = [
-                M31_112558620,
-                xor_col16,
-                split_16_low_part_size_8_output_tmp_b1429_9[0],
-                split_16_low_part_size_8_output_tmp_b1429_13[0],
-            ];
-            *lookup_data.verify_bitwise_xor_8_5 =
-                [M31_112558620, xor_col17, ms_8_bits_col12, ms_8_bits_col14];
-            *lookup_data.verify_bitwise_xor_8_6 = [
-                M31_112558620,
-                xor_col18,
-                split_16_low_part_size_8_output_tmp_b1429_11[0],
-                split_16_low_part_size_8_output_tmp_b1429_15[0],
-            ];
-            *lookup_data.verify_bitwise_xor_8_7 =
-                [M31_112558620, xor_col19, ms_8_bits_col13, ms_8_bits_col15];
-
-            *lookup_data.gate_0 =
-                [M31_378353459, triple_xor_input_addr_0, input_a_limb_0_col0, input_a_limb_1_col1];
-            *lookup_data.gate_1 =
-                [M31_378353459, triple_xor_input_addr_1, input_b_limb_0_col2, input_b_limb_1_col3];
-            *lookup_data.gate_2 =
-                [M31_378353459, triple_xor_input_addr_2, input_c_limb_0_col4, input_c_limb_1_col5];
-            *lookup_data.gate_3 = [
-                M31_378353459,
-                triple_xor_output_addr,
-                input_a_xor_b_xor_c_limb_0_col6,
-                input_a_xor_b_xor_c_limb_1_col7,
-            ];
+            *lookup_data.gate_0 = NarrowGate::new(addr_arrays[0], a_lo, a_hi);
+            *lookup_data.gate_1 = NarrowGate::new(addr_arrays[1], b_lo, b_hi);
+            *lookup_data.gate_2 = NarrowGate::new(addr_arrays[2], c_lo, c_hi);
+            *lookup_data.gate_3 = NarrowGate::new(addr_arrays[3], out_lo, out_hi);
             *lookup_data.mults_0 = mults;
         });
     (trace, lookup_data)
@@ -310,19 +208,72 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 struct LookupData {
-    gate_0: Vec<[PackedM31; 4]>,
-    gate_1: Vec<[PackedM31; 4]>,
-    gate_2: Vec<[PackedM31; 4]>,
-    gate_3: Vec<[PackedM31; 4]>,
-    verify_bitwise_xor_8_0: Vec<[PackedM31; 4]>,
-    verify_bitwise_xor_8_1: Vec<[PackedM31; 4]>,
-    verify_bitwise_xor_8_2: Vec<[PackedM31; 4]>,
-    verify_bitwise_xor_8_3: Vec<[PackedM31; 4]>,
-    verify_bitwise_xor_8_4: Vec<[PackedM31; 4]>,
-    verify_bitwise_xor_8_5: Vec<[PackedM31; 4]>,
-    verify_bitwise_xor_8_6: Vec<[PackedM31; 4]>,
-    verify_bitwise_xor_8_7: Vec<[PackedM31; 4]>,
+    gate_0: Vec<NarrowGate>,
+    gate_1: Vec<NarrowGate>,
+    gate_2: Vec<NarrowGate>,
+    gate_3: Vec<NarrowGate>,
+    verify_bitwise_xor_8_0: Vec<NarrowTriple>,
+    verify_bitwise_xor_8_1: Vec<NarrowTriple>,
+    verify_bitwise_xor_8_2: Vec<NarrowTriple>,
+    verify_bitwise_xor_8_3: Vec<NarrowTriple>,
+    verify_bitwise_xor_8_4: Vec<NarrowTriple>,
+    verify_bitwise_xor_8_5: Vec<NarrowTriple>,
+    verify_bitwise_xor_8_6: Vec<NarrowTriple>,
+    verify_bitwise_xor_8_7: Vec<NarrowTriple>,
     mults_0: Vec<PackedM31>,
+}
+
+#[derive(Clone, Copy)]
+struct NarrowGate([u32; N_LANES], [[u16; N_LANES]; 2]);
+
+#[derive(Clone, Copy)]
+struct NarrowTriple([[u16; N_LANES]; 3]);
+
+#[inline(always)]
+fn simd_to_m31(value: u32x16) -> PackedM31 {
+    unsafe { PackedM31::from_simd_unchecked(value) }
+}
+
+#[inline(always)]
+fn narrow_lanes(value: u32x16) -> [u16; N_LANES] {
+    value.cast::<u16>().to_array()
+}
+
+#[inline(always)]
+fn widen_lanes(lanes: [u16; N_LANES]) -> PackedM31 {
+    simd_to_m31(Simd::from_array(lanes).cast())
+}
+
+impl NarrowGate {
+    #[inline(always)]
+    fn new(address: [u32; N_LANES], low: u32x16, high: u32x16) -> Self {
+        Self(address, [narrow_lanes(low), narrow_lanes(high)])
+    }
+}
+
+impl NarrowTriple {
+    #[inline(always)]
+    fn new(values: [u32x16; 3]) -> Self {
+        Self(values.map(narrow_lanes))
+    }
+}
+
+trait Widen {
+    fn widen(&self) -> [PackedM31; 3];
+}
+
+impl Widen for NarrowGate {
+    #[inline(always)]
+    fn widen(&self) -> [PackedM31; 3] {
+        [simd_to_m31(Simd::from_array(self.0)), widen_lanes(self.1[0]), widen_lanes(self.1[1])]
+    }
+}
+
+impl Widen for NarrowTriple {
+    #[inline(always)]
+    fn widen(&self) -> [PackedM31; 3] {
+        self.0.map(widen_lanes)
+    }
 }
 
 pub struct InteractionClaimGenerator {
@@ -335,56 +286,78 @@ impl InteractionClaimGenerator {
         common_lookup_elements: &relations::CommonLookupElements,
     ) -> (Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>, InteractionClaim) {
         let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(self.log_size) };
+        let mut lookup_data = self.lookup_data;
 
-        // Sum logup terms in pairs.
-        logup_gen.write_frac_cols(1, |_, row| {
-            let values0 = &self.lookup_data.verify_bitwise_xor_8_0[row];
-            let values1 = &self.lookup_data.verify_bitwise_xor_8_1[row];
-            let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-            let denom1: PackedQM31 = common_lookup_elements.combine(values1);
-            (denom0 + denom1, denom0 * denom1)
-        });
-
-        logup_gen.write_frac_cols(1, |_, row| {
-            let values0 = &self.lookup_data.verify_bitwise_xor_8_2[row];
-            let values1 = &self.lookup_data.verify_bitwise_xor_8_3[row];
-            let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-            let denom1: PackedQM31 = common_lookup_elements.combine(values1);
-            (denom0 + denom1, denom0 * denom1)
-        });
-
-        logup_gen.write_frac_cols(1, |_, row| {
-            let values0 = &self.lookup_data.verify_bitwise_xor_8_4[row];
-            let values1 = &self.lookup_data.verify_bitwise_xor_8_5[row];
-            let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-            let denom1: PackedQM31 = common_lookup_elements.combine(values1);
-            (denom0 + denom1, denom0 * denom1)
-        });
-
-        logup_gen.write_frac_cols(1, |_, row| {
-            let values0 = &self.lookup_data.verify_bitwise_xor_8_6[row];
-            let values1 = &self.lookup_data.verify_bitwise_xor_8_7[row];
-            let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-            let denom1: PackedQM31 = common_lookup_elements.combine(values1);
-            (denom0 + denom1, denom0 * denom1)
-        });
-
-        logup_gen.write_frac_cols(1, |_, row| {
-            let values0 = &self.lookup_data.gate_0[row];
-            let values1 = &self.lookup_data.gate_1[row];
-            let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-            let denom1: PackedQM31 = common_lookup_elements.combine(values1);
-            (denom0 + denom1, denom0 * denom1)
-        });
-
-        logup_gen.write_frac_cols(1, |_, row| {
-            let values0 = &self.lookup_data.gate_2[row];
-            let values1 = &self.lookup_data.gate_3[row];
-            let mults_0 = self.lookup_data.mults_0[row];
-            let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-            let denom1: PackedQM31 = common_lookup_elements.combine(values1);
-            (denom1 - denom0 * mults_0, denom0 * denom1)
-        });
+        for column in 0..6 {
+            let lookup_data_ref = &lookup_data;
+            logup_gen.write_frac_cols(1, |_, row| {
+                let lookup_data = lookup_data_ref;
+                let (values0, values1, tag) = match column {
+                    0 => (
+                        lookup_data.verify_bitwise_xor_8_0[row].widen(),
+                        lookup_data.verify_bitwise_xor_8_1[row].widen(),
+                        relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
+                    ),
+                    1 => (
+                        lookup_data.verify_bitwise_xor_8_2[row].widen(),
+                        lookup_data.verify_bitwise_xor_8_3[row].widen(),
+                        relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
+                    ),
+                    2 => (
+                        lookup_data.verify_bitwise_xor_8_4[row].widen(),
+                        lookup_data.verify_bitwise_xor_8_5[row].widen(),
+                        relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
+                    ),
+                    3 => (
+                        lookup_data.verify_bitwise_xor_8_6[row].widen(),
+                        lookup_data.verify_bitwise_xor_8_7[row].widen(),
+                        relations::VERIFY_BITWISE_XOR_8_RELATION_ID,
+                    ),
+                    4 => (
+                        lookup_data.gate_0[row].widen(),
+                        lookup_data.gate_1[row].widen(),
+                        relations::GATE_RELATION_ID,
+                    ),
+                    5 => (
+                        lookup_data.gate_2[row].widen(),
+                        lookup_data.gate_3[row].widen(),
+                        relations::GATE_RELATION_ID,
+                    ),
+                    _ => unreachable!(),
+                };
+                let tag_m31 = PackedM31::broadcast(M31::from(tag));
+                let denom0: PackedQM31 =
+                    common_lookup_elements.combine(&[tag_m31, values0[0], values0[1], values0[2]]);
+                let denom1: PackedQM31 =
+                    common_lookup_elements.combine(&[tag_m31, values1[0], values1[1], values1[2]]);
+                let numerator = if column < 5 {
+                    denom0 + denom1
+                } else {
+                    denom1 - denom0 * lookup_data.mults_0[row]
+                };
+                (numerator, denom0 * denom1)
+            });
+            if column < 4 {
+                let released = match column {
+                    0 => [&mut lookup_data.verify_bitwise_xor_8_0, &mut lookup_data.verify_bitwise_xor_8_1],
+                    1 => [&mut lookup_data.verify_bitwise_xor_8_2, &mut lookup_data.verify_bitwise_xor_8_3],
+                    2 => [&mut lookup_data.verify_bitwise_xor_8_4, &mut lookup_data.verify_bitwise_xor_8_5],
+                    _ => [&mut lookup_data.verify_bitwise_xor_8_6, &mut lookup_data.verify_bitwise_xor_8_7],
+                };
+                for values in released {
+                    drop(std::mem::take(values));
+                }
+            } else {
+                let released = match column {
+                    4 => [&mut lookup_data.gate_0, &mut lookup_data.gate_1],
+                    _ => [&mut lookup_data.gate_2, &mut lookup_data.gate_3],
+                };
+                for values in released {
+                    drop(std::mem::take(values));
+                }
+            }
+        }
+        drop(lookup_data);
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
 

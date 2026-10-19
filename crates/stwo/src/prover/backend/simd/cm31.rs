@@ -200,7 +200,7 @@ impl FieldExpOps for PackedCM31 {
 /// The lane-wise norm of `x` over `M31`: `N(a + bi) = (a + bi)(a - bi) = a^2 + b^2`.
 #[inline(always)]
 pub(super) fn norm(x: PackedCM31) -> PackedM31 {
-    x.a().square() + x.b().square()
+    x.a().mul_inline(x.a()) + x.b().mul_inline(x.b())
 }
 
 /// Inverts a single chunk.
@@ -218,7 +218,7 @@ pub(super) fn norm(x: PackedCM31) -> PackedM31 {
 ///
 /// As with any batch inversion, a zero in any lane makes the whole batch's output for that
 /// lane meaningless.
-fn batch_inverse_chunk(
+pub(super) fn batch_inverse_chunk(
     column: &[PackedCM31],
     dst: &mut [PackedCM31],
     scratch: &mut BatchInverseScratch,
@@ -232,7 +232,10 @@ fn batch_inverse_chunk(
     batch_inverse_in_place(base_norms, base_norm_invs);
 
     for ((&x, base_norm_inv), dst) in column.iter().zip(base_norm_invs).zip(dst) {
-        *dst = PackedCM31([x.a() * *base_norm_inv, -(x.b() * *base_norm_inv)]);
+        *dst = PackedCM31([
+            x.a().mul_inline(*base_norm_inv),
+            -(x.b().mul_inline(*base_norm_inv)),
+        ]);
     }
 }
 

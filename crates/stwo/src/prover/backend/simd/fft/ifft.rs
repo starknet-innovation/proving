@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use super::{
     CACHED_FFT_LOG_SIZE, MIN_FFT_LOG_SIZE, STREAM_SCATTER_LOG_SIZE, compute_first_twiddles,
-    mul_twiddle, scattered_stores_done, store_scattered, transpose_vecs,
+    mul_twiddle, mul_twiddle_even, scattered_stores_done, store_scattered, transpose_vecs,
 };
 use crate::core::circle::Coset;
 use crate::core::utils::bit_reverse;
@@ -103,8 +103,11 @@ pub unsafe fn ifft_lower_with_vecwise(
                 std::array::from_fn(|i| *twiddle_dbl[1].get_unchecked(index * 4 + i)),
                 std::array::from_fn(|i| *twiddle_dbl[2].get_unchecked(index * 2 + i)),
             );
-            (val0, val1) =
-                simd_ibutterfly(val0, val1, u32x16::splat(*twiddle_dbl[3].get_unchecked(index)));
+            (val0, val1) = simd_ibutterfly_even(
+                val0,
+                val1,
+                u32x16::splat(*twiddle_dbl[3].get_unchecked(index)),
+            );
             val0.store(values.add(index * 32));
             val1.store(values.add(index * 32 + 16));
         }
@@ -160,6 +163,8 @@ pub unsafe fn ifft_lower_without_vecwise(
 ) {
     assert!(log_size >= LOG_N_LANES as usize);
 
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+    let scale_dbl = scale.map(|s| s.into_simd() + s.into_simd());
     let values = UnsafeMut(values);
     parallel_iter!(0..1 << (log_size - fft_layers - LOG_N_LANES as usize)).for_each(|index_h| {
         let values = values.get();
@@ -183,6 +188,19 @@ pub unsafe fn ifft_lower_without_vecwise(
                 }
             }
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+        if let Some(scale_dbl) = scale_dbl {
+            let chunk = values.add(index_h << (fft_layers + LOG_N_LANES as usize));
+            for i in 0..1 << fft_layers {
+                let ptr = chunk.add(i << LOG_N_LANES as usize);
+                mul_twiddle(PackedBaseField::load(ptr), scale_dbl).store(ptr);
+            }
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512f")
+        )))]
         if let Some(scale) = scale {
             let chunk = values.add(index_h << (fft_layers + LOG_N_LANES as usize));
             for i in 0..1 << fft_layers {
@@ -290,7 +308,7 @@ pub unsafe fn ifft_out_of_place(
                         std::array::from_fn(|i| *first_twiddles[1].get_unchecked(index * 4 + i)),
                         std::array::from_fn(|i| *first_twiddles[2].get_unchecked(index * 2 + i)),
                     );
-                    (val0, val1) = simd_ibutterfly(
+                    (val0, val1) = simd_ibutterfly_even(
                         val0,
                         val1,
                         u32x16::splat(*first_twiddles[3].get_unchecked(index)),
@@ -456,6 +474,101 @@ pub fn simd_ibutterfly(
     (r0, prod)
 }
 
+#[cfg_attr(
+    all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")),
+    inline(always)
+)]
+fn simd_ibutterfly_even(
+    val0: PackedBaseField,
+    val1: PackedBaseField,
+    twiddle_dbl: u32x16,
+) -> (PackedBaseField, PackedBaseField) {
+    let r0 = val0 + val1;
+    let r1 = val0 - val1;
+    let prod = mul_twiddle_even(r1, twiddle_dbl);
+    (r0, prod)
+}
+
+/// Fuses `(val0, val1) = simd_ibutterfly(val0, val1, t)` with `(val0, val1) = val0.deinterleave(val1)`.
+///
+/// Inside `mul_doubled_avx2`, `prod_dbl_e` already holds the 8 even-lane products and `prod_dbl_o`
+/// already holds the 8 odd-lane products. Extracting their low/high 32-bit halves with
+/// `_mm256_shuffle_ps::<0x88/0xDD>` and permuting once after the M31 addition produces the
+/// deinterleaved product directly without interleaving and then deinterleaving.
+#[cfg_attr(
+    all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")),
+    inline(always)
+)]
+fn ibutterfly_deinterleave(
+    val0: PackedBaseField,
+    val1: PackedBaseField,
+    twiddle_dbl: u32x16,
+) -> (PackedBaseField, PackedBaseField) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+    unsafe {
+        use std::arch::x86_64::{
+            __m256i, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_mul_epu32,
+            _mm256_permute4x64_epi64, _mm256_shuffle_ps, _mm256_srli_epi64,
+        };
+        use std::mem::transmute;
+
+        let r0 = val0 + val1;
+        let r1 = val0 - val1;
+
+        let [r0_0, r0_1]: [__m256i; 2] = transmute(r0);
+        let r0_0_ps = _mm256_castsi256_ps(r0_0);
+        let r0_1_ps = _mm256_castsi256_ps(r0_1);
+        let r0_e = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+            _mm256_shuffle_ps::<0x88>(r0_0_ps, r0_1_ps),
+        ));
+        let r0_o = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+            _mm256_shuffle_ps::<0xDD>(r0_0_ps, r0_1_ps),
+        ));
+
+        let [a0, a1]: [__m256i; 2] = transmute(r1);
+        let [b0_dbl, b1_dbl]: [__m256i; 2] = transmute(twiddle_dbl);
+        let a0_o = _mm256_srli_epi64(a0, 32);
+        let a1_o = _mm256_srli_epi64(a1, 32);
+        let b0_dbl_o = _mm256_srli_epi64(b0_dbl, 32);
+        let b1_dbl_o = _mm256_srli_epi64(b1_dbl, 32);
+
+        let prod0_dbl_e = _mm256_mul_epu32(a0, b0_dbl);
+        let prod1_dbl_e = _mm256_mul_epu32(a1, b1_dbl);
+        let prod0_dbl_o = _mm256_mul_epu32(a0_o, b0_dbl_o);
+        let prod1_dbl_o = _mm256_mul_epu32(a1_o, b1_dbl_o);
+
+        let pe0_ps = _mm256_castsi256_ps(prod0_dbl_e);
+        let pe1_ps = _mm256_castsi256_ps(prod1_dbl_e);
+        let po0_ps = _mm256_castsi256_ps(prod0_dbl_o);
+        let po1_ps = _mm256_castsi256_ps(prod1_dbl_o);
+
+        let lo_e = _mm256_castps_si256(_mm256_shuffle_ps::<0x88>(pe0_ps, pe1_ps));
+        let hi_e = _mm256_castps_si256(_mm256_shuffle_ps::<0xDD>(pe0_ps, pe1_ps));
+        let lo_o = _mm256_castps_si256(_mm256_shuffle_ps::<0x88>(po0_ps, po1_ps));
+        let hi_o = _mm256_castps_si256(_mm256_shuffle_ps::<0xDD>(po0_ps, po1_ps));
+
+        let mut prod_lo: u32x16 = transmute([lo_e, lo_o]);
+        prod_lo >>= 1;
+        let prod_hi: u32x16 = transmute([hi_e, hi_o]);
+        let prod =
+            PackedBaseField::from_simd_unchecked(prod_lo) + PackedBaseField::from_simd_unchecked(prod_hi);
+        let [prod_e_unperm, prod_o_unperm]: [__m256i; 2] = transmute(prod);
+        let prod_e = _mm256_permute4x64_epi64::<0xD8>(prod_e_unperm);
+        let prod_o = _mm256_permute4x64_epi64::<0xD8>(prod_o_unperm);
+
+        return (transmute([r0_e, prod_e]), transmute([r0_o, prod_o]));
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    )))]
+    {
+        let (val0, val1) = simd_ibutterfly(val0, val1, twiddle_dbl);
+        val0.deinterleave(val1)
+    }
+}
+
 /// Runs ifft on 2 vectors of 16 M31 elements.
 ///
 /// This amounts to 4 butterfly layers, each with 16 butterflies.
@@ -474,8 +587,6 @@ pub fn vecwise_ibutterflies(
     twiddle2_dbl: [u32; 4],
     twiddle3_dbl: [u32; 2],
 ) -> (PackedBaseField, PackedBaseField) {
-    // TODO(andrew): Can the permute be fused with the _mm512_srli_epi64 inside the butterfly?
-
     // Each `ibutterfly` take 2 512-bit registers, and does 16 butterflies element by element.
     // We need to permute the 512-bit registers to get the right order for the butterflies.
     // Denote the index of the 16 M31 elements in register i as i:abcd.
@@ -497,26 +608,16 @@ pub fn vecwise_ibutterflies(
 
     // Apply the permutation, resulting in indexing d:iabc.
     (val0, val1) = val0.deinterleave(val1);
-    (val0, val1) = simd_ibutterfly(val0, val1, t0);
-
-    // Apply the permutation, resulting in indexing c:diab.
-    (val0, val1) = val0.deinterleave(val1);
-    (val0, val1) = simd_ibutterfly(val0, val1, t1);
+    (val0, val1) = ibutterfly_deinterleave(val0, val1, t0);
+    (val0, val1) = ibutterfly_deinterleave(val0, val1, t1);
 
     let t =
         simd_swizzle!(u32x4::from(twiddle2_dbl), [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]);
-    // Apply the permutation, resulting in indexing b:cdia.
-    (val0, val1) = val0.deinterleave(val1);
-    (val0, val1) = simd_ibutterfly(val0, val1, t);
+    (val0, val1) = ibutterfly_deinterleave(val0, val1, t);
 
     let t =
         simd_swizzle!(u32x2::from(twiddle3_dbl), [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
-    // Apply the permutation, resulting in indexing a:bcid.
-    (val0, val1) = val0.deinterleave(val1);
-    (val0, val1) = simd_ibutterfly(val0, val1, t);
-
-    // Apply the permutation, resulting in indexing i:abcd.
-    val0.deinterleave(val1)
+    ibutterfly_deinterleave(val0, val1, t)
 }
 
 /// Returns the line twiddles (x points) for an ifft on a coset.
@@ -570,22 +671,22 @@ pub unsafe fn ifft3(
     let mut val7 = PackedBaseField::load(values.add(offset + (7 << log_step)).cast_const());
 
     // Apply the first layer of ibutterflies.
-    (val0, val1) = simd_ibutterfly(val0, val1, twiddles_dbl0[0]);
-    (val2, val3) = simd_ibutterfly(val2, val3, twiddles_dbl0[1]);
-    (val4, val5) = simd_ibutterfly(val4, val5, twiddles_dbl0[2]);
-    (val6, val7) = simd_ibutterfly(val6, val7, twiddles_dbl0[3]);
+    (val0, val1) = simd_ibutterfly_even(val0, val1, twiddles_dbl0[0]);
+    (val2, val3) = simd_ibutterfly_even(val2, val3, twiddles_dbl0[1]);
+    (val4, val5) = simd_ibutterfly_even(val4, val5, twiddles_dbl0[2]);
+    (val6, val7) = simd_ibutterfly_even(val6, val7, twiddles_dbl0[3]);
 
     // Apply the second layer of ibutterflies.
-    (val0, val2) = simd_ibutterfly(val0, val2, twiddles_dbl1[0]);
-    (val1, val3) = simd_ibutterfly(val1, val3, twiddles_dbl1[0]);
-    (val4, val6) = simd_ibutterfly(val4, val6, twiddles_dbl1[1]);
-    (val5, val7) = simd_ibutterfly(val5, val7, twiddles_dbl1[1]);
+    (val0, val2) = simd_ibutterfly_even(val0, val2, twiddles_dbl1[0]);
+    (val1, val3) = simd_ibutterfly_even(val1, val3, twiddles_dbl1[0]);
+    (val4, val6) = simd_ibutterfly_even(val4, val6, twiddles_dbl1[1]);
+    (val5, val7) = simd_ibutterfly_even(val5, val7, twiddles_dbl1[1]);
 
     // Apply the third layer of ibutterflies.
-    (val0, val4) = simd_ibutterfly(val0, val4, twiddles_dbl2[0]);
-    (val1, val5) = simd_ibutterfly(val1, val5, twiddles_dbl2[0]);
-    (val2, val6) = simd_ibutterfly(val2, val6, twiddles_dbl2[0]);
-    (val3, val7) = simd_ibutterfly(val3, val7, twiddles_dbl2[0]);
+    (val0, val4) = simd_ibutterfly_even(val0, val4, twiddles_dbl2[0]);
+    (val1, val5) = simd_ibutterfly_even(val1, val5, twiddles_dbl2[0]);
+    (val2, val6) = simd_ibutterfly_even(val2, val6, twiddles_dbl2[0]);
+    (val3, val7) = simd_ibutterfly_even(val3, val7, twiddles_dbl2[0]);
 
     // Store the 8 SIMD vectors back to the array.
     val0.store(values.add(offset + (0 << log_step)));
@@ -632,12 +733,12 @@ pub unsafe fn ifft2(
     let mut val3 = PackedBaseField::load(values.add(offset + (3 << log_step)).cast_const());
 
     // Apply the first layer of butterflies.
-    (val0, val1) = simd_ibutterfly(val0, val1, twiddles_dbl0[0]);
-    (val2, val3) = simd_ibutterfly(val2, val3, twiddles_dbl0[1]);
+    (val0, val1) = simd_ibutterfly_even(val0, val1, twiddles_dbl0[0]);
+    (val2, val3) = simd_ibutterfly_even(val2, val3, twiddles_dbl0[1]);
 
     // Apply the second layer of butterflies.
-    (val0, val2) = simd_ibutterfly(val0, val2, twiddles_dbl1[0]);
-    (val1, val3) = simd_ibutterfly(val1, val3, twiddles_dbl1[0]);
+    (val0, val2) = simd_ibutterfly_even(val0, val2, twiddles_dbl1[0]);
+    (val1, val3) = simd_ibutterfly_even(val1, val3, twiddles_dbl1[0]);
 
     // Store the 4 SIMD vectors back to the array.
     val0.store(values.add(offset + (0 << log_step)));
@@ -667,7 +768,7 @@ pub unsafe fn ifft1(values: *mut u32, offset: usize, log_step: usize, twiddles_d
     let mut val0 = PackedBaseField::load(values.add(offset + (0 << log_step)).cast_const());
     let mut val1 = PackedBaseField::load(values.add(offset + (1 << log_step)).cast_const());
 
-    (val0, val1) = simd_ibutterfly(val0, val1, twiddles_dbl0[0]);
+    (val0, val1) = simd_ibutterfly_even(val0, val1, twiddles_dbl0[0]);
 
     // Store the 2 SIMD vectors back to the array.
     val0.store(values.add(offset + (0 << log_step)));

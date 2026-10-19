@@ -58,22 +58,21 @@ impl ClaimGenerator {
         Self { small_values, big_values, small_mults, big_mults }
     }
 
+    #[inline]
     pub fn deduce_output(&self, ids: PackedM31) -> PackedFelt252 {
-        let values = std::array::from_fn(|j| {
-            Simd::from_array(ids.to_array().map(|M31(i)| match EncodedMemoryValueId(i).decode() {
-                MemoryValueId::F252(id) => self.big_values[id as usize][j],
+        let words_by_lane: [[u32; 8]; N_LANES] =
+            ids.to_array().map(|M31(i)| match EncodedMemoryValueId(i).decode() {
+                MemoryValueId::F252(id) => self.big_values[id as usize],
                 MemoryValueId::Small(id) => {
-                    if j >= 4 {
-                        0
-                    } else {
-                        let small = self.small_values[id as usize];
-                        u128_to_4_limbs(small)[j]
-                    }
+                    let [w0, w1, w2, w3] = u128_to_4_limbs(self.small_values[id as usize]);
+                    [w0, w1, w2, w3, 0, 0, 0, 0]
                 }
                 MemoryValueId::Empty => {
                     panic!("Attempted deduce_output on empty memory cell.")
                 }
-            }))
+            });
+        let values = std::array::from_fn(|j| {
+            Simd::from_array(std::array::from_fn(|lane| words_by_lane[lane][j]))
         });
 
         PackedFelt252 { value: split_f252_simd(values) }
@@ -238,29 +237,29 @@ fn gen_big_memory_traces(
 fn gen_single_big_memory_trace(values: &[[u32; 8]], mults: &[PackedM31]) -> Vec<BaseColumn> {
     assert_eq!(values.len(), mults.len() * N_LANES);
     let column_length = values.len().next_power_of_two();
+    let n_packed_rows = column_length / N_LANES;
+    let n_active_packed = values.len() / N_LANES;
 
     let mut mults = mults.to_vec();
-    mults.resize(column_length / N_LANES, PackedM31::zero());
+    mults.resize(n_packed_rows, PackedM31::zero());
     let multiplicities = BaseColumn::from_simd(mults);
-
-    let packed_values = values
-        .iter()
-        .chain(std::iter::repeat(&[0; 8]))
-        .take(column_length)
-        .array_chunks::<N_LANES>()
-        .map(|chunk| {
-            std::array::from_fn(|i| Simd::from_array(std::array::from_fn(|j| chunk[j][i])))
-        })
-        .collect_vec();
 
     let mut value_trace =
         std::iter::repeat_with(|| unsafe { BaseColumn::uninitialized(column_length) })
             .take(FELT252_N_WORDS)
             .collect_vec();
-    for (i, values) in packed_values.iter().enumerate() {
-        let values = split_f252_simd(*values);
-        for (j, value) in values.iter().enumerate() {
+    for (i, chunk) in values.chunks_exact(N_LANES).enumerate() {
+        let packed_words =
+            std::array::from_fn(|w| Simd::from_array(std::array::from_fn(|lane| chunk[lane][w])));
+        let limbs = split_f252_simd(packed_words);
+        for (j, value) in limbs.iter().enumerate() {
             value_trace[j].data[i] = *value;
+        }
+    }
+    if n_active_packed < n_packed_rows {
+        let zero_limbs = split_f252_simd([Simd::splat(0); 8]);
+        for (j, value) in zero_limbs.iter().enumerate() {
+            value_trace[j].data[n_active_packed..n_packed_rows].fill(*value);
         }
     }
 
@@ -271,38 +270,38 @@ fn gen_single_big_memory_trace(values: &[[u32; 8]], mults: &[PackedM31]) -> Vec<
 fn gen_small_memory_trace(values: Vec<u128>, mut mults: Vec<PackedM31>) -> Vec<BaseColumn> {
     assert_eq!(values.len(), mults.len() * N_LANES);
     let column_length = values.len().next_power_of_two();
+    let n_packed_rows = column_length / N_LANES;
+    let n_active_packed = values.len() / N_LANES;
 
-    mults.resize(column_length / N_LANES, PackedM31::zero());
+    mults.resize(n_packed_rows, PackedM31::zero());
     let multiplicities = BaseColumn::from_simd(mults);
-
-    let packed_values: Vec<[Simd<u32, N_LANES>; 4]> = values
-        .into_iter()
-        .chain(std::iter::repeat(0))
-        .take(column_length)
-        .map(u128_to_4_limbs)
-        .array_chunks::<N_LANES>()
-        .map(|chunk| {
-            std::array::from_fn(|i| Simd::from_array(std::array::from_fn(|j| chunk[j][i])))
-        })
-        .collect_vec();
 
     let mut values_trace =
         std::iter::repeat_with(|| unsafe { BaseColumn::uninitialized(column_length) })
             .take(N_M31_IN_SMALL_FELT252)
             .collect_vec();
-    for (i, values) in packed_values.iter().enumerate() {
-        let values = split_f252_simd([
-            values[0],
-            values[1],
-            values[2],
-            values[3],
+    for (i, chunk) in values.chunks_exact(N_LANES).enumerate() {
+        let limbs_by_lane: [[u32; 4]; N_LANES] =
+            std::array::from_fn(|lane| u128_to_4_limbs(chunk[lane]));
+        let packed_words = [
+            Simd::from_array(std::array::from_fn(|lane| limbs_by_lane[lane][0])),
+            Simd::from_array(std::array::from_fn(|lane| limbs_by_lane[lane][1])),
+            Simd::from_array(std::array::from_fn(|lane| limbs_by_lane[lane][2])),
+            Simd::from_array(std::array::from_fn(|lane| limbs_by_lane[lane][3])),
             Simd::splat(0),
             Simd::splat(0),
             Simd::splat(0),
             Simd::splat(0),
-        ]);
-        for (j, value) in values[..N_M31_IN_SMALL_FELT252].iter().enumerate() {
+        ];
+        let limbs = split_f252_simd(packed_words);
+        for (j, value) in limbs[..N_M31_IN_SMALL_FELT252].iter().enumerate() {
             values_trace[j].data[i] = *value;
+        }
+    }
+    if n_active_packed < n_packed_rows {
+        let zero_limbs = split_f252_simd([Simd::splat(0); 8]);
+        for (j, value) in zero_limbs[..N_M31_IN_SMALL_FELT252].iter().enumerate() {
+            values_trace[j].data[n_active_packed..n_packed_rows].fill(*value);
         }
     }
 

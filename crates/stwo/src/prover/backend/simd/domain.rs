@@ -5,7 +5,6 @@ use rayon::prelude::*;
 
 use super::m31::{LOG_N_LANES, PackedM31};
 use crate::core::circle::{CirclePoint, M31_CIRCLE_LOG_ORDER};
-use crate::core::fields::m31::M31;
 use crate::core::poly::circle::CircleDomain;
 use crate::core::utils::bit_reverse_index;
 
@@ -14,7 +13,7 @@ pub struct CircleDomainBitRevIterator {
     domain: CircleDomain,
     i: usize,
     current: CirclePoint<PackedM31>,
-    flips: [CirclePoint<M31>; (M31_CIRCLE_LOG_ORDER - LOG_N_LANES) as usize],
+    flips: [CirclePoint<PackedM31>; (M31_CIRCLE_LOG_ORDER - LOG_N_LANES) as usize],
 }
 impl CircleDomainBitRevIterator {
     pub fn new(domain: CircleDomain) -> Self {
@@ -36,7 +35,15 @@ impl CircleDomainBitRevIterator {
             let new_mul = bit_reverse_index(1 << i, log_size - LOG_N_LANES);
             let flip = domain.half_coset.step.mul(new_mul as u128)
                 - domain.half_coset.step.mul(prev_mul as u128);
-            flips[i as usize] = flip;
+            let flipx = Simd::splat(flip.x.0);
+            let flipy = u32x2::from_array([flip.y.0, (-flip.y).0]);
+            let flipy = simd_swizzle!(flipy, [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
+            flips[i as usize] = unsafe {
+                CirclePoint {
+                    x: PackedM31::from_simd_unchecked(flipx),
+                    y: PackedM31::from_simd_unchecked(flipy),
+                }
+            };
         }
         Self { domain, i: 0, current, flips }
     }
@@ -68,22 +75,16 @@ impl CircleDomainBitRevIterator {
 impl Iterator for CircleDomainBitRevIterator {
     type Item = CirclePoint<PackedM31>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.i << LOG_N_LANES >= self.domain.size() {
             return None;
         }
         let res = self.current;
         let flip = self.flips[self.i.trailing_ones() as usize];
-        let flipx = Simd::splat(flip.x.0);
-        let flipy = u32x2::from_array([flip.y.0, (-flip.y).0]);
-        let flipy = simd_swizzle!(flipy, [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
-        let flip = unsafe {
-            CirclePoint {
-                x: PackedM31::from_simd_unchecked(flipx),
-                y: PackedM31::from_simd_unchecked(flipy),
-            }
-        };
-        self.current = self.current + flip;
+        let x = self.current.x.mul_inline(flip.x) - self.current.y.mul_inline(flip.y);
+        let y = self.current.x.mul_inline(flip.y) + self.current.y.mul_inline(flip.x);
+        self.current = CirclePoint { x, y };
         self.i += 1;
         Some(res)
     }

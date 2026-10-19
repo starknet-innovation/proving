@@ -148,6 +148,19 @@ impl PackedQM31 {
         let Self([a, b]) = self;
         Self([a.mul_m31_inline(rhs), b.mul_m31_inline(rhs)])
     }
+
+    /// Returns `self * rhs` with `rhs.a() + rhs.b()` shared across both `CM31` Karatsuba products.
+    #[inline(always)]
+    pub(crate) fn mul_cm31_inline(self, rhs: PackedCM31) -> Self {
+        let rhs_sum = rhs.a() + rhs.b();
+        let mul_c = |lhs: PackedCM31| {
+            let ac = lhs.a().mul_inline(rhs.a());
+            let bd = lhs.b().mul_inline(rhs.b());
+            let ab_t_cd = (lhs.a() + lhs.b()).mul_inline(rhs_sum);
+            PackedCM31([ac - bd, ab_t_cd - ac - bd])
+        };
+        Self([mul_c(self.a()), mul_c(self.b())])
+    }
 }
 
 impl Mul for PackedQM31 {
@@ -259,10 +272,13 @@ fn batch_inverse_chunk(
         // x_norm = n
         let x_norm = dst.0[0];
         // n^-1 = conj(n) * m^-1
-        let norm_inv = PackedCM31([x_norm.a() * *base_norm_inv, -(x_norm.b() * *base_norm_inv)]);
+        let norm_inv = PackedCM31([
+            x_norm.a().mul_inline(*base_norm_inv),
+            -(x_norm.b().mul_inline(*base_norm_inv)),
+        ]);
         let [a, b] = x.0;
         // x^-1 = conj(x) * n^-1
-        *dst = PackedQM31([a * norm_inv, -(b * norm_inv)]);
+        *dst = PackedQM31([a, -b]).mul_cm31_inline(norm_inv);
     }
 }
 
@@ -302,8 +318,7 @@ impl Mul<PackedCM31> for PackedQM31 {
 
     #[inline(always)]
     fn mul(self, rhs: PackedCM31) -> Self::Output {
-        let Self([a, b]) = self;
-        Self([a * rhs, b * rhs])
+        self.mul_cm31_inline(rhs)
     }
 }
 

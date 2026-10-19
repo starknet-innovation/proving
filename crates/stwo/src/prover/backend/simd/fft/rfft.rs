@@ -10,7 +10,7 @@ use rayon::prelude::*;
 
 use super::{
     CACHED_FFT_LOG_SIZE, MIN_FFT_LOG_SIZE, STREAM_SCATTER_LOG_SIZE, compute_first_twiddles,
-    mul_twiddle, scattered_stores_done, store_scattered, transpose_vecs,
+    mul_twiddle, mul_twiddle_even, scattered_stores_done, store_scattered, transpose_vecs,
 };
 use crate::core::circle::Coset;
 use crate::core::utils::bit_reverse;
@@ -123,8 +123,11 @@ pub unsafe fn fft_lower_with_vecwise(
             let index = (index_h << loop_bits) + index_l;
             let mut val0 = PackedBaseField::load(src.add(index * 32));
             let mut val1 = PackedBaseField::load(src.add(index * 32 + 16));
-            (val0, val1) =
-                simd_butterfly(val0, val1, u32x16::splat(*twiddle_dbl[3].get_unchecked(index)));
+            (val0, val1) = simd_butterfly_even(
+                val0,
+                val1,
+                u32x16::splat(*twiddle_dbl[3].get_unchecked(index)),
+            );
             (val0, val1) = vecwise_butterflies(
                 val0,
                 val1,
@@ -312,8 +315,11 @@ pub unsafe fn fft_subdomains(
             let index = (h << loop_bits) + index_l;
             let mut val0 = PackedBaseField::load(from.add(index_l * 32));
             let mut val1 = PackedBaseField::load(from.add(index_l * 32 + 16));
-            (val0, val1) =
-                simd_butterfly(val0, val1, u32x16::splat(*twiddle_dbl[3].get_unchecked(index)));
+            (val0, val1) = simd_butterfly_even(
+                val0,
+                val1,
+                u32x16::splat(*twiddle_dbl[3].get_unchecked(index)),
+            );
             (val0, val1) = vecwise_butterflies(
                 val0,
                 val1,
@@ -573,6 +579,87 @@ pub fn simd_butterfly(
     (val0 + prod, val0 - prod)
 }
 
+#[cfg_attr(
+    all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")),
+    inline(always)
+)]
+fn simd_butterfly_even(
+    val0: PackedBaseField,
+    val1: PackedBaseField,
+    twiddle_dbl: u32x16,
+) -> (PackedBaseField, PackedBaseField) {
+    let prod = mul_twiddle_even(val1, twiddle_dbl);
+    (val0 + prod, val0 - prod)
+}
+
+/// Fuses `(val0, val1) = val0.interleave(val1)` with `(val0, val1) = simd_butterfly(val0, val1, t)`.
+///
+/// Since the second output of `val0.interleave(val1)` has the upper 256-bit half of `val0` in its
+/// 8 even 32-bit lanes and the upper 256-bit half of `val1` in its 8 odd 32-bit lanes (and is not
+/// used after `mul_twiddle`), on AVX2 we zero-extend those 128-bit quarters directly with
+/// `_mm256_cvtepu32_epi64` instead of interleaving and then shifting right by 32 bits.
+#[cfg_attr(
+    all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")),
+    inline(always)
+)]
+fn interleave_butterfly(
+    val0: PackedBaseField,
+    val1: PackedBaseField,
+    twiddle_dbl: u32x16,
+) -> (PackedBaseField, PackedBaseField) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+    unsafe {
+        use std::arch::x86_64::{
+            __m256i, _mm256_castsi256_si128, _mm256_cvtepu32_epi64, _mm256_extracti128_si256,
+            _mm256_mul_epu32, _mm256_srli_epi64,
+        };
+        use std::mem::transmute;
+        use std::simd::Swizzle;
+        use crate::prover::backend::simd::utils::swizzle::{InterleaveEvens, InterleaveOdds};
+
+        let [v0_lo, v0_hi]: [__m256i; 2] = transmute(val0);
+        let [v1_lo, v1_hi]: [__m256i; 2] = transmute(val1);
+        let v0_lo_u32: u32x8 = transmute(v0_lo);
+        let v1_lo_u32: u32x8 = transmute(v1_lo);
+        let (iv0_0, iv0_1) = v0_lo_u32.interleave(v1_lo_u32);
+        let new_val0: PackedBaseField = transmute([iv0_0, iv0_1]);
+
+        let a0_e = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(v0_hi));
+        let a1_e = _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(v0_hi));
+        let a0_o = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(v1_hi));
+        let a1_o = _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(v1_hi));
+
+        let [b0_dbl, b1_dbl]: [__m256i; 2] = transmute(twiddle_dbl);
+        let b0_dbl_o = _mm256_srli_epi64(b0_dbl, 32);
+        let b1_dbl_o = _mm256_srli_epi64(b1_dbl, 32);
+
+        let prod0_dbl_e = _mm256_mul_epu32(a0_e, b0_dbl);
+        let prod0_dbl_o = _mm256_mul_epu32(a0_o, b0_dbl_o);
+        let prod1_dbl_e = _mm256_mul_epu32(a1_e, b1_dbl);
+        let prod1_dbl_o = _mm256_mul_epu32(a1_o, b1_dbl_o);
+
+        let prod_dbl_e: u32x16 = transmute([prod0_dbl_e, prod1_dbl_e]);
+        let prod_dbl_o: u32x16 = transmute([prod0_dbl_o, prod1_dbl_o]);
+
+        let mut prod_lo = InterleaveEvens::concat_swizzle(prod_dbl_e, prod_dbl_o);
+        prod_lo >>= 1;
+        let prod_hi = InterleaveOdds::concat_swizzle(prod_dbl_e, prod_dbl_o);
+        let prod =
+            PackedBaseField::from_simd_unchecked(prod_lo) + PackedBaseField::from_simd_unchecked(prod_hi);
+
+        return (new_val0 + prod, new_val0 - prod);
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    )))]
+    {
+        let (val0, val1) = val0.interleave(val1);
+        simd_butterfly(val0, val1, twiddle_dbl)
+    }
+}
+
 /// Runs fft on 2 vectors of 16 M31 elements.
 ///
 /// This amounts to 4 butterfly layers, each with 16 butterflies.
@@ -589,25 +676,19 @@ pub fn vecwise_butterflies(
     twiddle2_dbl: [u32; 4],
     twiddle3_dbl: [u32; 2],
 ) -> (PackedBaseField, PackedBaseField) {
-    // TODO(andrew): Can the permute be fused with the _mm512_srli_epi64 inside the butterfly?
     // The implementation is the exact reverse of vecwise_ibutterflies().
     // See the comments in its body for more info.
     let t =
         simd_swizzle!(u32x2::from(twiddle3_dbl), [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
-    (val0, val1) = val0.interleave(val1);
-    (val0, val1) = simd_butterfly(val0, val1, t);
+    (val0, val1) = interleave_butterfly(val0, val1, t);
 
     let t =
         simd_swizzle!(u32x4::from(twiddle2_dbl), [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]);
-    (val0, val1) = val0.interleave(val1);
-    (val0, val1) = simd_butterfly(val0, val1, t);
+    (val0, val1) = interleave_butterfly(val0, val1, t);
 
     let (t0, t1) = compute_first_twiddles(u32x8::from(twiddle1_dbl));
-    (val0, val1) = val0.interleave(val1);
-    (val0, val1) = simd_butterfly(val0, val1, t1);
-
-    (val0, val1) = val0.interleave(val1);
-    (val0, val1) = simd_butterfly(val0, val1, t0);
+    (val0, val1) = interleave_butterfly(val0, val1, t1);
+    (val0, val1) = interleave_butterfly(val0, val1, t0);
 
     val0.interleave(val1)
 }
@@ -665,22 +746,22 @@ pub unsafe fn fft3(
     let mut val7 = PackedBaseField::load(src.add(offset + (7 << log_step)));
 
     // Apply the third layer of butterflies.
-    (val0, val4) = simd_butterfly(val0, val4, twiddles_dbl2[0]);
-    (val1, val5) = simd_butterfly(val1, val5, twiddles_dbl2[0]);
-    (val2, val6) = simd_butterfly(val2, val6, twiddles_dbl2[0]);
-    (val3, val7) = simd_butterfly(val3, val7, twiddles_dbl2[0]);
+    (val0, val4) = simd_butterfly_even(val0, val4, twiddles_dbl2[0]);
+    (val1, val5) = simd_butterfly_even(val1, val5, twiddles_dbl2[0]);
+    (val2, val6) = simd_butterfly_even(val2, val6, twiddles_dbl2[0]);
+    (val3, val7) = simd_butterfly_even(val3, val7, twiddles_dbl2[0]);
 
     // Apply the second layer of butterflies.
-    (val0, val2) = simd_butterfly(val0, val2, twiddles_dbl1[0]);
-    (val1, val3) = simd_butterfly(val1, val3, twiddles_dbl1[0]);
-    (val4, val6) = simd_butterfly(val4, val6, twiddles_dbl1[1]);
-    (val5, val7) = simd_butterfly(val5, val7, twiddles_dbl1[1]);
+    (val0, val2) = simd_butterfly_even(val0, val2, twiddles_dbl1[0]);
+    (val1, val3) = simd_butterfly_even(val1, val3, twiddles_dbl1[0]);
+    (val4, val6) = simd_butterfly_even(val4, val6, twiddles_dbl1[1]);
+    (val5, val7) = simd_butterfly_even(val5, val7, twiddles_dbl1[1]);
 
     // Apply the first layer of butterflies.
-    (val0, val1) = simd_butterfly(val0, val1, twiddles_dbl0[0]);
-    (val2, val3) = simd_butterfly(val2, val3, twiddles_dbl0[1]);
-    (val4, val5) = simd_butterfly(val4, val5, twiddles_dbl0[2]);
-    (val6, val7) = simd_butterfly(val6, val7, twiddles_dbl0[3]);
+    (val0, val1) = simd_butterfly_even(val0, val1, twiddles_dbl0[0]);
+    (val2, val3) = simd_butterfly_even(val2, val3, twiddles_dbl0[1]);
+    (val4, val5) = simd_butterfly_even(val4, val5, twiddles_dbl0[2]);
+    (val6, val7) = simd_butterfly_even(val6, val7, twiddles_dbl0[3]);
 
     // Store the 8 SIMD vectors back to the array.
     val0.store(dst.add(offset + (0 << log_step)));
@@ -729,12 +810,12 @@ pub unsafe fn fft2(
     let mut val3 = PackedBaseField::load(src.add(offset + (3 << log_step)));
 
     // Apply the second layer of butterflies.
-    (val0, val2) = simd_butterfly(val0, val2, twiddles_dbl1[0]);
-    (val1, val3) = simd_butterfly(val1, val3, twiddles_dbl1[0]);
+    (val0, val2) = simd_butterfly_even(val0, val2, twiddles_dbl1[0]);
+    (val1, val3) = simd_butterfly_even(val1, val3, twiddles_dbl1[0]);
 
     // Apply the first layer of butterflies.
-    (val0, val1) = simd_butterfly(val0, val1, twiddles_dbl0[0]);
-    (val2, val3) = simd_butterfly(val2, val3, twiddles_dbl0[1]);
+    (val0, val1) = simd_butterfly_even(val0, val1, twiddles_dbl0[0]);
+    (val2, val3) = simd_butterfly_even(val2, val3, twiddles_dbl0[1]);
 
     // Store the 4 SIMD vectors back to the array.
     val0.store(dst.add(offset + (0 << log_step)));
@@ -771,7 +852,7 @@ pub unsafe fn fft1(
     let mut val0 = PackedBaseField::load(src.add(offset + (0 << log_step)));
     let mut val1 = PackedBaseField::load(src.add(offset + (1 << log_step)));
 
-    (val0, val1) = simd_butterfly(val0, val1, twiddles_dbl0[0]);
+    (val0, val1) = simd_butterfly_even(val0, val1, twiddles_dbl0[0]);
 
     // Store the 2 SIMD vectors back to the array.
     val0.store(dst.add(offset + (0 << log_step)));

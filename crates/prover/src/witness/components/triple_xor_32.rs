@@ -85,10 +85,9 @@ fn write_trace_simd(
     };
 
     let M31_112558620 = PackedM31::broadcast(M31::from(112558620));
-    let M31_256 = PackedM31::broadcast(M31::from(256));
     let M31_521092554 = PackedM31::broadcast(M31::from(521092554));
     let M31_990559919 = PackedM31::broadcast(M31::from(990559919));
-    let UInt16_8 = PackedUInt16::broadcast(UInt16::from(8));
+    let mask8 = std::simd::u32x16::splat(0xFF);
     let enabler_col = Enabler::new(n_rows);
 
     (
@@ -116,170 +115,115 @@ fn write_trace_simd(
                 let input_limb_5_col6 = triple_xor_32_input[2].high().as_m31();
                 *row[6] = input_limb_5_col6;
 
-                // Split 16 Low Part Size 8.
+                let l0 = input_limb_0_col1.into_simd();
+                let l1 = input_limb_1_col2.into_simd();
+                let l2 = input_limb_2_col3.into_simd();
+                let l3 = input_limb_3_col4.into_simd();
+                let l4 = input_limb_4_col5.into_simd();
+                let l5 = input_limb_5_col6.into_simd();
 
-                let ms_8_bits_tmp_6e2d1_0 = ((triple_xor_32_input[0].low()) >> (UInt16_8));
-                let ms_8_bits_col7 = ms_8_bits_tmp_6e2d1_0.as_m31();
+                let h0 = l0 >> 8;
+                let h1 = l1 >> 8;
+                let h2 = l2 >> 8;
+                let h3 = l3 >> 8;
+                let h4 = l4 >> 8;
+                let h5 = l5 >> 8;
+
+                let b0 = l0 & mask8;
+                let b1 = l1 & mask8;
+                let b2 = l2 & mask8;
+                let b3 = l3 & mask8;
+                let b4 = l4 & mask8;
+                let b5 = l5 & mask8;
+
+                let ms_8_bits_col7 = PackedM31::from_u32x16_masked(h0);
                 *row[7] = ms_8_bits_col7;
-                let split_16_low_part_size_8_output_tmp_6e2d1_1 =
-                    [((input_limb_0_col1) - ((ms_8_bits_col7) * (M31_256))), ms_8_bits_col7];
+                let ls_8_bits_0 = PackedM31::from_u32x16_masked(b0);
 
-                // Split 16 Low Part Size 8.
-
-                let ms_8_bits_tmp_6e2d1_2 = ((triple_xor_32_input[0].high()) >> (UInt16_8));
-                let ms_8_bits_col8 = ms_8_bits_tmp_6e2d1_2.as_m31();
+                let ms_8_bits_col8 = PackedM31::from_u32x16_masked(h1);
                 *row[8] = ms_8_bits_col8;
-                let split_16_low_part_size_8_output_tmp_6e2d1_3 =
-                    [((input_limb_1_col2) - ((ms_8_bits_col8) * (M31_256))), ms_8_bits_col8];
+                let ls_8_bits_1 = PackedM31::from_u32x16_masked(b1);
 
-                // Split 16 Low Part Size 8.
-
-                let ms_8_bits_tmp_6e2d1_4 = ((triple_xor_32_input[1].low()) >> (UInt16_8));
-                let ms_8_bits_col9 = ms_8_bits_tmp_6e2d1_4.as_m31();
+                let ms_8_bits_col9 = PackedM31::from_u32x16_masked(h2);
                 *row[9] = ms_8_bits_col9;
-                let split_16_low_part_size_8_output_tmp_6e2d1_5 =
-                    [((input_limb_2_col3) - ((ms_8_bits_col9) * (M31_256))), ms_8_bits_col9];
+                let ls_8_bits_2 = PackedM31::from_u32x16_masked(b2);
 
-                // Split 16 Low Part Size 8.
-
-                let ms_8_bits_tmp_6e2d1_6 = ((triple_xor_32_input[1].high()) >> (UInt16_8));
-                let ms_8_bits_col10 = ms_8_bits_tmp_6e2d1_6.as_m31();
+                let ms_8_bits_col10 = PackedM31::from_u32x16_masked(h3);
                 *row[10] = ms_8_bits_col10;
-                let split_16_low_part_size_8_output_tmp_6e2d1_7 =
-                    [((input_limb_3_col4) - ((ms_8_bits_col10) * (M31_256))), ms_8_bits_col10];
+                let ls_8_bits_3 = PackedM31::from_u32x16_masked(b3);
 
-                // Split 16 Low Part Size 8.
-
-                let ms_8_bits_tmp_6e2d1_8 = ((triple_xor_32_input[2].low()) >> (UInt16_8));
-                let ms_8_bits_col11 = ms_8_bits_tmp_6e2d1_8.as_m31();
+                let ms_8_bits_col11 = PackedM31::from_u32x16_masked(h4);
                 *row[11] = ms_8_bits_col11;
-                let split_16_low_part_size_8_output_tmp_6e2d1_9 =
-                    [((input_limb_4_col5) - ((ms_8_bits_col11) * (M31_256))), ms_8_bits_col11];
+                let ls_8_bits_4 = PackedM31::from_u32x16_masked(b4);
 
-                // Split 16 Low Part Size 8.
-
-                let ms_8_bits_tmp_6e2d1_10 = ((triple_xor_32_input[2].high()) >> (UInt16_8));
-                let ms_8_bits_col12 = ms_8_bits_tmp_6e2d1_10.as_m31();
+                let ms_8_bits_col12 = PackedM31::from_u32x16_masked(h5);
                 *row[12] = ms_8_bits_col12;
-                let split_16_low_part_size_8_output_tmp_6e2d1_11 =
-                    [((input_limb_5_col6) - ((ms_8_bits_col12) * (M31_256))), ms_8_bits_col12];
+                let ls_8_bits_5 = PackedM31::from_u32x16_masked(b5);
 
-                // Bitwise Xor Num Bits 8.
-
-                let xor_tmp_6e2d1_12 =
-                    ((PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_6e2d1_1[0]))
-                        ^ (PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_6e2d1_5[0])));
-                let xor_col13 = xor_tmp_6e2d1_12.as_m31();
+                let x13 = b0 ^ b2;
+                let xor_col13 = PackedM31::from_u32x16_masked(x13);
                 *row[13] = xor_col13;
-                *sub_component_inputs.verify_bitwise_xor_8[0] = [
-                    split_16_low_part_size_8_output_tmp_6e2d1_1[0],
-                    split_16_low_part_size_8_output_tmp_6e2d1_5[0],
-                    xor_col13,
-                ];
-                *lookup_data.verify_bitwise_xor_8_0 = [
-                    M31_112558620,
-                    split_16_low_part_size_8_output_tmp_6e2d1_1[0],
-                    split_16_low_part_size_8_output_tmp_6e2d1_5[0],
-                    xor_col13,
-                ];
+                *sub_component_inputs.verify_bitwise_xor_8[0] = [ls_8_bits_0, ls_8_bits_2, xor_col13];
+                *lookup_data.verify_bitwise_xor_8_0 =
+                    [M31_112558620, ls_8_bits_0, ls_8_bits_2, xor_col13];
 
-                // Bitwise Xor Num Bits 8.
-
-                let xor_tmp_6e2d1_14 = ((PackedUInt16::from_m31(xor_col13))
-                    ^ (PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_6e2d1_9[0])));
-                let xor_col14 = xor_tmp_6e2d1_14.as_m31();
+                let x14 = x13 ^ b4;
+                let xor_col14 = PackedM31::from_u32x16_masked(x14);
                 *row[14] = xor_col14;
-                *sub_component_inputs.verify_bitwise_xor_8[1] =
-                    [xor_col13, split_16_low_part_size_8_output_tmp_6e2d1_9[0], xor_col14];
-                *lookup_data.verify_bitwise_xor_8_1 = [
-                    M31_112558620,
-                    xor_col13,
-                    split_16_low_part_size_8_output_tmp_6e2d1_9[0],
-                    xor_col14,
-                ];
+                *sub_component_inputs.verify_bitwise_xor_8[1] = [xor_col13, ls_8_bits_4, xor_col14];
+                *lookup_data.verify_bitwise_xor_8_1 =
+                    [M31_112558620, xor_col13, ls_8_bits_4, xor_col14];
 
-                // Bitwise Xor Num Bits 8.
-
-                let xor_tmp_6e2d1_16 = ((PackedUInt16::from_m31(ms_8_bits_col7))
-                    ^ (PackedUInt16::from_m31(ms_8_bits_col9)));
-                let xor_col15 = xor_tmp_6e2d1_16.as_m31();
+                let x15 = h0 ^ h2;
+                let xor_col15 = PackedM31::from_u32x16_masked(x15);
                 *row[15] = xor_col15;
                 *sub_component_inputs.verify_bitwise_xor_8[2] =
                     [ms_8_bits_col7, ms_8_bits_col9, xor_col15];
                 *lookup_data.verify_bitwise_xor_8_2 =
                     [M31_112558620, ms_8_bits_col7, ms_8_bits_col9, xor_col15];
 
-                // Bitwise Xor Num Bits 8.
-
-                let xor_tmp_6e2d1_18 = ((PackedUInt16::from_m31(xor_col15))
-                    ^ (PackedUInt16::from_m31(ms_8_bits_col11)));
-                let xor_col16 = xor_tmp_6e2d1_18.as_m31();
+                let x16 = x15 ^ h4;
+                let xor_col16 = PackedM31::from_u32x16_masked(x16);
                 *row[16] = xor_col16;
                 *sub_component_inputs.verify_bitwise_xor_8[3] =
                     [xor_col15, ms_8_bits_col11, xor_col16];
                 *lookup_data.verify_bitwise_xor_8_3 =
                     [M31_112558620, xor_col15, ms_8_bits_col11, xor_col16];
 
-                // Bitwise Xor Num Bits 8 B.
-
-                let xor_tmp_6e2d1_20 =
-                    ((PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_6e2d1_3[0]))
-                        ^ (PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_6e2d1_7[0])));
-                let xor_col17 = xor_tmp_6e2d1_20.as_m31();
+                let x17 = b1 ^ b3;
+                let xor_col17 = PackedM31::from_u32x16_masked(x17);
                 *row[17] = xor_col17;
-                *sub_component_inputs.verify_bitwise_xor_8_b[0] = [
-                    split_16_low_part_size_8_output_tmp_6e2d1_3[0],
-                    split_16_low_part_size_8_output_tmp_6e2d1_7[0],
-                    xor_col17,
-                ];
-                *lookup_data.verify_bitwise_xor_8_b_4 = [
-                    M31_521092554,
-                    split_16_low_part_size_8_output_tmp_6e2d1_3[0],
-                    split_16_low_part_size_8_output_tmp_6e2d1_7[0],
-                    xor_col17,
-                ];
+                *sub_component_inputs.verify_bitwise_xor_8_b[0] =
+                    [ls_8_bits_1, ls_8_bits_3, xor_col17];
+                *lookup_data.verify_bitwise_xor_8_b_4 =
+                    [M31_521092554, ls_8_bits_1, ls_8_bits_3, xor_col17];
 
-                // Bitwise Xor Num Bits 8 B.
-
-                let xor_tmp_6e2d1_22 = ((PackedUInt16::from_m31(xor_col17))
-                    ^ (PackedUInt16::from_m31(split_16_low_part_size_8_output_tmp_6e2d1_11[0])));
-                let xor_col18 = xor_tmp_6e2d1_22.as_m31();
+                let x18 = x17 ^ b5;
+                let xor_col18 = PackedM31::from_u32x16_masked(x18);
                 *row[18] = xor_col18;
                 *sub_component_inputs.verify_bitwise_xor_8_b[1] =
-                    [xor_col17, split_16_low_part_size_8_output_tmp_6e2d1_11[0], xor_col18];
-                *lookup_data.verify_bitwise_xor_8_b_5 = [
-                    M31_521092554,
-                    xor_col17,
-                    split_16_low_part_size_8_output_tmp_6e2d1_11[0],
-                    xor_col18,
-                ];
+                    [xor_col17, ls_8_bits_5, xor_col18];
+                *lookup_data.verify_bitwise_xor_8_b_5 =
+                    [M31_521092554, xor_col17, ls_8_bits_5, xor_col18];
 
-                // Bitwise Xor Num Bits 8 B.
-
-                let xor_tmp_6e2d1_24 = ((PackedUInt16::from_m31(ms_8_bits_col8))
-                    ^ (PackedUInt16::from_m31(ms_8_bits_col10)));
-                let xor_col19 = xor_tmp_6e2d1_24.as_m31();
+                let x19 = h1 ^ h3;
+                let xor_col19 = PackedM31::from_u32x16_masked(x19);
                 *row[19] = xor_col19;
                 *sub_component_inputs.verify_bitwise_xor_8_b[2] =
                     [ms_8_bits_col8, ms_8_bits_col10, xor_col19];
                 *lookup_data.verify_bitwise_xor_8_b_6 =
                     [M31_521092554, ms_8_bits_col8, ms_8_bits_col10, xor_col19];
 
-                // Bitwise Xor Num Bits 8 B.
-
-                let xor_tmp_6e2d1_26 = ((PackedUInt16::from_m31(xor_col19))
-                    ^ (PackedUInt16::from_m31(ms_8_bits_col12)));
-                let xor_col20 = xor_tmp_6e2d1_26.as_m31();
+                let x20 = x19 ^ h5;
+                let xor_col20 = PackedM31::from_u32x16_masked(x20);
                 *row[20] = xor_col20;
                 *sub_component_inputs.verify_bitwise_xor_8_b[3] =
                     [xor_col19, ms_8_bits_col12, xor_col20];
                 *lookup_data.verify_bitwise_xor_8_b_7 =
                     [M31_521092554, xor_col19, ms_8_bits_col12, xor_col20];
 
-                let triple_xor32_output_tmp_6e2d1_28 = PackedUInt32::from_limbs([
-                    ((xor_col14) + ((xor_col16) * (M31_256))),
-                    ((xor_col18) + ((xor_col20) * (M31_256))),
-                ]);
+                let out_low = PackedM31::from_u32x16_masked(x14 | (x16 << 8));
+                let out_high = PackedM31::from_u32x16_masked(x18 | (x20 << 8));
                 *lookup_data.triple_xor_32_8 = [
                     M31_990559919,
                     input_limb_0_col1,
@@ -288,8 +232,8 @@ fn write_trace_simd(
                     input_limb_3_col4,
                     input_limb_4_col5,
                     input_limb_5_col6,
-                    triple_xor32_output_tmp_6e2d1_28.low().as_m31(),
-                    triple_xor32_output_tmp_6e2d1_28.high().as_m31(),
+                    out_low,
+                    out_high,
                 ];
                 *lookup_data.mults_0 = enabler_col0;
             },

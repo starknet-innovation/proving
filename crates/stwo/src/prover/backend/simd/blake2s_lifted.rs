@@ -20,7 +20,8 @@ use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
 use crate::parallel_iter;
 use crate::prover::backend::simd::blake2s::{
-    INITIAL_STATE, compress_finalize, compress_unfinalized, transpose_msgs, untranspose_states,
+    INITIAL_STATE, compress_finalize, compress_unfinalized, deinterleave_u32x16, transpose_msgs,
+    untranspose_states,
 };
 use crate::prover::backend::simd::column::BaseColumn;
 use crate::prover::backend::simd::m31::{N_LANES, PackedBaseField};
@@ -235,6 +236,7 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
         layers
     }
 
+    #[allow(clippy::uninit_vec)]
     fn build_packed_layers(
         columns: &[&Col<Self, BaseField>; SECURE_EXTENSION_DEGREE],
         lifting_log_size: u32,
@@ -253,7 +255,9 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
         }
         // Fuse the packed-leaf transpose into leaf hashing. Only the tile of hash states and
         // the retained upper layer are materialized; no full-size sixteen-column copy.
-        let mut top = vec![Blake2sHash::default(); 1 << (lifting_log_size - FUSED_LEVELS)];
+        // Safety: every slice of `top` is overwritten by `store_states` before being read.
+        let mut top: Vec<Blake2sHash> =
+            unsafe { uninit_vec(1 << (lifting_log_size - FUSED_LEVELS)) };
         chunks_mut_iter(&mut top, N_HASHES_PER_SIMD_STATE).enumerate().for_each(
             |(tile_index, dst)| {
                 let mut states = [INITIAL_STATE; TILE];
@@ -779,7 +783,7 @@ fn hash_state_pair(
 ) -> [u32x16; N_FELTS_IN_BLAKE_STATE] {
     let mut msgs = [u32x16::splat(0); N_FELTS_IN_BLAKE_MESSAGE];
     for w in 0..N_FELTS_IN_BLAKE_STATE {
-        (msgs[w], msgs[N_FELTS_IN_BLAKE_STATE + w]) = first[w].deinterleave(second[w]);
+        (msgs[w], msgs[N_FELTS_IN_BLAKE_STATE + w]) = deinterleave_u32x16(first[w], second[w]);
     }
     compress_finalize(INITIAL_STATE, msgs, N_BYTES_IN_BLAKE_MESSAGE)
 }

@@ -103,41 +103,38 @@ impl FrameworkEval for Eval {
             (qm31_ops_pointwise_mul_flag.clone()
                 * (qm31_ops_pointwise_mul_flag.clone() - M31_1.clone())),
         );
+        let p00 = input_op0_limb0_col0.clone() * input_op1_limb0_col4.clone();
+        let p11 = input_op0_limb1_col1.clone() * input_op1_limb1_col5.clone();
+        let p22 = input_op0_limb2_col2.clone() * input_op1_limb2_col6.clone();
+        let p33 = input_op0_limb3_col3.clone() * input_op1_limb3_col7.clone();
+        let p23 = input_op0_limb2_col2.clone() * input_op1_limb3_col7.clone();
+        let p32 = input_op0_limb3_col3.clone() * input_op1_limb2_col6.clone();
         eval.add_constraint(
             (input_dst_limb0_col8.clone()
-                - (((((((((input_op0_limb0_col0.clone() * input_op1_limb0_col4.clone())
-                    - (input_op0_limb1_col1.clone() * input_op1_limb1_col5.clone()))
-                    + (M31_2.clone()
-                        * ((input_op0_limb2_col2.clone() * input_op1_limb2_col6.clone())
-                            - (input_op0_limb3_col3.clone()
-                                * input_op1_limb3_col7.clone()))))
-                    - (input_op0_limb2_col2.clone() * input_op1_limb3_col7.clone()))
-                    - (input_op0_limb3_col3.clone() * input_op1_limb2_col6.clone()))
+                - ((((((((p00.clone() - p11.clone())
+                    + (M31_2.clone() * (p22.clone() - p33.clone())))
+                    - p23.clone())
+                    - p32.clone())
                     * qm31_ops_mul_flag.clone())
                     + ((input_op0_limb0_col0.clone() + input_op1_limb0_col4.clone())
                         * qm31_ops_add_flag.clone()))
                     + ((input_op0_limb0_col0.clone() - input_op1_limb0_col4.clone())
                         * qm31_ops_sub_flag.clone()))
-                    + ((input_op0_limb0_col0.clone() * input_op1_limb0_col4.clone())
-                        * qm31_ops_pointwise_mul_flag.clone()))),
+                    + (p00 * qm31_ops_pointwise_mul_flag.clone()))),
         );
         eval.add_constraint(
             (input_dst_limb1_col9.clone()
                 - (((((((((input_op0_limb0_col0.clone() * input_op1_limb1_col5.clone())
                     + (input_op0_limb1_col1.clone() * input_op1_limb0_col4.clone()))
-                    + (M31_2.clone()
-                        * ((input_op0_limb2_col2.clone() * input_op1_limb3_col7.clone())
-                            + (input_op0_limb3_col3.clone()
-                                * input_op1_limb2_col6.clone()))))
-                    + (input_op0_limb2_col2.clone() * input_op1_limb2_col6.clone()))
-                    - (input_op0_limb3_col3.clone() * input_op1_limb3_col7.clone()))
+                    + (M31_2.clone() * (p23 + p32)))
+                    + p22.clone())
+                    - p33.clone())
                     * qm31_ops_mul_flag.clone())
                     + ((input_op0_limb1_col1.clone() + input_op1_limb1_col5.clone())
                         * qm31_ops_add_flag.clone()))
                     + ((input_op0_limb1_col1.clone() - input_op1_limb1_col5.clone())
                         * qm31_ops_sub_flag.clone()))
-                    + ((input_op0_limb1_col1.clone() * input_op1_limb1_col5.clone())
-                        * qm31_ops_pointwise_mul_flag.clone()))),
+                    + (p11 * qm31_ops_pointwise_mul_flag.clone()))),
         );
         eval.add_constraint(
             (input_dst_limb2_col10.clone()
@@ -150,8 +147,7 @@ impl FrameworkEval for Eval {
                         * qm31_ops_add_flag.clone()))
                     + ((input_op0_limb2_col2.clone() - input_op1_limb2_col6.clone())
                         * qm31_ops_sub_flag.clone()))
-                    + ((input_op0_limb2_col2.clone() * input_op1_limb2_col6.clone())
-                        * qm31_ops_pointwise_mul_flag.clone()))),
+                    + (p22 * qm31_ops_pointwise_mul_flag.clone()))),
         );
         eval.add_constraint(
             (input_dst_limb3_col11.clone()
@@ -164,8 +160,7 @@ impl FrameworkEval for Eval {
                         * qm31_ops_add_flag.clone()))
                     + ((input_op0_limb3_col3.clone() - input_op1_limb3_col7.clone())
                         * qm31_ops_sub_flag.clone()))
-                    + ((input_op0_limb3_col3.clone() * input_op1_limb3_col7.clone())
-                        * qm31_ops_pointwise_mul_flag.clone()))),
+                    + (p33 * qm31_ops_pointwise_mul_flag.clone()))),
         );
         eval.add_to_relation(RelationEntry::new(
             &self.common_lookup_elements,

@@ -49,20 +49,8 @@ pub fn write_trace(
     let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
     let log_size = size.ilog2();
 
-    // A row's input, as `extract_component_inputs` stages it.
-    let input = |row: usize| -> InputType {
-        let m31_input = context_values[columns[0].at(row)].to_m31_array()[0];
-        (m31_input, UInt32::from(m31_input.0))
-    };
-
-    let (trace, lookup_data) = write_trace_simd(n_rows, input, &columns);
-    // The range-checked values are counted straight from the lookup tuples, the three columns in
-    // one pass, instead of from a staged copy of them (omarespejel, rgr1_3f4875e7).
-    range_check_16_state.add_lookup_columns([
-        &lookup_data.range_check_16_0[..],
-        &lookup_data.range_check_16_1[..],
-        &lookup_data.range_check_16_2[..],
-    ]);
+    let (trace, lookup_data) =
+        write_trace_simd(n_rows, context_values, &columns, range_check_16_state);
 
     (trace, Claim { log_size }, InteractionClaimGenerator { log_size, lookup_data })
 }
@@ -73,8 +61,9 @@ pub fn write_trace(
 #[allow(non_snake_case)]
 fn write_trace_simd(
     n_rows: usize,
-    input: impl Fn(usize) -> InputType + Sync,
+    context_values: &[QM31],
     columns: &[circuit_common::preprocessed::ColumnRows<'_>; 3],
+    range_check_16_state: &range_check_16::ClaimGenerator,
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData) {
     let log_n_packed_rows = (n_rows / N_LANES).ilog2();
     let log_size = log_n_packed_rows + LOG_N_LANES;
@@ -86,56 +75,50 @@ fn write_trace_simd(
     };
 
     let M31_0 = PackedM31::broadcast(M31::from(0));
-    let M31_1 = PackedM31::broadcast(M31::from(1));
-    let M31_1008385708 = PackedM31::broadcast(M31::from(1008385708));
-    let M31_32767 = PackedM31::broadcast(M31::from(32767));
-    let M31_378353459 = PackedM31::broadcast(M31::from(378353459));
+    let mask16 = std::simd::u32x16::splat(0xFFFF);
+    let rc16_mults = &range_check_16_state.mults[0];
 
     (trace.par_iter_mut(), lookup_data.par_iter_mut())
         .into_par_iter()
         .enumerate()
-        .for_each(
-            |(row_index, (row, lookup_data))| {
-                let first = row_index * N_LANES;
-                let m_31_to_u_32_input: PackedInputType =
-                    crate::witness::utils::packed_input(&input, first);
-                let [m31_to_u32_input_addr, m31_to_u32_output_addr, m31_to_u32_multiplicity] =
-                    crate::witness::utils::packed_column_rows(columns, first);
-                let input_m31_col0 = m_31_to_u_32_input.0;
-                *row[0] = input_m31_col0;
-                let input_u32_limb_0_col1 = m_31_to_u_32_input.1.low().as_m31();
-                *row[1] = input_u32_limb_0_col1;
-                let input_u32_limb_1_col2 = m_31_to_u_32_input.1.high().as_m31();
-                *row[2] = input_u32_limb_1_col2;
-                *lookup_data.range_check_16_0 = [M31_1008385708, input_u32_limb_0_col1];
-                *lookup_data.range_check_16_1 = [M31_1008385708, input_u32_limb_1_col2];
-                *lookup_data.range_check_16_2 =
-                    [M31_1008385708, ((M31_32767) - (input_u32_limb_1_col2))];
-                let input_is_zero_tmp_c1f7a_0 = M31_0.eq(input_m31_col0);
-                let inv_or_one_col3 =
-                    ((input_is_zero_tmp_c1f7a_0.as_m31()) + (input_m31_col0)).inverse();
-                *row[3] = inv_or_one_col3;
-                *lookup_data.gate_0 = [M31_378353459, m31_to_u32_input_addr, input_m31_col0];
-                *lookup_data.gate_1 = [
-                    M31_378353459,
-                    m31_to_u32_output_addr,
-                    input_u32_limb_0_col1,
-                    input_u32_limb_1_col2,
-                ];
-                *lookup_data.mults_0 = m31_to_u32_multiplicity;
-            },
-        );
+        .for_each(|(row_index, (row, lookup_data))| {
+            let first = row_index * N_LANES;
+            let [m31_to_u32_input_addr, m31_to_u32_output_addr, m31_to_u32_multiplicity] =
+                crate::witness::utils::packed_column_rows(columns, first);
+            let raw_vals: [u32; N_LANES] =
+                from_fn(|lane| context_values[columns[0].at(first + lane)].0.0.0);
+            for val in raw_vals {
+                let l0 = val & 0xFFFF;
+                let l1 = val >> 16;
+                rc16_mults.increase_at(l0);
+                rc16_mults.increase_at(l1);
+                rc16_mults.increase_at(32767 - l1);
+            }
+            let v = std::simd::u32x16::from_array(raw_vals);
+            let input_m31_col0 = PackedM31::from_u32x16_masked(v);
+            *row[0] = input_m31_col0;
+            let input_u32_limb_0_col1 = PackedM31::from_u32x16_masked(v & mask16);
+            *row[1] = input_u32_limb_0_col1;
+            let input_u32_limb_1_col2 = PackedM31::from_u32x16_masked(v >> 16);
+            *row[2] = input_u32_limb_1_col2;
+            let input_is_zero_tmp_c1f7a_0 = M31_0.eq(input_m31_col0);
+            let inv_or_one_col3 =
+                ((input_is_zero_tmp_c1f7a_0.as_m31()) + (input_m31_col0)).inverse();
+            *row[3] = inv_or_one_col3;
+            *lookup_data.input_addr = m31_to_u32_input_addr;
+            *lookup_data.output_addr = m31_to_u32_output_addr;
+            *lookup_data.input_m31 = input_m31_col0;
+            *lookup_data.mults_0 = m31_to_u32_multiplicity;
+        });
 
     (trace, lookup_data)
 }
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 struct LookupData {
-    gate_0: Vec<[PackedM31; 3]>,
-    gate_1: Vec<[PackedM31; 4]>,
-    range_check_16_0: Vec<[PackedM31; 2]>,
-    range_check_16_1: Vec<[PackedM31; 2]>,
-    range_check_16_2: Vec<[PackedM31; 2]>,
+    input_addr: Vec<PackedM31>,
+    output_addr: Vec<PackedM31>,
+    input_m31: Vec<PackedM31>,
     mults_0: Vec<PackedM31>,
 }
 
@@ -144,6 +127,7 @@ pub struct InteractionClaimGenerator {
     lookup_data: LookupData,
 }
 impl InteractionClaimGenerator {
+    #[allow(non_snake_case)]
     pub fn write_interaction_trace(
         self,
         _common_lookup_elements: &relations::CommonLookupElements,
@@ -154,28 +138,46 @@ impl InteractionClaimGenerator {
         let common_lookup_elements = _common_lookup_elements;
         let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(self.log_size) };
 
+        let M31_1008385708 = PackedM31::broadcast(M31::from(1008385708));
+        let M31_32767 = PackedM31::broadcast(M31::from(32767));
+        let M31_378353459 = PackedM31::broadcast(M31::from(378353459));
+        let mask16 = std::simd::u32x16::splat(0xFFFF);
+
         // Sum logup terms in pairs.
         logup_gen.write_frac_cols(1, |_, row| {
-            let values0 = &self.lookup_data.range_check_16_0[row];
-            let values1 = &self.lookup_data.range_check_16_1[row];
-            let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-            let denom1: PackedQM31 = common_lookup_elements.combine(values1);
+            let v = self.lookup_data.input_m31[row].into_simd();
+            let limb0 = PackedM31::from_u32x16_masked(v & mask16);
+            let limb1 = PackedM31::from_u32x16_masked(v >> 16);
+            let denom0: PackedQM31 = common_lookup_elements.combine(&[M31_1008385708, limb0]);
+            let denom1: PackedQM31 = common_lookup_elements.combine(&[M31_1008385708, limb1]);
             (denom0 + denom1, denom0 * denom1)
         });
 
         logup_gen.write_frac_cols(1, |_, row| {
-            let values0 = &self.lookup_data.range_check_16_2[row];
-            let gate_values = &self.lookup_data.gate_0[row];
-            let denom0: PackedQM31 = common_lookup_elements.combine(values0);
-            let denom1: PackedQM31 = common_lookup_elements.combine(gate_values);
+            let input_m31 = self.lookup_data.input_m31[row];
+            let limb1 = PackedM31::from_u32x16_masked(input_m31.into_simd() >> 16);
+            let denom0: PackedQM31 =
+                common_lookup_elements.combine(&[M31_1008385708, M31_32767 - limb1]);
+            let denom1: PackedQM31 = common_lookup_elements.combine(&[
+                M31_378353459,
+                self.lookup_data.input_addr[row],
+                input_m31,
+            ]);
             (denom0 + denom1, denom0 * denom1)
         });
 
         // Sum last logup term.
         logup_gen.write_frac_cols(1, |_, row| {
-            let values = &self.lookup_data.gate_1[row];
+            let v = self.lookup_data.input_m31[row].into_simd();
+            let limb0 = PackedM31::from_u32x16_masked(v & mask16);
+            let limb1 = PackedM31::from_u32x16_masked(v >> 16);
             let mults_0 = self.lookup_data.mults_0[row];
-            let denom = common_lookup_elements.combine(values);
+            let denom = common_lookup_elements.combine(&[
+                M31_378353459,
+                self.lookup_data.output_addr[row],
+                limb0,
+                limb1,
+            ]);
             (-PackedQM31::one() * mults_0, denom)
         });
 

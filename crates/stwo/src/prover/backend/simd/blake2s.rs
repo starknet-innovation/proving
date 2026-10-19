@@ -320,6 +320,38 @@ pub fn round(v: &mut [u32x16; 16], m: [u32x16; 16], r: usize) {
     v[4] = rotate::<7>(v[4]);
 }
 
+/// Deinterleaves the even and odd lanes of two `u32x16` vectors.
+#[inline(always)]
+pub(super) fn deinterleave_u32x16(a: u32x16, b: u32x16) -> (u32x16, u32x16) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::{
+            _mm256_castps_si256, _mm256_castsi256_ps, _mm256_permute4x64_epi64, _mm256_shuffle_ps,
+        };
+        let [a_lo, a_hi]: [__m256i; 2] = transmute(a);
+        let [b_lo, b_hi]: [__m256i; 2] = transmute(b);
+
+        let a_evens = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+            _mm256_shuffle_ps::<0x88>(_mm256_castsi256_ps(a_lo), _mm256_castsi256_ps(a_hi)),
+        ));
+        let b_evens = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+            _mm256_shuffle_ps::<0x88>(_mm256_castsi256_ps(b_lo), _mm256_castsi256_ps(b_hi)),
+        ));
+        let a_odds = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+            _mm256_shuffle_ps::<0xDD>(_mm256_castsi256_ps(a_lo), _mm256_castsi256_ps(a_hi)),
+        ));
+        let b_odds = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+            _mm256_shuffle_ps::<0xDD>(_mm256_castsi256_ps(b_lo), _mm256_castsi256_ps(b_hi)),
+        ));
+
+        (transmute([a_evens, b_evens]), transmute([a_odds, b_odds]))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        a.deinterleave(b)
+    }
+}
+
 /// Transposes input chunks (16 chunks of 16 `u32`s each), to get 16 `u32x16`, each
 /// representing 16 packed instances of a message word.
 pub fn transpose_msgs(mut data: [u32x16; 16]) -> [u32x16; 16] {
@@ -330,35 +362,90 @@ pub fn transpose_msgs(mut data: [u32x16; 16]) -> [u32x16; 16] {
     //   abcd:xyzw => wabc:dxyz
     // In other words, rotate the index to the right by 1.
     for _ in 0..4 {
-        let (d0, d8) = data[0].deinterleave(data[1]);
-        let (d1, d9) = data[2].deinterleave(data[3]);
-        let (d2, d10) = data[4].deinterleave(data[5]);
-        let (d3, d11) = data[6].deinterleave(data[7]);
-        let (d4, d12) = data[8].deinterleave(data[9]);
-        let (d5, d13) = data[10].deinterleave(data[11]);
-        let (d6, d14) = data[12].deinterleave(data[13]);
-        let (d7, d15) = data[14].deinterleave(data[15]);
+        let (d0, d8) = deinterleave_u32x16(data[0], data[1]);
+        let (d1, d9) = deinterleave_u32x16(data[2], data[3]);
+        let (d2, d10) = deinterleave_u32x16(data[4], data[5]);
+        let (d3, d11) = deinterleave_u32x16(data[6], data[7]);
+        let (d4, d12) = deinterleave_u32x16(data[8], data[9]);
+        let (d5, d13) = deinterleave_u32x16(data[10], data[11]);
+        let (d6, d14) = deinterleave_u32x16(data[12], data[13]);
+        let (d7, d15) = deinterleave_u32x16(data[14], data[15]);
         data = [d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14, d15];
     }
 
     data
 }
 
-pub fn untranspose_states(mut states: [u32x16; 8]) -> [u32x16; 8] {
-    // Index abc:xyzw, refers to a specific word in data as follows:
-    //   abc - chunk index (in base 2)
-    //   xyzw - word offset (in base 2)
-    // Transpose by applying 3 times the index permutation:
-    //   abc:xyzw => bcx:yzwa
-    // In other words, rotate the index to the left by 1.
-    for _ in 0..3 {
-        let (d0, d1) = states[0].interleave(states[4]);
-        let (d2, d3) = states[1].interleave(states[5]);
-        let (d4, d5) = states[2].interleave(states[6]);
-        let (d6, d7) = states[3].interleave(states[7]);
-        states = [d0, d1, d2, d3, d4, d5, d6, d7];
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn transpose_8x8_avx2(r: [__m256i; 8]) -> [u32x16; 4] {
+    use std::arch::x86_64::{
+        _mm256_permute2x128_si256, _mm256_unpackhi_epi32, _mm256_unpackhi_epi64,
+        _mm256_unpacklo_epi32, _mm256_unpacklo_epi64,
+    };
+    let t0 = _mm256_unpacklo_epi32(r[0], r[1]);
+    let t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+    let t2 = _mm256_unpacklo_epi32(r[2], r[3]);
+    let t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+    let t4 = _mm256_unpacklo_epi32(r[4], r[5]);
+    let t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+    let t6 = _mm256_unpacklo_epi32(r[6], r[7]);
+    let t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+
+    let u0 = _mm256_unpacklo_epi64(t0, t2);
+    let u1 = _mm256_unpackhi_epi64(t0, t2);
+    let u2 = _mm256_unpacklo_epi64(t1, t3);
+    let u3 = _mm256_unpackhi_epi64(t1, t3);
+    let u4 = _mm256_unpacklo_epi64(t4, t6);
+    let u5 = _mm256_unpackhi_epi64(t4, t6);
+    let u6 = _mm256_unpacklo_epi64(t5, t7);
+    let u7 = _mm256_unpackhi_epi64(t5, t7);
+
+    let h0 = _mm256_permute2x128_si256::<0x20>(u0, u4);
+    let h1 = _mm256_permute2x128_si256::<0x20>(u1, u5);
+    let h2 = _mm256_permute2x128_si256::<0x20>(u2, u6);
+    let h3 = _mm256_permute2x128_si256::<0x20>(u3, u7);
+    let h4 = _mm256_permute2x128_si256::<0x31>(u0, u4);
+    let h5 = _mm256_permute2x128_si256::<0x31>(u1, u5);
+    let h6 = _mm256_permute2x128_si256::<0x31>(u2, u6);
+    let h7 = _mm256_permute2x128_si256::<0x31>(u3, u7);
+
+    unsafe {
+        [
+            transmute([h0, h1]),
+            transmute([h2, h3]),
+            transmute([h4, h5]),
+            transmute([h6, h7]),
+        ]
     }
-    states
+}
+
+#[inline(always)]
+pub fn untranspose_states(mut states: [u32x16; 8]) -> [u32x16; 8] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        let halves: [[__m256i; 2]; 8] = transmute(states);
+        let lo = transpose_8x8_avx2(array::from_fn(|w| halves[w][0]));
+        let hi = transpose_8x8_avx2(array::from_fn(|w| halves[w][1]));
+        return [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        // Index abc:xyzw, refers to a specific word in data as follows:
+        //   abc - chunk index (in base 2)
+        //   xyzw - word offset (in base 2)
+        // Transpose by applying 3 times the index permutation:
+        //   abc:xyzw => bcx:yzwa
+        // In other words, rotate the index to the left by 1.
+        for _ in 0..3 {
+            let (d0, d1) = states[0].interleave(states[4]);
+            let (d2, d3) = states[1].interleave(states[5]);
+            let (d4, d5) = states[2].interleave(states[6]);
+            let (d6, d7) = states[3].interleave(states[7]);
+            states = [d0, d1, d2, d3, d4, d5, d6, d7];
+        }
+        states
+    }
 }
 
 /// The two byte rotations of BLAKE2s, `rotate_right(16)` and `rotate_right(8)`, on 8-lane vectors.

@@ -66,6 +66,32 @@ pub struct PackedM31(Simd<u32, N_LANES>);
 unsafe impl Send for PackedM31 {}
 unsafe impl Sync for PackedM31 {}
 
+/// A loop-invariant scalar [`M31`] pre-splatted for repeated vector multiplication.
+///
+/// On AVX2, holds `u32x16::splat(v.0 + v.0)` so [`PackedM31::mul_splatted`] calls
+/// [`mul_doubled_even_avx2`] directly without per-element doubling, broadcasting, or
+/// odd-lane 64-bit right-shifts.
+#[derive(Copy, Clone)]
+pub(crate) struct SplattedM31 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+    dbl: u32x16,
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f"))))]
+    vec: PackedM31,
+}
+
+impl SplattedM31 {
+    #[inline(always)]
+    pub(crate) fn new(v: M31) -> Self {
+        cfg_if::cfg_if! {
+            if #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))] {
+                Self { dbl: u32x16::splat(v.0 + v.0) }
+            } else {
+                Self { vec: PackedM31::broadcast(v) }
+            }
+        }
+    }
+}
+
 impl PackedM31 {
     /// Constructs a new instance with all vector elements set to `value`.
     #[inline(always)]
@@ -96,6 +122,18 @@ impl PackedM31 {
         }
     }
 
+    /// Returns `self * rhs` for a loop-invariant pre-splatted scalar [`SplattedM31`].
+    #[inline(always)]
+    pub(crate) fn mul_splatted(self, rhs: SplattedM31) -> Self {
+        cfg_if::cfg_if! {
+            if #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))] {
+                mul_doubled_even_avx2(self, rhs.dbl)
+            } else {
+                self * rhs.vec
+            }
+        }
+    }
+
     #[inline]
     pub fn from_array(values: [M31; N_LANES]) -> PackedM31 {
         Self(Simd::from_array(values.map(|M31(v)| v)))
@@ -119,9 +157,46 @@ impl PackedM31 {
     }
 
     /// Deinterleaves two vectors.
+    #[cfg_attr(
+        all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")),
+        inline(always)
+    )]
     pub fn deinterleave(self, other: Self) -> (Self, Self) {
-        let (a, b) = self.0.deinterleave(other.0);
-        (Self(a), Self(b))
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+        unsafe {
+            use std::arch::x86_64::{
+                __m256i, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_permute4x64_epi64,
+                _mm256_shuffle_ps,
+            };
+            let [a0, a1]: [__m256i; 2] = transmute(self);
+            let [b0, b1]: [__m256i; 2] = transmute(other);
+            let a0_ps = _mm256_castsi256_ps(a0);
+            let a1_ps = _mm256_castsi256_ps(a1);
+            let b0_ps = _mm256_castsi256_ps(b0);
+            let b1_ps = _mm256_castsi256_ps(b1);
+            let a_e = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+                _mm256_shuffle_ps::<0x88>(a0_ps, a1_ps),
+            ));
+            let b_e = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+                _mm256_shuffle_ps::<0x88>(b0_ps, b1_ps),
+            ));
+            let a_o = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+                _mm256_shuffle_ps::<0xDD>(a0_ps, a1_ps),
+            ));
+            let b_o = _mm256_permute4x64_epi64::<0xD8>(_mm256_castps_si256(
+                _mm256_shuffle_ps::<0xDD>(b0_ps, b1_ps),
+            ));
+            return (transmute([a_e, b_e]), transmute([a_o, b_o]));
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512f")
+        )))]
+        {
+            let (a, b) = self.0.deinterleave(other.0);
+            (Self(a), Self(b))
+        }
     }
 
     /// Reverses the order of the elements in the vector.
@@ -143,6 +218,12 @@ impl PackedM31 {
     #[inline(always)]
     pub const fn into_simd(self) -> Simd<u32, N_LANES> {
         self.0
+    }
+
+    /// Wraps a `u32x16` vector masked to 31 bits (`<= P`) as a [`PackedM31`].
+    #[inline(always)]
+    pub fn from_u32x16_masked(v: Simd<u32, N_LANES>) -> Self {
+        Self(v & MODULUS)
     }
 
     /// # Safety
@@ -585,6 +666,39 @@ cfg_if::cfg_if! {
             // Interleave the odd words of prod_dbl_e with the odd words of prod_dbl_o:
             let prod_hi = InterleaveOdds::concat_swizzle(prod_dbl_e, prod_dbl_o);
             // prod_hi -    |0|prod_o_h|0|prod_e_h|
+
+            PackedM31(prod_lo) + PackedM31(prod_hi)
+        }
+
+        /// Returns `a * b` when each 64-bit lane of `b_double` has identical lower and upper
+        /// 32-bit words (for example, a splatted or even-odd duplicated twiddle in `[0, 2P]`).
+        ///
+        /// Skipping `_mm256_srli_epi64(b_dbl, 32)` avoids redundant shift instructions and prevents
+        /// LLVM's LICM from hoisting separate even-masked and odd-shifted YMM registers per
+        /// loop-invariant twiddle.
+        #[inline(always)]
+        pub(crate) fn mul_doubled_even_avx2(a: PackedM31, b_double: u32x16) -> PackedM31 {
+            let [a0, a1]: [__m256i; 2] = unsafe { transmute::<PackedM31, [__m256i; 2]>(a) };
+            let [b0_dbl, b1_dbl]: [__m256i; 2] = unsafe { transmute::<u32x16, [__m256i; 2]>(b_double) };
+
+            let a0_e = a0;
+            let a1_e = a1;
+            let a0_o = unsafe { _mm256_srli_epi64(a0, 32) };
+            let a1_o = unsafe { _mm256_srli_epi64(a1, 32) };
+
+            let prod0_dbl_e = unsafe { _mm256_mul_epu32(a0_e, b0_dbl) };
+            let prod0_dbl_o = unsafe { _mm256_mul_epu32(a0_o, b0_dbl) };
+            let prod1_dbl_e = unsafe { _mm256_mul_epu32(a1_e, b1_dbl) };
+            let prod1_dbl_o = unsafe { _mm256_mul_epu32(a1_o, b1_dbl) };
+
+            let prod_dbl_e: u32x16 =
+                unsafe { transmute::<[__m256i; 2], u32x16>([prod0_dbl_e, prod1_dbl_e]) };
+            let prod_dbl_o: u32x16 =
+                unsafe { transmute::<[__m256i; 2], u32x16>([prod0_dbl_o, prod1_dbl_o]) };
+
+            let mut prod_lo = InterleaveEvens::concat_swizzle(prod_dbl_e, prod_dbl_o);
+            prod_lo >>= 1;
+            let prod_hi = InterleaveOdds::concat_swizzle(prod_dbl_e, prod_dbl_o);
 
             PackedM31(prod_lo) + PackedM31(prod_hi)
         }

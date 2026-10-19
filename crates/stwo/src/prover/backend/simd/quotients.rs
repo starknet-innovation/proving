@@ -9,12 +9,12 @@ use rayon::iter::{
 };
 
 use super::SimdBackend;
+use super::batch_inverse::{BatchInverseScratch, PACKED_CM31_BATCH_INVERSE_CHUNK_SIZE};
 use super::column::{BaseColumn, CM31Column, SecureColumnByCoordsMutSlice};
 use super::domain::CircleDomainBitRevIterator;
 use super::m31::{LOG_N_LANES, PackedBaseField};
 use super::qm31::PackedSecureField;
 use crate::core::circle::CirclePoint;
-use crate::core::fields::FieldExpOps;
 use crate::core::fields::m31::{BaseField, P};
 use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::quotients::{ColumnSampleBatch, quotient_constants};
@@ -90,6 +90,7 @@ impl QuotientOps for SimdBackend {
     ) -> SecureEvaluation<Self, BitReversedOrder> {
         // This constant is chosen empirically by benchmarking.
         const COMBINE_CHUNK_SIZE: usize = 16;
+        const STRIDE: usize = 1 << 6;
 
         let eval_domain = CanonicCoset::new(lifting_log_size).circle_domain();
         let (eval_subdomain, _) = eval_domain.split(log_blowup_factor);
@@ -116,13 +117,7 @@ impl QuotientOps for SimdBackend {
                 SecureColumnByCoords::from_cpu(cpu_result.values),
             );
         }
-        // The points are computed by the workers, a stride each (one thread took ~20 ms at 2^23).
-        #[cfg(feature = "parallel")]
-        let subdomain_points: Vec<CirclePoint<PackedBaseField>> =
-            CircleDomainBitRevIterator::new(eval_subdomain).par_iter().collect();
-        #[cfg(not(feature = "parallel"))]
-        let subdomain_points: Vec<CirclePoint<PackedBaseField>> =
-            CircleDomainBitRevIterator::new(eval_subdomain).collect();
+        let domain_iter_base = CircleDomainBitRevIterator::new(eval_subdomain);
         let subdomain_log_size = eval_subdomain.log_size();
         let mut quotients: SecureColumnByCoords<SimdBackend> =
             unsafe { SecureColumnByCoords::uninitialized(1 << subdomain_log_size) };
@@ -155,63 +150,108 @@ impl QuotientOps for SimdBackend {
             .map(|acc| PackedSecureField::broadcast(acc.first_linear_term_acc))
             .collect();
 
-        // Populate `quotients`.
+        let batch_cap = sample_coords.len() * COMBINE_CHUNK_SIZE;
+        let init_scratch = || {
+            (
+                Vec::<PackedCM31>::with_capacity(batch_cap),
+                vec![PackedCM31::zero(); batch_cap],
+                BatchInverseScratch::new(batch_cap.min(PACKED_CM31_BATCH_INVERSE_CHUNK_SIZE)),
+            )
+        };
+        let process_stride = |(denominators, chunk_inverses, scratch): &mut (
+            Vec<PackedCM31>,
+            Vec<PackedCM31>,
+            BatchInverseScratch,
+        ),
+                              (stride_idx, mut value_dst): (
+            usize,
+            SecureColumnByCoordsMutSlice<'_>,
+        )| {
+            let stride_start = stride_idx * STRIDE;
+            let packed_stride_len = value_dst.0[0].0.len();
+            let mut point_iter = domain_iter_base.start_at(stride_start);
+            let mut sub_points = [CirclePoint::zero(); COMBINE_CHUNK_SIZE];
+
+            for sub_start in (0..packed_stride_len).step_by(COMBINE_CHUNK_SIZE) {
+                let packed_chunk_len = COMBINE_CHUNK_SIZE.min(packed_stride_len - sub_start);
+                let chunk_start = stride_start + sub_start;
+                let points_slice = &mut sub_points[..packed_chunk_len];
+                for p in points_slice.iter_mut() {
+                    *p = point_iter.next().unwrap();
+                }
+
+                let mut chunk_acc = [PackedSecureField::zero(); COMBINE_CHUNK_SIZE];
+                let chunk_acc = &mut chunk_acc[..packed_chunk_len];
+
+                denominators.clear();
+                for [prx, pry, pix, piy] in &sample_coords {
+                    for points in &*points_slice {
+                        denominators.push(
+                            (*prx - points.x).mul_inline(*piy)
+                                - (*pry - points.y).mul_inline(*pix),
+                        );
+                    }
+                }
+                let inv_slice = &mut chunk_inverses[..denominators.len()];
+                for (col_chunk, dst_chunk) in denominators
+                    .chunks(PACKED_CM31_BATCH_INVERSE_CHUNK_SIZE)
+                    .zip(inv_slice.chunks_mut(PACKED_CM31_BATCH_INVERSE_CHUNK_SIZE))
+                {
+                    super::cm31::batch_inverse_chunk(col_chunk, dst_chunk, scratch);
+                }
+
+                for (((acc, den_inv), log_ratio), first_linear_term) in accumulations
+                    .iter()
+                    .zip_eq(inv_slice.chunks(packed_chunk_len))
+                    .zip_eq(log_ratios.iter())
+                    .zip_eq(first_linear_terms.iter())
+                {
+                    for (i, accumulator) in chunk_acc.iter_mut().enumerate() {
+                        let domain_idx = chunk_start + i;
+                        let lifted_partial_numerator =
+                            PackedSecureField::from_packed_m31s(std::array::from_fn(|j| {
+                                let lifted_simd = to_lifted_simd(
+                                    acc.partial_numerators_acc.columns[j].data
+                                        [domain_idx >> log_ratio]
+                                        .into_simd(),
+                                    *log_ratio,
+                                    domain_idx,
+                                );
+                                unsafe { PackedBaseField::from_simd_unchecked(lifted_simd) }
+                            }));
+
+                        let numerator = lifted_partial_numerator
+                            - first_linear_term.mul_m31_inline(points_slice[i].y);
+                        *accumulator += numerator.mul_cm31_inline(den_inv[i]);
+                    }
+                }
+
+                for (i, accumulator) in chunk_acc.iter().enumerate() {
+                    unsafe {
+                        value_dst.set_packed(sub_start + i, *accumulator);
+                    }
+                }
+            }
+        };
+
         #[cfg(not(feature = "parallel"))]
-        let iter = quotients.chunks_mut(COMBINE_CHUNK_SIZE).enumerate();
+        {
+            let mut scratch = init_scratch();
+            quotients
+                .chunks_mut(STRIDE)
+                .enumerate()
+                .for_each(|item| process_stride(&mut scratch, item));
+        }
 
         #[cfg(feature = "parallel")]
-        let iter = quotients.par_chunks_mut(COMBINE_CHUNK_SIZE).enumerate();
+        quotients
+            .par_chunks_mut(STRIDE)
+            .enumerate()
+            .for_each_init(init_scratch, process_stride);
 
-        iter.for_each(|(chunk_idx, mut value_dst)| {
-            let chunk_start = chunk_idx * COMBINE_CHUNK_SIZE;
-            let packed_chunk_len = value_dst.0[0].0.len();
-
-            let mut chunk_acc = [PackedSecureField::zero(); COMBINE_CHUNK_SIZE];
-            let chunk_acc = &mut chunk_acc[..packed_chunk_len];
-
-            let mut denominators = Vec::with_capacity(sample_coords.len() * packed_chunk_len);
-            for [prx, pry, pix, piy] in &sample_coords {
-                for points in &subdomain_points[chunk_start..chunk_start + packed_chunk_len] {
-                    denominators.push((*prx - points.x) * *piy - (*pry - points.y) * *pix);
-                }
-            }
-            let chunk_inverses = PackedCM31::batch_inverse(&denominators);
-
-            for (((acc, den_inv), log_ratio), first_linear_term) in accumulations
-                .iter()
-                .zip_eq(chunk_inverses.chunks(packed_chunk_len))
-                .zip_eq(log_ratios.iter())
-                .zip_eq(first_linear_terms.iter())
-            {
-                for (i, accumulator) in chunk_acc.iter_mut().enumerate() {
-                    let domain_idx = chunk_start + i;
-                    let lifted_partial_numerator =
-                        PackedSecureField::from_packed_m31s(std::array::from_fn(|j| {
-                            let lifted_simd = to_lifted_simd(
-                                acc.partial_numerators_acc.columns[j].data[domain_idx >> log_ratio]
-                                    .into_simd(),
-                                *log_ratio,
-                                domain_idx,
-                            );
-                            unsafe { PackedBaseField::from_simd_unchecked(lifted_simd) }
-                        }));
-
-                    let numerator = lifted_partial_numerator
-                        - *first_linear_term * subdomain_points[domain_idx].y;
-                    *accumulator += numerator * den_inv[i];
-                }
-            }
-
-            for (i, accumulator) in chunk_acc.iter().enumerate() {
-                unsafe {
-                    value_dst.set_packed(i, *accumulator);
-                }
-            }
-        });
         // Numerator and denominator scratch is dead before the larger-domain extension.
         drop(accumulations);
         drop(sample_coords);
-        drop(subdomain_points);
         drop(sample_points);
         drop(log_ratios);
         drop(first_linear_terms);
@@ -280,23 +320,28 @@ fn accumulate_group<const G: usize>(
     cols: [&[PackedBaseField]; G],
     coeffs: &[[u32; 4]; G],
 ) {
+    let c_splat: [[u64x8; 4]; G] = std::array::from_fn(|g| {
+        std::array::from_fn(|k| u64x8::splat(u64::from(coeffs[g][k])))
+    });
+    let mask32 = u64x8::splat(0xFFFF_FFFF);
+    let mod_p = u64x8::splat(u64::from(P));
     for (r, row_acc) in acc.iter_mut().enumerate() {
         let mut even = [u64x8::splat(0); G];
         let mut odd = [u64x8::splat(0); G];
         for g in 0..G {
             let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(cols[g][r]));
-            even[g] = w & u64x8::splat(0xFFFF_FFFF);
+            even[g] = w & mask32;
             odd[g] = w >> 32;
         }
         for k in 0..4 {
-            let mut pe = even[0] * u64x8::splat(u64::from(coeffs[0][k]));
-            let mut po = odd[0] * u64x8::splat(u64::from(coeffs[0][k]));
+            let mut pe = even[0] * c_splat[0][k];
+            let mut po = odd[0] * c_splat[0][k];
             for g in 1..G {
-                pe += even[g] * u64x8::splat(u64::from(coeffs[g][k]));
-                po += odd[g] * u64x8::splat(u64::from(coeffs[g][k]));
+                pe += even[g] * c_splat[g][k];
+                po += odd[g] * c_splat[g][k];
             }
-            row_acc[k][0] += (pe & u64x8::splat(u64::from(P))) + (pe >> 31);
-            row_acc[k][1] += (po & u64x8::splat(u64::from(P))) + (po >> 31);
+            row_acc[k][0] += (pe & mod_p) + (pe >> 31);
+            row_acc[k][1] += (po & mod_p) + (po >> 31);
         }
     }
 }

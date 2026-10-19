@@ -132,8 +132,16 @@ fn write_trace_simd(
     };
 
     trace.par_iter_mut().enumerate().for_each(|(row_index, row)| {
-        let packed: PackedInputType =
-            <InputType as Pack>::pack(from_fn(|lane| operands(row_index * N_LANES + lane)));
+        let first = row_index * N_LANES;
+        let packed: PackedInputType = if first + N_LANES <= first_permutation_row {
+            [in0_address, in1_address, out_address].map(|address| {
+                <[M31; 4] as Pack>::pack(from_fn(|lane| {
+                    context_values[address.at(first + lane)].to_m31_array()
+                }))
+            })
+        } else {
+            <InputType as Pack>::pack(from_fn(|lane| operands(first + lane)))
+        };
         for column in 0..N_TRACE_COLUMNS {
             *row[column] = packed[column / 4][column % 4];
         }
@@ -184,8 +192,14 @@ pub fn write_interaction_trace(
     };
     let tuple = |address: &ColumnRows<'_>, index: usize, row: usize| {
         let first = row * N_LANES;
-        let [a, b, c, d] = <[M31; 4] as Pack>::pack(from_fn(|lane| operand(first + lane, index)));
-        [tag, address.packed_m31_at(first), a, b, c, d]
+        let addr_packed = address.packed_m31_at(first);
+        let [a, b, c, d] = if first + N_LANES <= first_permutation_row {
+            let addrs = addr_packed.into_simd().to_array();
+            <[M31; 4] as Pack>::pack(addrs.map(|addr| context_values[addr as usize].to_m31_array()))
+        } else {
+            <[M31; 4] as Pack>::pack(from_fn(|lane| operand(first + lane, index)))
+        };
+        [tag, addr_packed, a, b, c, d]
     };
 
     // Sum logup terms in pairs, in one pass per column (fractions, inverses and the running sum

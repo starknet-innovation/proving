@@ -12,7 +12,7 @@ use tracing::{Level, span};
 
 use super::SimdBackend;
 use super::fft::{CACHED_FFT_LOG_SIZE, MIN_FFT_LOG_SIZE, ifft, rfft};
-use super::m31::{LOG_N_LANES, N_LANES, PackedBaseField};
+use super::m31::{LOG_N_LANES, N_LANES, PackedBaseField, SplattedM31};
 use super::qm31::PackedSecureField;
 use crate::core::circle::{CirclePoint, CirclePointIndex, Coset, M31_CIRCLE_LOG_ORDER};
 use crate::core::constraints::{coset_vanishing, coset_vanishing_derivative, point_vanishing};
@@ -1238,25 +1238,63 @@ fn evaluate_block_phases_into(
             let stripe = block >> (level - log_block);
             let sign = (block >> (level - 1 - log_block)) & 1;
             let t = BaseField::from_u32_unchecked(line_twiddles[(level - 2) as usize][stripe] / 2);
-            PackedBaseField::broadcast(if sign == 0 { t } else { -t })
+            if sign == 0 { t } else { -t }
         };
-        let t0 = (log_size - log_block == 2).then(|| signed_twiddle(log_size));
-        let t1 = signed_twiddle(log_block + 1);
+        let t0 = (log_size - log_block == 2).then(|| SplattedM31::new(signed_twiddle(log_size)));
+        let t1 = SplattedM31::new(signed_twiddle(log_block + 1));
         let src = &poly.coeffs.data;
-        let log_n_vecs = log_size - LOG_N_LANES;
-        let at = |v: usize| src[transposed_vec_index(v, log_n_vecs)];
-        let quarter_vecs = 1usize << (log_block - LOG_N_LANES);
+        let lb = log_block - LOG_N_LANES;
+        let ln = log_size - LOG_N_LANES;
+        let post_n = ln / 2;
+        let n_b_n = ln & 1;
+        let k_stride = 1usize << (lb - post_n - n_b_n);
+        let block_vecs = 1usize << (lb / 2);
+        let quarter_vecs = 1usize << lb;
         let load: &(dyn Fn(usize, &mut [Simd<u32, N_LANES>]) + Sync) =
             &|first: usize, vecs: &mut [Simd<u32, N_LANES>]| {
+                if first & (block_vecs - 1) == 0 && vecs.len() == block_vecs && block_vecs >= 4 {
+                    let base0 = transposed_vec_index(transposed_vec_index(first, lb), ln);
+                    let base1 = transposed_vec_index(transposed_vec_index(first + 1, lb), ln);
+                    let p_stride =
+                        transposed_vec_index(transposed_vec_index(first + 2, lb), ln) - base0;
+                    match t0 {
+                        Some(t0) => {
+                            for (j, pair) in vecs.chunks_exact_mut(2).enumerate() {
+                                let idx0 = base0 + j * p_stride;
+                                let idx1 = base1 + j * p_stride;
+                                let lo0 = src[idx0] + src[idx0 + 2 * k_stride].mul_splatted(t0);
+                                let hi0 =
+                                    src[idx0 + k_stride] + src[idx0 + 3 * k_stride].mul_splatted(t0);
+                                pair[0] = (lo0 + hi0.mul_splatted(t1)).into_simd();
+                                let lo1 = src[idx1] + src[idx1 + 2 * k_stride].mul_splatted(t0);
+                                let hi1 =
+                                    src[idx1 + k_stride] + src[idx1 + 3 * k_stride].mul_splatted(t0);
+                                pair[1] = (lo1 + hi1.mul_splatted(t1)).into_simd();
+                            }
+                        }
+                        None => {
+                            for (j, pair) in vecs.chunks_exact_mut(2).enumerate() {
+                                let idx0 = base0 + j * p_stride;
+                                let idx1 = base1 + j * p_stride;
+                                pair[0] =
+                                    (src[idx0] + src[idx0 + k_stride].mul_splatted(t1)).into_simd();
+                                pair[1] =
+                                    (src[idx1] + src[idx1 + k_stride].mul_splatted(t1)).into_simd();
+                            }
+                        }
+                    }
+                    return;
+                }
+                let at = |v: usize| src[transposed_vec_index(v, ln)];
                 for (p, vec) in (first..).zip(vecs.iter_mut()) {
-                    let i = transposed_vec_index(p, log_block - LOG_N_LANES);
+                    let i = transposed_vec_index(p, lb);
                     let value = match t0 {
                         Some(t0) => {
-                            let lo = at(i) + at(i + 2 * quarter_vecs) * t0;
-                            let hi = at(i + quarter_vecs) + at(i + 3 * quarter_vecs) * t0;
-                            lo + hi * t1
+                            let lo = at(i) + at(i + 2 * quarter_vecs).mul_splatted(t0);
+                            let hi = at(i + quarter_vecs) + at(i + 3 * quarter_vecs).mul_splatted(t0);
+                            lo + hi.mul_splatted(t1)
                         }
-                        None => at(i) + at(i + quarter_vecs) * t1,
+                        None => at(i) + at(i + quarter_vecs).mul_splatted(t1),
                     };
                     *vec = value.into_simd();
                 }
@@ -1269,7 +1307,7 @@ fn evaluate_block_phases_into(
         let stripe = block >> (level - log_block);
         let sign = (block >> (level - 1 - log_block)) & 1;
         let t = BaseField::from_u32_unchecked(line_twiddles[(level - 2) as usize][stripe] / 2);
-        let t = PackedBaseField::broadcast(if sign == 0 { t } else { -t });
+        let t = SplattedM31::new(if sign == 0 { t } else { -t });
         let half_vecs = 1usize << (level - 1 - LOG_N_LANES);
         match &mut folded {
             None => {
@@ -1297,7 +1335,7 @@ fn evaluate_block_phases_into(
                         } else {
                             i
                         };
-                        at(i) + at(i + half_vecs) * t
+                        at(i) + at(i + half_vecs).mul_splatted(t)
                     })
                     .collect(),
                 );
@@ -1313,7 +1351,7 @@ fn evaluate_block_phases_into(
                     let out = BaseColumn::from_simd(
                         iter.map(|i| {
                             let i = transposed_vec_index(i, log_block - LOG_N_LANES);
-                            buf.data[i] + buf.data[i + half_vecs] * t
+                            buf.data[i] + buf.data[i + half_vecs].mul_splatted(t)
                         })
                         .collect(),
                     );
@@ -1325,7 +1363,7 @@ fn evaluate_block_phases_into(
                     let pairs = lo.iter_mut().zip(hi.iter());
                     #[cfg(feature = "parallel")]
                     let pairs = lo.par_iter_mut().zip(hi.par_iter());
-                    pairs.for_each(|(l, h)| *l = *l + *h * t);
+                    pairs.for_each(|(l, h)| *l = *l + h.mul_splatted(t));
                     buf.data.truncate(half_vecs);
                     buf.length = 1 << (level - 1);
                 }
@@ -1375,8 +1413,8 @@ pub fn evaluate_rows_from_coefficients(
     let mut acc = vec![[PackedBaseField::zero(); 2]; n_blocks];
     // The nodes of the current and next level, each `2^(n0 - d)` vectors, back to back.
     let max_nodes = plan.levels.iter().map(|level| level.len()).max().unwrap_or(1);
-    let mut cur: Vec<PackedBaseField> = vec![PackedBaseField::zero(); max_nodes * tile / 2];
-    let mut next: Vec<PackedBaseField> = vec![PackedBaseField::zero(); max_nodes * tile / 2];
+    let mut cur: Vec<PackedBaseField> = unsafe { crate::core::utils::uninit_vec(max_nodes * tile / 2) };
+    let mut next: Vec<PackedBaseField> = unsafe { crate::core::utils::uninit_vec(max_nodes * tile / 2) };
     let low_half = u64x8::splat(0xFFFF_FFFF);
     let modulus = u64x8::splat(u64::from(P));
     let fold64 = |x: u64x8| (x & modulus) + (x >> 31);
@@ -1390,7 +1428,12 @@ pub fn evaluate_rows_from_coefficients(
         let lanes = bytemuck::cast::<[u64; 8], PackedBaseField>(packed.to_array());
         PackedBaseField::reduce_simd(lanes.into_simd())
     };
-    let mut leaf_lanes = vec![[u64x8::splat(0); 2]; tile.max(max_nodes * tile / 2)];
+    let n_leaf_vecs = if low % 4 == 0 {
+        (plan.blocks.iter().map(|block| block.leaf).max().unwrap_or(0) + 1) * low
+    } else {
+        0
+    };
+    let mut leaf_lanes: Vec<[u64x8; 2]> = unsafe { crate::core::utils::uninit_vec(n_leaf_vecs) };
     for t in 0..n_tiles {
         let src = &coeffs.coeffs.data[t * tile..(t + 1) * tile];
         for (d, level) in plan.levels.iter().enumerate() {
@@ -1402,7 +1445,7 @@ pub fn evaluate_rows_from_coefficients(
                     &cur[op.parent * 2 * half..(op.parent + 1) * 2 * half]
                 };
                 let (lo, hi) = parent.split_at(half);
-                let f = PackedBaseField::broadcast(op.factor);
+                let f = SplattedM31::new(op.factor);
                 match (op.plus, op.minus) {
                     (Some(p), Some(m)) => {
                         let (a, b) = if p < m {
@@ -1413,7 +1456,7 @@ pub fn evaluate_rows_from_coefficients(
                             (&mut y[..half], &mut x[m * half..(m + 1) * half])
                         };
                         for i in 0..half {
-                            let prod = hi[i] * f;
+                            let prod = hi[i].mul_splatted(f);
                             a[i] = lo[i] + prod;
                             b[i] = lo[i] - prod;
                         }
@@ -1421,13 +1464,13 @@ pub fn evaluate_rows_from_coefficients(
                     (Some(p), None) => {
                         let a = &mut next[p * half..(p + 1) * half];
                         for i in 0..half {
-                            a[i] = lo[i] + hi[i] * f;
+                            a[i] = lo[i] + hi[i].mul_splatted(f);
                         }
                     }
                     (None, Some(m)) => {
                         let b = &mut next[m * half..(m + 1) * half];
                         for i in 0..half {
-                            b[i] = lo[i] - hi[i] * f;
+                            b[i] = lo[i] - hi[i].mul_splatted(f);
                         }
                     }
                     (None, None) => unreachable!(),
@@ -1444,7 +1487,6 @@ pub fn evaluate_rows_from_coefficients(
             // (`x = hi * 2^31 + lo` to `hi + lo`, equal modulo P, below 2^34), so a block's sum
             // stays below 2^(log2(low) + 32) and one more fold and a reduction give the canonical
             // residue the reduced per-term arithmetic gives.
-            let n_leaf_vecs = (plan.blocks.iter().map(|block| block.leaf).max().unwrap_or(0) + 1) * low;
             for (lane, &v) in leaf_lanes.iter_mut().zip(&leaves[..n_leaf_vecs]) {
                 *lane = split(v);
             }
@@ -1453,29 +1495,31 @@ pub fn evaluate_rows_from_coefficients(
                 let mut even = u64x8::splat(0);
                 let mut odd = u64x8::splat(0);
                 for (g, group) in lanes.chunks_exact(4).enumerate() {
-                    let mut sum_even = u64x8::splat(0);
-                    let mut sum_odd = u64x8::splat(0);
-                    for (j, lane) in group.iter().enumerate() {
-                        let i = g * 4 + j;
-                        let w = if i == 0 { 1 } else { block.low_weights[i].0 };
-                        let w = u64x8::splat(u64::from(w));
-                        sum_even += (lane[0] & low_half) * w;
-                        sum_odd += (lane[1] & low_half) * w;
+                    let (mut sum_even, mut sum_odd) = if g == 0 {
+                        (group[0][0], group[0][1])
+                    } else {
+                        let w0 = u64x8::splat(u64::from(block.low_weights[g * 4].0));
+                        (group[0][0] * w0, group[0][1] * w0)
+                    };
+                    for j in 1..4 {
+                        let w = u64x8::splat(u64::from(block.low_weights[g * 4 + j].0));
+                        sum_even += group[j][0] * w;
+                        sum_odd += group[j][1] * w;
                     }
                     even += fold64(sum_even);
                     odd += fold64(sum_odd);
                 }
                 let v = pack(even, odd);
-                acc[e] += v * PackedBaseField::broadcast(block.tile_weights[t]);
+                acc[e] += v.mul_splatted(SplattedM31::new(block.tile_weights[t]));
             }
         } else {
             for (block, acc) in plan.blocks.iter().zip(acc.iter_mut()) {
                 let leaf = &leaves[block.leaf * low..(block.leaf + 1) * low];
                 let mut v = leaf[0];
                 for i in 1..low {
-                    v += leaf[i] * PackedBaseField::broadcast(block.low_weights[i]);
+                    v += leaf[i].mul_splatted(SplattedM31::new(block.low_weights[i]));
                 }
-                acc[e] += v * PackedBaseField::broadcast(block.tile_weights[t]);
+                acc[e] += v.mul_splatted(SplattedM31::new(block.tile_weights[t]));
             }
         }
     }

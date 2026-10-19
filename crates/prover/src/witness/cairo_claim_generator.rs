@@ -1087,274 +1087,178 @@ impl CairoClaimGenerator {
             })
             .unzip();
 
-        let (verify_instruction_claim, verify_instruction_interaction_gen) = self
-            .verify_instruction
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+        let mut verify_instruction_res = None;
+        let mut blake_round_res = None;
+        let mut triple_xor_32_res = None;
+        let mut add_mod_builtin_res = None;
+        let mut bitwise_builtin_res = None;
+        let mut mul_mod_builtin_res = None;
+        let mut pedersen_builtin_res = None;
+        let mut pedersen_builtin_narrow_windows_res = None;
+        let mut poseidon_builtin_res = None;
+        let mut range_check96_builtin_res = None;
+        let mut range_check_builtin_res = None;
+        let mut ec_op_builtin_res = None;
+
+        macro_rules! par_join {
+            ($a:expr $(,)?) => { $a };
+            ($a:expr, $b:expr $(,)?) => {
+                rayon::join(|| $a, || $b)
+            };
+            ($a:expr, $b:expr, $($rest:expr),+ $(,)?) => {
+                rayon::join(|| rayon::join(|| $a, || $b), || par_join!($($rest),+))
+            };
+        }
+
+        let verify_instruction = self.verify_instruction;
+        let blake_round = self.blake_round;
+        let triple_xor_32 = self.triple_xor_32;
+        let add_mod_builtin = self.add_mod_builtin;
+        let bitwise_builtin = self.bitwise_builtin;
+        let mul_mod_builtin = self.mul_mod_builtin;
+        let pedersen_builtin = self.pedersen_builtin;
+        let pedersen_builtin_narrow_windows = self.pedersen_builtin_narrow_windows;
+        let poseidon_builtin = self.poseidon_builtin;
+        let range_check96_builtin = self.range_check96_builtin;
+        let range_check_builtin = self.range_check_builtin;
+        let ec_op_builtin = self.ec_op_builtin;
+
+        par_join!(
+            verify_instruction_res = verify_instruction.map(|generator| {
+                generator.write_trace(
                     self.range_check_7_2_5.as_ref().unwrap(),
                     self.range_check_4_3.as_ref().unwrap(),
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (blake_round_claim, blake_round_interaction_gen) = self
-            .blake_round
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            blake_round_res = blake_round.map(|generator| {
+                generator.write_trace(
                     self.blake_round_sigma.as_ref().unwrap(),
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.range_check_7_2_5.as_ref().unwrap(),
                     self.blake_g.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (blake_g_claim, blake_g_interaction_gen) = self
-            .blake_g
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
-                    self.verify_bitwise_xor_8.as_ref().unwrap(),
-                    self.verify_bitwise_xor_12.as_ref().unwrap(),
-                    self.verify_bitwise_xor_4.as_ref().unwrap(),
-                    self.verify_bitwise_xor_7.as_ref().unwrap(),
-                    self.verify_bitwise_xor_9.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (blake_round_sigma_claim, blake_round_sigma_interaction_gen) = self
-            .blake_round_sigma
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (triple_xor_32_claim, triple_xor_32_interaction_gen) = self
-            .triple_xor_32
-            .map(|generator| {
-                let (trace, claim, interaction_gen) =
-                    generator.write_trace(self.verify_bitwise_xor_8.as_ref().unwrap());
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (verify_bitwise_xor_12_claim, verify_bitwise_xor_12_interaction_gen) = self
-            .verify_bitwise_xor_12
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace);
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (add_mod_builtin_claim, add_mod_builtin_interaction_gen) = self
-            .add_mod_builtin
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            triple_xor_32_res = triple_xor_32.map(|generator| {
+                generator.write_trace(self.verify_bitwise_xor_8.as_ref().unwrap())
+            }),
+            add_mod_builtin_res = add_mod_builtin.map(|generator| {
+                generator.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (bitwise_builtin_claim, bitwise_builtin_interaction_gen) = self
-            .bitwise_builtin
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            bitwise_builtin_res = bitwise_builtin.map(|generator| {
+                generator.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.verify_bitwise_xor_9.as_ref().unwrap(),
                     self.verify_bitwise_xor_8.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (mul_mod_builtin_claim, mul_mod_builtin_interaction_gen) = self
-            .mul_mod_builtin
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            mul_mod_builtin_res = mul_mod_builtin.map(|generator| {
+                generator.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.range_check_12.as_ref().unwrap(),
                     self.range_check_3_6_6_3.as_ref().unwrap(),
                     self.range_check_18.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (pedersen_builtin_claim, pedersen_builtin_interaction_gen) = self
-            .pedersen_builtin
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            pedersen_builtin_res = pedersen_builtin.map(|generator| {
+                generator.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.pedersen_aggregator_window_bits_18.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (
-            pedersen_builtin_narrow_windows_claim,
-            pedersen_builtin_narrow_windows_interaction_gen,
-        ) = self
-            .pedersen_builtin_narrow_windows
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.pedersen_aggregator_window_bits_9.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (poseidon_builtin_claim, poseidon_builtin_interaction_gen) = self
-            .poseidon_builtin
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            pedersen_builtin_narrow_windows_res =
+                pedersen_builtin_narrow_windows.map(|generator| {
+                    generator.write_trace(
+                        self.memory_address_to_id.as_ref().unwrap(),
+                        self.pedersen_aggregator_window_bits_9.as_ref().unwrap(),
+                    )
+                }),
+            poseidon_builtin_res = poseidon_builtin.map(|generator| {
+                generator.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.poseidon_aggregator.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (range_check96_builtin_claim, range_check96_builtin_interaction_gen) = self
-            .range_check96_builtin
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            range_check96_builtin_res = range_check96_builtin.map(|generator| {
+                generator.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.range_check_6.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (range_check_builtin_claim, range_check_builtin_interaction_gen) = self
-            .range_check_builtin
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            range_check_builtin_res = range_check_builtin.map(|generator| {
+                generator.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (ec_op_builtin_claim, ec_op_builtin_interaction_gen) = self
-            .ec_op_builtin
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            ec_op_builtin_res = ec_op_builtin.map(|generator| {
+                generator.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.range_check_8.as_ref().unwrap(),
                     self.partial_ec_mul_generic.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (partial_ec_mul_generic_claim, partial_ec_mul_generic_interaction_gen) = self
-            .partial_ec_mul_generic
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+        );
+
+        let mut blake_g_res = None;
+        let mut blake_round_sigma_res = None;
+        let mut partial_ec_mul_generic_res = None;
+        let mut pedersen_aggregator_window_bits_18_res = None;
+        let mut pedersen_aggregator_window_bits_9_res = None;
+        let mut poseidon_aggregator_res = None;
+
+        let blake_g = self.blake_g;
+        let blake_round_sigma = self.blake_round_sigma;
+        let partial_ec_mul_generic = self.partial_ec_mul_generic;
+        let pedersen_aggregator_window_bits_18 = self.pedersen_aggregator_window_bits_18;
+        let pedersen_aggregator_window_bits_9 = self.pedersen_aggregator_window_bits_9;
+        let poseidon_aggregator = self.poseidon_aggregator;
+
+        par_join!(
+            blake_g_res = blake_g.map(|generator| {
+                generator.write_trace(
+                    self.verify_bitwise_xor_8.as_ref().unwrap(),
+                    self.verify_bitwise_xor_12.as_ref().unwrap(),
+                    self.verify_bitwise_xor_4.as_ref().unwrap(),
+                    self.verify_bitwise_xor_7.as_ref().unwrap(),
+                    self.verify_bitwise_xor_9.as_ref().unwrap(),
+                )
+            }),
+            blake_round_sigma_res = blake_round_sigma.map(|generator| generator.write_trace()),
+            partial_ec_mul_generic_res = partial_ec_mul_generic.map(|generator| {
+                generator.write_trace(
                     self.range_check_8.as_ref().unwrap(),
                     self.range_check_9_9.as_ref().unwrap(),
                     self.range_check_20.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (
-            pedersen_aggregator_window_bits_18_claim,
-            pedersen_aggregator_window_bits_18_interaction_gen,
-        ) = self
-            .pedersen_aggregator_window_bits_18
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.range_check_8.as_ref().unwrap(),
-                    self.partial_ec_mul_window_bits_18.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (partial_ec_mul_window_bits_18_claim, partial_ec_mul_window_bits_18_interaction_gen) =
-            self.partial_ec_mul_window_bits_18
-                .map(|generator| {
-                    let (trace, claim, interaction_gen) = generator.write_trace(
-                        self.pedersen_points_table_window_bits_18.as_ref().unwrap(),
-                        self.range_check_9_9.as_ref().unwrap(),
-                        self.range_check_20.as_ref().unwrap(),
-                    );
-                    evals.extend(trace.to_evals());
-                    (claim, interaction_gen)
-                })
-                .unzip();
-        let (
-            pedersen_points_table_window_bits_18_claim,
-            pedersen_points_table_window_bits_18_interaction_gen,
-        ) = self
-            .pedersen_points_table_window_bits_18
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (
-            pedersen_aggregator_window_bits_9_claim,
-            pedersen_aggregator_window_bits_9_interaction_gen,
-        ) = self
-            .pedersen_aggregator_window_bits_9
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.range_check_8.as_ref().unwrap(),
-                    self.partial_ec_mul_window_bits_9.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (partial_ec_mul_window_bits_9_claim, partial_ec_mul_window_bits_9_interaction_gen) =
-            self.partial_ec_mul_window_bits_9
-                .map(|generator| {
-                    let (trace, claim, interaction_gen) = generator.write_trace(
-                        self.pedersen_points_table_window_bits_9.as_ref().unwrap(),
-                        self.range_check_9_9.as_ref().unwrap(),
-                        self.range_check_20.as_ref().unwrap(),
-                    );
-                    evals.extend(trace.to_evals());
-                    (claim, interaction_gen)
-                })
-                .unzip();
-        let (
-            pedersen_points_table_window_bits_9_claim,
-            pedersen_points_table_window_bits_9_interaction_gen,
-        ) = self
-            .pedersen_points_table_window_bits_9
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (poseidon_aggregator_claim, poseidon_aggregator_interaction_gen) = self
-            .poseidon_aggregator
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
+                )
+            }),
+            pedersen_aggregator_window_bits_18_res =
+                pedersen_aggregator_window_bits_18.map(|generator| {
+                    generator.write_trace(
+                        self.memory_id_to_big.as_ref().unwrap(),
+                        self.range_check_8.as_ref().unwrap(),
+                        self.partial_ec_mul_window_bits_18.as_ref().unwrap(),
+                    )
+                }),
+            pedersen_aggregator_window_bits_9_res =
+                pedersen_aggregator_window_bits_9.map(|generator| {
+                    generator.write_trace(
+                        self.memory_id_to_big.as_ref().unwrap(),
+                        self.range_check_8.as_ref().unwrap(),
+                        self.partial_ec_mul_window_bits_9.as_ref().unwrap(),
+                    )
+                }),
+            poseidon_aggregator_res = poseidon_aggregator.map(|generator| {
+                generator.write_trace(
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.poseidon_full_round_chain.as_ref().unwrap(),
                     self.range_check_252_width_27.as_ref().unwrap(),
@@ -1363,87 +1267,371 @@ impl CairoClaimGenerator {
                     self.range_check_4_4_4_4.as_ref().unwrap(),
                     self.range_check_4_4.as_ref().unwrap(),
                     self.poseidon_3_partial_rounds_chain.as_ref().unwrap(),
-                );
+                )
+            }),
+        );
+
+        let mut verify_bitwise_xor_12_res = None;
+        let mut partial_ec_mul_window_bits_18_res = None;
+        let mut partial_ec_mul_window_bits_9_res = None;
+        let mut poseidon_3_partial_rounds_chain_res = None;
+        let mut poseidon_full_round_chain_res = None;
+        let mut cube_252_res = None;
+        let mut range_check_252_width_27_res = None;
+        let mut memory_address_to_id_res = None;
+        let mut memory_id_to_big_res = None;
+
+        let verify_bitwise_xor_12 = self.verify_bitwise_xor_12;
+        let partial_ec_mul_window_bits_18 = self.partial_ec_mul_window_bits_18;
+        let partial_ec_mul_window_bits_9 = self.partial_ec_mul_window_bits_9;
+        let poseidon_3_partial_rounds_chain = self.poseidon_3_partial_rounds_chain;
+        let poseidon_full_round_chain = self.poseidon_full_round_chain;
+        let cube_252 = self.cube_252;
+        let range_check_252_width_27 = self.range_check_252_width_27;
+        let memory_address_to_id = self.memory_address_to_id;
+        let memory_id_to_big = self.memory_id_to_big;
+
+        par_join!(
+            verify_bitwise_xor_12_res =
+                verify_bitwise_xor_12.map(|generator| generator.write_trace()),
+            partial_ec_mul_window_bits_18_res =
+                partial_ec_mul_window_bits_18.map(|generator| {
+                    generator.write_trace(
+                        self.pedersen_points_table_window_bits_18.as_ref().unwrap(),
+                        self.range_check_9_9.as_ref().unwrap(),
+                        self.range_check_20.as_ref().unwrap(),
+                    )
+                }),
+            partial_ec_mul_window_bits_9_res = partial_ec_mul_window_bits_9.map(|generator| {
+                generator.write_trace(
+                    self.pedersen_points_table_window_bits_9.as_ref().unwrap(),
+                    self.range_check_9_9.as_ref().unwrap(),
+                    self.range_check_20.as_ref().unwrap(),
+                )
+            }),
+            {
+                poseidon_3_partial_rounds_chain_res =
+                    poseidon_3_partial_rounds_chain.map(|generator| {
+                        generator.write_trace(
+                            self.poseidon_round_keys.as_ref().unwrap(),
+                            cube_252.as_ref().unwrap(),
+                            self.range_check_4_4_4_4.as_ref().unwrap(),
+                            self.range_check_4_4.as_ref().unwrap(),
+                            range_check_252_width_27.as_ref().unwrap(),
+                        )
+                    });
+                poseidon_full_round_chain_res = poseidon_full_round_chain.map(|generator| {
+                    generator.write_trace(
+                        cube_252.as_ref().unwrap(),
+                        self.poseidon_round_keys.as_ref().unwrap(),
+                        self.range_check_3_3_3_3_3.as_ref().unwrap(),
+                    )
+                });
+                cube_252_res = cube_252.map(|generator| {
+                    generator.write_trace(
+                        self.range_check_9_9.as_ref().unwrap(),
+                        self.range_check_20.as_ref().unwrap(),
+                    )
+                });
+                range_check_252_width_27_res = range_check_252_width_27.map(|generator| {
+                    generator.write_trace(
+                        self.range_check_9_9.as_ref().unwrap(),
+                        self.range_check_18.as_ref().unwrap(),
+                    )
+                });
+            },
+            memory_address_to_id_res =
+                memory_address_to_id.map(|generator| generator.write_trace()),
+            memory_id_to_big_res = memory_id_to_big.map(|generator| {
+                const LOG_MAX_BIG_SIZE: u32 = MAX_SEQUENCE_LOG_SIZE;
+                generator.write_trace(
+                    self.range_check_9_9.as_ref().unwrap(),
+                    LOG_MAX_BIG_SIZE,
+                    opt_n_id_to_big_components,
+                )
+            }),
+        );
+
+        let mut pedersen_points_table_window_bits_18_res = None;
+        let mut pedersen_points_table_window_bits_9_res = None;
+        let mut poseidon_round_keys_res = None;
+        let mut range_check_6_res = None;
+        let mut range_check_8_res = None;
+        let mut range_check_11_res = None;
+        let mut range_check_12_res = None;
+        let mut range_check_18_res = None;
+        let mut range_check_20_res = None;
+        let mut range_check_4_3_res = None;
+        let mut range_check_4_4_res = None;
+        let mut range_check_9_9_res = None;
+        let mut range_check_7_2_5_res = None;
+        let mut range_check_3_6_6_3_res = None;
+        let mut range_check_4_4_4_4_res = None;
+        let mut range_check_3_3_3_3_3_res = None;
+        let mut verify_bitwise_xor_4_res = None;
+        let mut verify_bitwise_xor_7_res = None;
+        let mut verify_bitwise_xor_8_res = None;
+        let mut verify_bitwise_xor_9_res = None;
+
+        let pedersen_points_table_window_bits_18 = self.pedersen_points_table_window_bits_18;
+        let pedersen_points_table_window_bits_9 = self.pedersen_points_table_window_bits_9;
+        let poseidon_round_keys = self.poseidon_round_keys;
+        let range_check_6 = self.range_check_6;
+        let range_check_8 = self.range_check_8;
+        let range_check_11 = self.range_check_11;
+        let range_check_12 = self.range_check_12;
+        let range_check_18 = self.range_check_18;
+        let range_check_20 = self.range_check_20;
+        let range_check_4_3 = self.range_check_4_3;
+        let range_check_4_4 = self.range_check_4_4;
+        let range_check_9_9 = self.range_check_9_9;
+        let range_check_7_2_5 = self.range_check_7_2_5;
+        let range_check_3_6_6_3 = self.range_check_3_6_6_3;
+        let range_check_4_4_4_4 = self.range_check_4_4_4_4;
+        let range_check_3_3_3_3_3 = self.range_check_3_3_3_3_3;
+        let verify_bitwise_xor_4 = self.verify_bitwise_xor_4;
+        let verify_bitwise_xor_7 = self.verify_bitwise_xor_7;
+        let verify_bitwise_xor_8 = self.verify_bitwise_xor_8;
+        let verify_bitwise_xor_9 = self.verify_bitwise_xor_9;
+
+        par_join!(
+            pedersen_points_table_window_bits_18_res =
+                pedersen_points_table_window_bits_18.map(|generator| generator.write_trace()),
+            pedersen_points_table_window_bits_9_res =
+                pedersen_points_table_window_bits_9.map(|generator| generator.write_trace()),
+            poseidon_round_keys_res =
+                poseidon_round_keys.map(|generator| generator.write_trace()),
+            range_check_6_res = range_check_6.map(|generator| generator.write_trace()),
+            range_check_8_res = range_check_8.map(|generator| generator.write_trace()),
+            range_check_11_res = range_check_11.map(|generator| generator.write_trace()),
+            range_check_12_res = range_check_12.map(|generator| generator.write_trace()),
+            range_check_18_res = range_check_18.map(|generator| generator.write_trace()),
+            range_check_20_res = range_check_20.map(|generator| generator.write_trace()),
+            range_check_4_3_res = range_check_4_3.map(|generator| generator.write_trace()),
+            range_check_4_4_res = range_check_4_4.map(|generator| generator.write_trace()),
+            range_check_9_9_res = range_check_9_9.map(|generator| generator.write_trace()),
+            range_check_7_2_5_res = range_check_7_2_5.map(|generator| generator.write_trace()),
+            range_check_3_6_6_3_res =
+                range_check_3_6_6_3.map(|generator| generator.write_trace()),
+            range_check_4_4_4_4_res =
+                range_check_4_4_4_4.map(|generator| generator.write_trace()),
+            range_check_3_3_3_3_3_res =
+                range_check_3_3_3_3_3.map(|generator| generator.write_trace()),
+            verify_bitwise_xor_4_res =
+                verify_bitwise_xor_4.map(|generator| generator.write_trace()),
+            verify_bitwise_xor_7_res =
+                verify_bitwise_xor_7.map(|generator| generator.write_trace()),
+            verify_bitwise_xor_8_res =
+                verify_bitwise_xor_8.map(|generator| generator.write_trace()),
+            verify_bitwise_xor_9_res =
+                verify_bitwise_xor_9.map(|generator| generator.write_trace()),
+        );
+
+        let (verify_instruction_claim, verify_instruction_interaction_gen) = verify_instruction_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (blake_round_claim, blake_round_interaction_gen) = blake_round_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (blake_g_claim, blake_g_interaction_gen) = blake_g_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (blake_round_sigma_claim, blake_round_sigma_interaction_gen) = blake_round_sigma_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (triple_xor_32_claim, triple_xor_32_interaction_gen) = triple_xor_32_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (verify_bitwise_xor_12_claim, verify_bitwise_xor_12_interaction_gen) =
+            verify_bitwise_xor_12_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace);
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (add_mod_builtin_claim, add_mod_builtin_interaction_gen) = add_mod_builtin_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (bitwise_builtin_claim, bitwise_builtin_interaction_gen) = bitwise_builtin_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (mul_mod_builtin_claim, mul_mod_builtin_interaction_gen) = mul_mod_builtin_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (pedersen_builtin_claim, pedersen_builtin_interaction_gen) = pedersen_builtin_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
         let (
+            pedersen_builtin_narrow_windows_claim,
+            pedersen_builtin_narrow_windows_interaction_gen,
+        ) = pedersen_builtin_narrow_windows_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (poseidon_builtin_claim, poseidon_builtin_interaction_gen) = poseidon_builtin_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (range_check96_builtin_claim, range_check96_builtin_interaction_gen) =
+            range_check96_builtin_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (range_check_builtin_claim, range_check_builtin_interaction_gen) =
+            range_check_builtin_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (ec_op_builtin_claim, ec_op_builtin_interaction_gen) = ec_op_builtin_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (partial_ec_mul_generic_claim, partial_ec_mul_generic_interaction_gen) =
+            partial_ec_mul_generic_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (
+            pedersen_aggregator_window_bits_18_claim,
+            pedersen_aggregator_window_bits_18_interaction_gen,
+        ) = pedersen_aggregator_window_bits_18_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (partial_ec_mul_window_bits_18_claim, partial_ec_mul_window_bits_18_interaction_gen) =
+            partial_ec_mul_window_bits_18_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (
+            pedersen_points_table_window_bits_18_claim,
+            pedersen_points_table_window_bits_18_interaction_gen,
+        ) = pedersen_points_table_window_bits_18_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (
+            pedersen_aggregator_window_bits_9_claim,
+            pedersen_aggregator_window_bits_9_interaction_gen,
+        ) = pedersen_aggregator_window_bits_9_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (partial_ec_mul_window_bits_9_claim, partial_ec_mul_window_bits_9_interaction_gen) =
+            partial_ec_mul_window_bits_9_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (
+            pedersen_points_table_window_bits_9_claim,
+            pedersen_points_table_window_bits_9_interaction_gen,
+        ) = pedersen_points_table_window_bits_9_res
+            .map(|(trace, claim, interaction_gen)| {
+                evals.extend(trace.to_evals());
+                (claim, interaction_gen)
+            })
+            .unzip();
+        let (poseidon_aggregator_claim, poseidon_aggregator_interaction_gen) =
+            poseidon_aggregator_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (
             poseidon_3_partial_rounds_chain_claim,
             poseidon_3_partial_rounds_chain_interaction_gen,
-        ) = self
-            .poseidon_3_partial_rounds_chain
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
-                    self.poseidon_round_keys.as_ref().unwrap(),
-                    self.cube_252.as_ref().unwrap(),
-                    self.range_check_4_4_4_4.as_ref().unwrap(),
-                    self.range_check_4_4.as_ref().unwrap(),
-                    self.range_check_252_width_27.as_ref().unwrap(),
-                );
+        ) = poseidon_3_partial_rounds_chain_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (poseidon_full_round_chain_claim, poseidon_full_round_chain_interaction_gen) = self
-            .poseidon_full_round_chain
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
-                    self.cube_252.as_ref().unwrap(),
-                    self.poseidon_round_keys.as_ref().unwrap(),
-                    self.range_check_3_3_3_3_3.as_ref().unwrap(),
-                );
+        let (poseidon_full_round_chain_claim, poseidon_full_round_chain_interaction_gen) =
+            poseidon_full_round_chain_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (cube_252_claim, cube_252_interaction_gen) = cube_252_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (cube_252_claim, cube_252_interaction_gen) = self
-            .cube_252
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
-                    self.range_check_9_9.as_ref().unwrap(),
-                    self.range_check_20.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (poseidon_round_keys_claim, poseidon_round_keys_interaction_gen) = self
-            .poseidon_round_keys
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (range_check_252_width_27_claim, range_check_252_width_27_interaction_gen) = self
-            .range_check_252_width_27
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace(
-                    self.range_check_9_9.as_ref().unwrap(),
-                    self.range_check_18.as_ref().unwrap(),
-                );
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (memory_address_to_id_claim, memory_address_to_id_interaction_gen) = self
-            .memory_address_to_id
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace);
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (memory_id_to_big_claim, memory_id_to_big_interaction_gen) = self
-            .memory_id_to_big
-            .map(|generator| {
-                const LOG_MAX_BIG_SIZE: u32 = MAX_SEQUENCE_LOG_SIZE;
-                let (big_traces, small_trace, claim, interaction_gen) = generator.write_trace(
-                    self.range_check_9_9.as_ref().unwrap(),
-                    LOG_MAX_BIG_SIZE,
-                    opt_n_id_to_big_components,
-                );
+        let (poseidon_round_keys_claim, poseidon_round_keys_interaction_gen) =
+            poseidon_round_keys_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (range_check_252_width_27_claim, range_check_252_width_27_interaction_gen) =
+            range_check_252_width_27_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (memory_address_to_id_claim, memory_address_to_id_interaction_gen) =
+            memory_address_to_id_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace);
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (memory_id_to_big_claim, memory_id_to_big_interaction_gen) = memory_id_to_big_res
+            .map(|(big_traces, small_trace, claim, interaction_gen)| {
                 for big_trace in big_traces {
                     evals.extend(big_trace);
                 }
@@ -1451,142 +1639,115 @@ impl CairoClaimGenerator {
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_6_claim, range_check_6_interaction_gen) = self
-            .range_check_6
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_6_claim, range_check_6_interaction_gen) = range_check_6_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_8_claim, range_check_8_interaction_gen) = self
-            .range_check_8
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_8_claim, range_check_8_interaction_gen) = range_check_8_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_11_claim, range_check_11_interaction_gen) = self
-            .range_check_11
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_11_claim, range_check_11_interaction_gen) = range_check_11_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_12_claim, range_check_12_interaction_gen) = self
-            .range_check_12
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_12_claim, range_check_12_interaction_gen) = range_check_12_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_18_claim, range_check_18_interaction_gen) = self
-            .range_check_18
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_18_claim, range_check_18_interaction_gen) = range_check_18_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_20_claim, range_check_20_interaction_gen) = self
-            .range_check_20
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_20_claim, range_check_20_interaction_gen) = range_check_20_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_4_3_claim, range_check_4_3_interaction_gen) = self
-            .range_check_4_3
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_4_3_claim, range_check_4_3_interaction_gen) = range_check_4_3_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_4_4_claim, range_check_4_4_interaction_gen) = self
-            .range_check_4_4
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_4_4_claim, range_check_4_4_interaction_gen) = range_check_4_4_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_9_9_claim, range_check_9_9_interaction_gen) = self
-            .range_check_9_9
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_9_9_claim, range_check_9_9_interaction_gen) = range_check_9_9_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_7_2_5_claim, range_check_7_2_5_interaction_gen) = self
-            .range_check_7_2_5
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
+        let (range_check_7_2_5_claim, range_check_7_2_5_interaction_gen) = range_check_7_2_5_res
+            .map(|(trace, claim, interaction_gen)| {
                 evals.extend(trace.to_evals());
                 (claim, interaction_gen)
             })
             .unzip();
-        let (range_check_3_6_6_3_claim, range_check_3_6_6_3_interaction_gen) = self
-            .range_check_3_6_6_3
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (range_check_4_4_4_4_claim, range_check_4_4_4_4_interaction_gen) = self
-            .range_check_4_4_4_4
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (range_check_3_3_3_3_3_claim, range_check_3_3_3_3_3_interaction_gen) = self
-            .range_check_3_3_3_3_3
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (verify_bitwise_xor_4_claim, verify_bitwise_xor_4_interaction_gen) = self
-            .verify_bitwise_xor_4
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (verify_bitwise_xor_7_claim, verify_bitwise_xor_7_interaction_gen) = self
-            .verify_bitwise_xor_7
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (verify_bitwise_xor_8_claim, verify_bitwise_xor_8_interaction_gen) = self
-            .verify_bitwise_xor_8
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (verify_bitwise_xor_9_claim, verify_bitwise_xor_9_interaction_gen) = self
-            .verify_bitwise_xor_9
-            .map(|generator| {
-                let (trace, claim, interaction_gen) = generator.write_trace();
-                evals.extend(trace.to_evals());
-                (claim, interaction_gen)
-            })
-            .unzip();
+        let (range_check_3_6_6_3_claim, range_check_3_6_6_3_interaction_gen) =
+            range_check_3_6_6_3_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (range_check_4_4_4_4_claim, range_check_4_4_4_4_interaction_gen) =
+            range_check_4_4_4_4_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (range_check_3_3_3_3_3_claim, range_check_3_3_3_3_3_interaction_gen) =
+            range_check_3_3_3_3_3_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (verify_bitwise_xor_4_claim, verify_bitwise_xor_4_interaction_gen) =
+            verify_bitwise_xor_4_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (verify_bitwise_xor_7_claim, verify_bitwise_xor_7_interaction_gen) =
+            verify_bitwise_xor_7_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (verify_bitwise_xor_8_claim, verify_bitwise_xor_8_interaction_gen) =
+            verify_bitwise_xor_8_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
+        let (verify_bitwise_xor_9_claim, verify_bitwise_xor_9_interaction_gen) =
+            verify_bitwise_xor_9_res
+                .map(|(trace, claim, interaction_gen)| {
+                    evals.extend(trace.to_evals());
+                    (claim, interaction_gen)
+                })
+                .unzip();
 
         let (memory_id_to_big_claim, memory_id_to_small_claim) = memory_id_to_big_claim.unzip();
         (

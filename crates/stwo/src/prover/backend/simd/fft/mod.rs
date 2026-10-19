@@ -161,3 +161,19 @@ fn mul_twiddle(v: PackedBaseField, twiddle_dbl: u32x16) -> PackedBaseField {
         }
     }
 }
+
+/// Computes `v * twiddle` when each 64-bit lane of `twiddle_dbl` has identical lower and upper
+/// 32-bit words (for example, a splatted twiddle).
+#[cfg_attr(
+    all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")),
+    inline(always)
+)]
+fn mul_twiddle_even(v: PackedBaseField, twiddle_dbl: u32x16) -> PackedBaseField {
+    cfg_if::cfg_if! {
+        if #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))] {
+            crate::prover::backend::simd::m31::mul_doubled_even_avx2(v, twiddle_dbl)
+        } else {
+            mul_twiddle(v, twiddle_dbl)
+        }
+    }
+}
