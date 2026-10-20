@@ -5,11 +5,9 @@ use std::array;
 use std::mem::transmute;
 use std::simd::{simd_swizzle, u32x8, u32x16};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use std::arch::x86_64::{__m256i, _mm256_shuffle_epi8};
+use std::arch::x86_64::{__m256i, _mm256_setr_epi8, _mm256_shuffle_epi8};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use std::hint::black_box;
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use std::simd::u8x32;
 
 use bytemuck::cast_slice;
 use itertools::Itertools;
@@ -421,6 +419,7 @@ unsafe fn transpose_8x8_avx2(r: [__m256i; 8]) -> [u32x16; 4] {
 }
 
 #[inline(always)]
+#[allow(unused_mut)]
 pub fn untranspose_states(mut states: [u32x16; 8]) -> [u32x16; 8] {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe {
@@ -471,18 +470,19 @@ impl ByteRotations {
         {
             // Byte `i` of each 4-byte lane comes from byte `(i + 2) % 4` (16 bits) or
             // `(i + 1) % 4` (8 bits) of the same lane: a right rotation in little-endian lanes.
-            const BY16: [u8; 32] = [
-                2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13, 18, 19, 16, 17, 22, 23, 20, 21,
-                26, 27, 24, 25, 30, 31, 28, 29,
-            ];
-            const BY8: [u8; 32] = [
-                1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12, 17, 18, 19, 16, 21, 22, 23, 20,
-                25, 26, 27, 24, 29, 30, 31, 28,
-            ];
-            Self {
-                by16: black_box(u8x32::from_array(BY16)).into(),
-                by8: black_box(u8x32::from_array(BY8)).into(),
-            }
+            let by16 = unsafe {
+                _mm256_setr_epi8(
+                    2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13, 18, 19, 16, 17, 22, 23,
+                    20, 21, 26, 27, 24, 25, 30, 31, 28, 29,
+                )
+            };
+            let by8 = unsafe {
+                _mm256_setr_epi8(
+                    1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12, 17, 18, 19, 16, 21, 22,
+                    23, 20, 25, 26, 27, 24, 29, 30, 31, 28,
+                )
+            };
+            Self { by16: black_box(by16), by8: black_box(by8) }
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         {
@@ -495,11 +495,12 @@ impl ByteRotations {
     pub(super) fn rotate<const N: u32>(self, x: u32x8) -> u32x8 {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
-            if N == 16 || N == 8 {
-                let mask = if N == 16 { self.by16 } else { self.by8 };
-                // SAFETY: `_mm256_shuffle_epi8` is an AVX2 instruction and this arm is compiled
-                // only for targets with AVX2.
-                let rotated: __m256i = unsafe { _mm256_shuffle_epi8(x.into(), mask) };
+            if N == 16 {
+                let rotated: __m256i = unsafe { _mm256_shuffle_epi8(x.into(), self.by16) };
+                return rotated.into();
+            }
+            if N == 8 {
+                let rotated: __m256i = unsafe { _mm256_shuffle_epi8(x.into(), self.by8) };
                 return rotated.into();
             }
         }
@@ -531,85 +532,92 @@ fn g8(
 
 /// One BLAKE2s round `R` on an 8-lane slice of the state.
 #[inline(always)]
-fn round8<const R: usize>(v: &mut [u32x8; 16], m: &[u32x8; 16], rot: ByteRotations) {
+fn round8<const R: usize>(v: &mut [u32x8; 16], m_base: *const [u32x8; 2], rot: ByteRotations) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let m_base = black_box(m_base);
     let s = &SIGMA[R];
-    g8(v, rot, 0, 4, 8, 12, m[s[0] as usize], m[s[1] as usize]);
-    g8(v, rot, 1, 5, 9, 13, m[s[2] as usize], m[s[3] as usize]);
-    g8(v, rot, 2, 6, 10, 14, m[s[4] as usize], m[s[5] as usize]);
-    g8(v, rot, 3, 7, 11, 15, m[s[6] as usize], m[s[7] as usize]);
-    g8(v, rot, 0, 5, 10, 15, m[s[8] as usize], m[s[9] as usize]);
-    g8(v, rot, 1, 6, 11, 12, m[s[10] as usize], m[s[11] as usize]);
-    g8(v, rot, 2, 7, 8, 13, m[s[12] as usize], m[s[13] as usize]);
-    g8(v, rot, 3, 4, 9, 14, m[s[14] as usize], m[s[15] as usize]);
+    let load_m = |idx: u8| -> u32x8 {
+        // SAFETY: `idx < 16` for all entries of `SIGMA`, and `m_base` points to the active half of
+        // a 16-element `[[u32x8; 2]; 16]` array.
+        unsafe { *m_base.add(idx as usize).cast::<u32x8>() }
+    };
+    g8(v, rot, 0, 4, 8, 12, load_m(s[0]), load_m(s[1]));
+    g8(v, rot, 1, 5, 9, 13, load_m(s[2]), load_m(s[3]));
+    g8(v, rot, 2, 6, 10, 14, load_m(s[4]), load_m(s[5]));
+    g8(v, rot, 3, 7, 11, 15, load_m(s[6]), load_m(s[7]));
+    g8(v, rot, 0, 5, 10, 15, load_m(s[8]), load_m(s[9]));
+    g8(v, rot, 1, 6, 11, 12, load_m(s[10]), load_m(s[11]));
+    g8(v, rot, 2, 7, 8, 13, load_m(s[12]), load_m(s[13]));
+    g8(v, rot, 3, 4, 9, 14, load_m(s[14]), load_m(s[15]));
 }
 
-/// Compresses the low (`HI == false`) or high (`HI == true`) 8 of the 16 BLAKE2s instances.
+/// Compresses an 8-lane half (`h_base`, `m_base`) of the 16 BLAKE2s instances.
 ///
-/// A full 16-word state of 8-lane vectors exactly fills the 16 AVX2 vector registers, whereas the
+/// A full 16-word state of 8-lane vectors fits in the 16 AVX2 vector registers, whereas the
 /// 16-lane state needs twice as many and spills on every step. Running the two halves one after
 /// the other keeps each of them in registers; the result is bit-identical.
 #[inline(never)]
-fn compress16_8lane<const HI: bool>(
-    h_vecs: &[u32x16; 8],
-    msg_vecs: &[u32x16; 16],
-    count_low: u32x16,
-    count_high: u32x16,
-    lastblock: u32x16,
-    lastnode: u32x16,
+fn compress16_8lane(
+    h_base: *const [u32x8; 2],
+    m_base: *const [u32x8; 2],
+    count_low: u32x8,
+    count_high: u32x8,
+    lastblock: u32x8,
+    lastnode: u32x8,
 ) -> [u32x8; 8] {
-    let pick = |x: u32x16| -> u32x8 {
-        if HI {
-            simd_swizzle!(x, [8, 9, 10, 11, 12, 13, 14, 15])
-        } else {
-            simd_swizzle!(x, [0, 1, 2, 3, 4, 5, 6, 7])
-        }
+    let rot = ByteRotations::new();
+    let load_h = |base: *const [u32x8; 2], i: usize| -> u32x8 {
+        // SAFETY: `i < 8` and `base` points to the active half of `[[u32x8; 2]; 8]`.
+        unsafe { *base.add(i).cast::<u32x8>() }
     };
-    let h: [u32x8; 8] = std::array::from_fn(|i| pick(h_vecs[i]));
-    let m: [u32x8; 16] = std::array::from_fn(|i| pick(msg_vecs[i]));
+
     let mut v = [
-        h[0],
-        h[1],
-        h[2],
-        h[3],
-        h[4],
-        h[5],
-        h[6],
-        h[7],
+        load_h(h_base, 0),
+        load_h(h_base, 1),
+        load_h(h_base, 2),
+        load_h(h_base, 3),
+        load_h(h_base, 4),
+        load_h(h_base, 5),
+        load_h(h_base, 6),
+        load_h(h_base, 7),
         u32x8::splat(IV[0]),
         u32x8::splat(IV[1]),
         u32x8::splat(IV[2]),
         u32x8::splat(IV[3]),
-        u32x8::splat(IV[4]) ^ pick(count_low),
-        u32x8::splat(IV[5]) ^ pick(count_high),
-        u32x8::splat(IV[6]) ^ pick(lastblock),
-        u32x8::splat(IV[7]) ^ pick(lastnode),
+        u32x8::splat(IV[4]) ^ count_low,
+        u32x8::splat(IV[5]) ^ count_high,
+        u32x8::splat(IV[6]) ^ lastblock,
+        u32x8::splat(IV[7]) ^ lastnode,
     ];
 
-    let rot = ByteRotations::new();
-    round8::<0>(&mut v, &m, rot);
-    round8::<1>(&mut v, &m, rot);
-    round8::<2>(&mut v, &m, rot);
-    round8::<3>(&mut v, &m, rot);
-    round8::<4>(&mut v, &m, rot);
-    round8::<5>(&mut v, &m, rot);
-    round8::<6>(&mut v, &m, rot);
-    round8::<7>(&mut v, &m, rot);
-    round8::<8>(&mut v, &m, rot);
-    round8::<9>(&mut v, &m, rot);
+    round8::<0>(&mut v, m_base, rot);
+    round8::<1>(&mut v, m_base, rot);
+    round8::<2>(&mut v, m_base, rot);
+    round8::<3>(&mut v, m_base, rot);
+    round8::<4>(&mut v, m_base, rot);
+    round8::<5>(&mut v, m_base, rot);
+    round8::<6>(&mut v, m_base, rot);
+    round8::<7>(&mut v, m_base, rot);
+    round8::<8>(&mut v, m_base, rot);
+    round8::<9>(&mut v, m_base, rot);
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let h_base = black_box(h_base);
 
     [
-        h[0] ^ v[0] ^ v[8],
-        h[1] ^ v[1] ^ v[9],
-        h[2] ^ v[2] ^ v[10],
-        h[3] ^ v[3] ^ v[11],
-        h[4] ^ v[4] ^ v[12],
-        h[5] ^ v[5] ^ v[13],
-        h[6] ^ v[6] ^ v[14],
-        h[7] ^ v[7] ^ v[15],
+        load_h(h_base, 0) ^ v[0] ^ v[8],
+        load_h(h_base, 1) ^ v[1] ^ v[9],
+        load_h(h_base, 2) ^ v[2] ^ v[10],
+        load_h(h_base, 3) ^ v[3] ^ v[11],
+        load_h(h_base, 4) ^ v[4] ^ v[12],
+        load_h(h_base, 5) ^ v[5] ^ v[13],
+        load_h(h_base, 6) ^ v[6] ^ v[14],
+        load_h(h_base, 7) ^ v[7] ^ v[15],
     ]
 }
 
 /// Compresses 16 blake2s instances.
+#[inline(always)]
 pub fn compress16(
     h_vecs: [u32x16; 8],
     msg_vecs: [u32x16; 16],
@@ -618,10 +626,30 @@ pub fn compress16(
     lastblock: u32x16,
     lastnode: u32x16,
 ) -> [u32x16; 8] {
-    let lo =
-        compress16_8lane::<false>(&h_vecs, &msg_vecs, count_low, count_high, lastblock, lastnode);
-    let hi =
-        compress16_8lane::<true>(&h_vecs, &msg_vecs, count_low, count_high, lastblock, lastnode);
+    let pick_lo = |x: u32x16| -> u32x8 { simd_swizzle!(x, [0, 1, 2, 3, 4, 5, 6, 7]) };
+    let pick_hi = |x: u32x16| -> u32x8 { simd_swizzle!(x, [8, 9, 10, 11, 12, 13, 14, 15]) };
+    let h_ptr = h_vecs.as_ptr().cast::<[u32x8; 2]>();
+    let m_ptr = msg_vecs.as_ptr().cast::<[u32x8; 2]>();
+    let lo = compress16_8lane(
+        h_ptr,
+        m_ptr,
+        pick_lo(count_low),
+        pick_lo(count_high),
+        pick_lo(lastblock),
+        pick_lo(lastnode),
+    );
+    // SAFETY: Adding 1 `u32x8` (32 bytes) points to the high 8-lane half of each `[u32x8; 2]`
+    // element at the same 64-byte stride.
+    let hi = unsafe {
+        compress16_8lane(
+            h_ptr.byte_add(32),
+            m_ptr.byte_add(32),
+            pick_hi(count_low),
+            pick_hi(count_high),
+            pick_hi(lastblock),
+            pick_hi(lastnode),
+        )
+    };
     std::array::from_fn(|i| {
         simd_swizzle!(lo[i], hi[i], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
     })

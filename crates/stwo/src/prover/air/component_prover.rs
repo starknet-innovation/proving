@@ -297,6 +297,23 @@ impl<B: Backend> ComponentProvers<'_, B> {
             }
             end = start;
         }
+        let group_bytes = |(log_size, members): &(u32, Vec<(usize, PowerRange)>)| -> usize {
+            members
+                .iter()
+                .map(|(index, _)| {
+                    let n_columns: usize = self.components[*index]
+                        .trace_log_degree_bounds()
+                        .iter()
+                        .map(|tree| tree.len())
+                        .sum();
+                    (n_columns * core::mem::size_of::<BaseField>()
+                        + core::mem::size_of::<SecureField>())
+                        << *log_size
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        groups.sort_by_key(|group| core::cmp::Reverse(group_bytes(group)));
 
         // Runs `members` one after the other into one accumulator of their own, which starts from
         // zero columns: the powers of the members, last member first, so that the accumulator's

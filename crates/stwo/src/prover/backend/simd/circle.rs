@@ -1490,21 +1490,34 @@ pub fn evaluate_rows_from_coefficients(
             for (lane, &v) in leaf_lanes.iter_mut().zip(&leaves[..n_leaf_vecs]) {
                 *lane = split(v);
             }
+            let mul32 = |a: u64x8, w: u32| -> u64x8 {
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                unsafe {
+                    use std::arch::x86_64::{__m256i, _mm256_mul_epu32, _mm256_set1_epi32};
+                    let [a0, a1]: [__m256i; 2] = core::mem::transmute(a);
+                    let wc = _mm256_set1_epi32(w as i32);
+                    core::mem::transmute([_mm256_mul_epu32(a0, wc), _mm256_mul_epu32(a1, wc)])
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                {
+                    (a & low_half) * u64x8::splat(u64::from(w))
+                }
+            };
             for (block, acc) in plan.blocks.iter().zip(acc.iter_mut()) {
                 let lanes = &leaf_lanes[block.leaf * low..(block.leaf + 1) * low];
                 let mut even = u64x8::splat(0);
                 let mut odd = u64x8::splat(0);
                 for (g, group) in lanes.chunks_exact(4).enumerate() {
                     let (mut sum_even, mut sum_odd) = if g == 0 {
-                        (group[0][0], group[0][1])
+                        (group[0][0] & low_half, group[0][1] & low_half)
                     } else {
-                        let w0 = u64x8::splat(u64::from(block.low_weights[g * 4].0));
-                        (group[0][0] * w0, group[0][1] * w0)
+                        let w0 = block.low_weights[g * 4].0;
+                        (mul32(group[0][0], w0), mul32(group[0][1], w0))
                     };
                     for j in 1..4 {
-                        let w = u64x8::splat(u64::from(block.low_weights[g * 4 + j].0));
-                        sum_even += group[j][0] * w;
-                        sum_odd += group[j][1] * w;
+                        let w = block.low_weights[g * 4 + j].0;
+                        sum_even += mul32(group[j][0], w);
+                        sum_odd += mul32(group[j][1], w);
                     }
                     even += fold64(sum_even);
                     odd += fold64(sum_odd);
