@@ -65,11 +65,20 @@ impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> f
     }
 }
 
-/// Adds message word `idx` of the grind block `digest (8 words) || nonce low || nonce high ||
-/// zeros (6 words)` to `a`. The zero padding words are never materialized.
 #[inline(always)]
-fn add_grind_msg(a: u32x8, m: &[u32x8; 10], idx: u8) -> u32x8 {
-    if (idx as usize) < m.len() { a + m[idx as usize] } else { a }
+fn add_grind_msg(
+    sum: u32x8,
+    m_digest: &[u32x8; 8],
+    low: u32x8,
+    high: u32x8,
+    idx: u8,
+) -> u32x8 {
+    match idx {
+        0..=7 => sum + m_digest[idx as usize],
+        8 => sum + low,
+        9 => sum + high,
+        _ => sum,
+    }
 }
 
 /// One BLAKE2s `G` mixing step on 8 nonce lanes.
@@ -78,15 +87,17 @@ fn g8(
     v: &mut [u32x8; 16],
     rot: ByteRotations,
     [a, b, c, d]: [usize; 4],
-    m: &[u32x8; 10],
+    m_digest: &[u32x8; 8],
+    low: u32x8,
+    high: u32x8,
     x: u8,
     y: u8,
 ) {
-    v[a] = add_grind_msg(v[a] + v[b], m, x);
+    v[a] = add_grind_msg(v[a] + v[b], m_digest, low, high, x);
     v[d] = rot.rotate::<16>(v[d] ^ v[a]);
     v[c] += v[d];
     v[b] = rot.rotate::<12>(v[b] ^ v[c]);
-    v[a] = add_grind_msg(v[a] + v[b], m, y);
+    v[a] = add_grind_msg(v[a] + v[b], m_digest, low, high, y);
     v[d] = rot.rotate::<8>(v[d] ^ v[a]);
     v[c] += v[d];
     v[b] = rot.rotate::<7>(v[b] ^ v[c]);
@@ -94,16 +105,24 @@ fn g8(
 
 /// One BLAKE2s round on 8 nonce lanes.
 #[inline(always)]
-fn round8<const R: usize>(v: &mut [u32x8; 16], m: &[u32x8; 10], rot: ByteRotations) {
+fn round8<const R: usize>(
+    v: &mut [u32x8; 16],
+    m_digest: &[u32x8; 8],
+    low: u32x8,
+    high: u32x8,
+    rot: ByteRotations,
+) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let m_digest = std::hint::black_box(m_digest);
     let s = &SIGMA[R];
-    g8(v, rot, [0, 4, 8, 12], m, s[0], s[1]);
-    g8(v, rot, [1, 5, 9, 13], m, s[2], s[3]);
-    g8(v, rot, [2, 6, 10, 14], m, s[4], s[5]);
-    g8(v, rot, [3, 7, 11, 15], m, s[6], s[7]);
-    g8(v, rot, [0, 5, 10, 15], m, s[8], s[9]);
-    g8(v, rot, [1, 6, 11, 12], m, s[10], s[11]);
-    g8(v, rot, [2, 7, 8, 13], m, s[12], s[13]);
-    g8(v, rot, [3, 4, 9, 14], m, s[14], s[15]);
+    g8(v, rot, [0, 4, 8, 12], m_digest, low, high, s[0], s[1]);
+    g8(v, rot, [1, 5, 9, 13], m_digest, low, high, s[2], s[3]);
+    g8(v, rot, [2, 6, 10, 14], m_digest, low, high, s[4], s[5]);
+    g8(v, rot, [3, 7, 11, 15], m_digest, low, high, s[6], s[7]);
+    g8(v, rot, [0, 5, 10, 15], m_digest, low, high, s[8], s[9]);
+    g8(v, rot, [1, 6, 11, 12], m_digest, low, high, s[10], s[11]);
+    g8(v, rot, [2, 7, 8, 13], m_digest, low, high, s[12], s[13]);
+    g8(v, rot, [3, 4, 9, 14], m_digest, low, high, s[14], s[15]);
 }
 
 /// Scalar `G`, used for the part of the compression that does not depend on the nonce.
@@ -124,8 +143,9 @@ fn g_scalar(v: &mut [u32; 16], [a, b, c, d]: [usize; 4], x: u32, y: u32) {
 /// to 15. In round 0 the message words are used in order, so of the eight `G` steps only
 /// `G(0, 5, 10, 15)` (words 8 and 9) varies with the nonce. The other seven are computed once.
 struct GrindPrefix {
-    v: [u32; 16],
-    digest: [u32; 8],
+    v_splat: [u32x8; 16],
+    m_digest: [u32x8; 8],
+    v0_plus_v5: u32x8,
     rot: ByteRotations,
 }
 
@@ -161,25 +181,26 @@ impl GrindPrefix {
         g_scalar(&mut v, [1, 6, 11, 12], 0, 0);
         g_scalar(&mut v, [2, 7, 8, 13], 0, 0);
         g_scalar(&mut v, [3, 4, 9, 14], 0, 0);
-        Self { v, digest, rot: ByteRotations::new() }
+        let v_splat = std::array::from_fn(|i| u32x8::splat(v[i]));
+        let m_digest = std::array::from_fn(|i| u32x8::splat(digest[i]));
+        Self {
+            v_splat,
+            m_digest,
+            v0_plus_v5: u32x8::splat(v[0].wrapping_add(v[5])),
+            rot: ByteRotations::new(),
+        }
     }
 
     /// Returns the first 32 bits of the hash of `digest || nonce` for 8 nonces that share the high
     /// word `high` and have the given low words.
-    #[inline(always)]
+    #[inline(never)]
     fn hash_word0(&self, high: u32x8, low: u32x8) -> u32x8 {
-        let splat = u32x8::splat;
-        let m: [u32x8; 10] = std::array::from_fn(|i| match i {
-            0..=7 => splat(self.digest[i]),
-            8 => low,
-            _ => high,
-        });
-        let mut v: [u32x8; 16] = std::array::from_fn(|i| splat(self.v[i]));
+        let mut v = self.v_splat;
         // Round 0, `G(0, 5, 10, 15)`: the only step that depends on the nonce.
-        let a = splat(self.v[0].wrapping_add(self.v[5])) + low;
-        let d = self.rot.rotate::<16>(splat(self.v[15]) ^ a);
-        let c = splat(self.v[10]) + d;
-        let b = self.rot.rotate::<12>(splat(self.v[5]) ^ c);
+        let a = self.v0_plus_v5 + low;
+        let d = self.rot.rotate::<16>(v[15] ^ a);
+        let c = v[10] + d;
+        let b = self.rot.rotate::<12>(v[5] ^ c);
         let a = a + b + high;
         let d = self.rot.rotate::<8>(d ^ a);
         let c = c + d;
@@ -188,18 +209,18 @@ impl GrindPrefix {
         v[5] = b;
         v[10] = c;
         v[15] = d;
-        round8::<1>(&mut v, &m, self.rot);
-        round8::<2>(&mut v, &m, self.rot);
-        round8::<3>(&mut v, &m, self.rot);
-        round8::<4>(&mut v, &m, self.rot);
-        round8::<5>(&mut v, &m, self.rot);
-        round8::<6>(&mut v, &m, self.rot);
-        round8::<7>(&mut v, &m, self.rot);
-        round8::<8>(&mut v, &m, self.rot);
+        round8::<1>(&mut v, &self.m_digest, low, high, self.rot);
+        round8::<2>(&mut v, &self.m_digest, low, high, self.rot);
+        round8::<3>(&mut v, &self.m_digest, low, high, self.rot);
+        round8::<4>(&mut v, &self.m_digest, low, high, self.rot);
+        round8::<5>(&mut v, &self.m_digest, low, high, self.rot);
+        round8::<6>(&mut v, &self.m_digest, low, high, self.rot);
+        round8::<7>(&mut v, &self.m_digest, low, high, self.rot);
+        round8::<8>(&mut v, &self.m_digest, low, high, self.rot);
         // Only the first output word is tested, so the compiler drops every step of the last round
         // that does not feed `v[0]` or `v[8]`.
-        round8::<9>(&mut v, &m, self.rot);
-        splat(IV[0] ^ 0x01010020) ^ v[0] ^ v[8]
+        round8::<9>(&mut v, &self.m_digest, low, high, self.rot);
+        u32x8::splat(IV[0] ^ 0x01010020) ^ v[0] ^ v[8]
     }
 }
 

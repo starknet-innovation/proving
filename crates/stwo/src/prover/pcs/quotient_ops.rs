@@ -284,7 +284,8 @@ pub fn compute_fri_quotients_with_regrowth<B: Backend>(
                     // Too few columns to save transforms: each one's stripe 0, a batch at a time.
                     let stripe0 = |poly: &Poly<B>| {
                         let coeffs = poly.coeffs.as_ref().unwrap();
-                        let mut values = Col::<B, BaseField>::zeros(1 << coeffs.log_size());
+                        let mut values = crate::prover::mempool::BaseColumnPool::<B>::new()
+                            .take_or_alloc(coeffs.log_size());
                         B::evaluate_stripe_into(coeffs, poly.evals.domain, twiddles, 0, &mut values);
                         let mut evals = CircleEvaluation::new(
                             CanonicCoset::new(coeffs.log_size()).circle_domain(),

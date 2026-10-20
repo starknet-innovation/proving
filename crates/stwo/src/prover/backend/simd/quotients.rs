@@ -119,8 +119,10 @@ impl QuotientOps for SimdBackend {
         }
         let domain_iter_base = CircleDomainBitRevIterator::new(eval_subdomain);
         let subdomain_log_size = eval_subdomain.log_size();
-        let mut quotients: SecureColumnByCoords<SimdBackend> =
-            unsafe { SecureColumnByCoords::uninitialized(1 << subdomain_log_size) };
+        let pool = crate::prover::mempool::BaseColumnPool::<SimdBackend>::new();
+        let mut quotients: SecureColumnByCoords<SimdBackend> = SecureColumnByCoords {
+            columns: std::array::from_fn(|_| pool.take_or_alloc(subdomain_log_size)),
+        };
         let sample_points: Vec<CirclePoint<SecureField>> =
             accumulations.iter().map(|x| x.sample_point).collect();
         // The denominators are inverted a chunk at a time inside the loop below (one batch
@@ -200,29 +202,34 @@ impl QuotientOps for SimdBackend {
                     super::cm31::batch_inverse_chunk(col_chunk, dst_chunk, scratch);
                 }
 
-                for (((acc, den_inv), log_ratio), first_linear_term) in accumulations
+                for (((acc, den_inv), &log_ratio), first_linear_term) in accumulations
                     .iter()
                     .zip_eq(inv_slice.chunks(packed_chunk_len))
                     .zip_eq(log_ratios.iter())
                     .zip_eq(first_linear_terms.iter())
                 {
+                    let cols = &acc.partial_numerators_acc.columns;
+                    let [flt0, flt1] = first_linear_term.0;
                     for (i, accumulator) in chunk_acc.iter_mut().enumerate() {
                         let domain_idx = chunk_start + i;
-                        let lifted_partial_numerator =
-                            PackedSecureField::from_packed_m31s(std::array::from_fn(|j| {
-                                let lifted_simd = to_lifted_simd(
-                                    acc.partial_numerators_acc.columns[j].data
-                                        [domain_idx >> log_ratio]
-                                        .into_simd(),
-                                    *log_ratio,
-                                    domain_idx,
-                                );
-                                unsafe { PackedBaseField::from_simd_unchecked(lifted_simd) }
-                            }));
+                        let src_idx = domain_idx >> log_ratio;
+                        let py = points_slice[i].y;
+                        let di = den_inv[i];
 
-                        let numerator = lifted_partial_numerator
-                            - first_linear_term.mul_m31_inline(points_slice[i].y);
-                        *accumulator += numerator.mul_cm31_inline(den_inv[i]);
+                        let lift = |col: &BaseColumn| unsafe {
+                            PackedBaseField::from_simd_unchecked(to_lifted_simd(
+                                col.data[src_idx].into_simd(),
+                                log_ratio,
+                                domain_idx,
+                            ))
+                        };
+                        let num0 = PackedCM31([lift(&cols[0]), lift(&cols[1])])
+                            - PackedCM31([flt0.0[0] * py, flt0.0[1] * py]);
+                        accumulator.0[0] = accumulator.0[0] + num0.mul_inline(di);
+
+                        let num1 = PackedCM31([lift(&cols[2]), lift(&cols[3])])
+                            - PackedCM31([flt1.0[0] * py, flt1.0[1] * py]);
+                        accumulator.0[1] = accumulator.0[1] + num1.mul_inline(di);
                     }
                 }
 
@@ -311,37 +318,95 @@ impl QuotientOps for SimdBackend {
 /// the row as `u64` lanes.
 type RowAcc = [[u64x8; 2]; 4];
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn mul_u32_lanes(a: std::simd::u64x4, b: std::simd::u64x4) -> std::simd::u64x4 {
+    unsafe {
+        use std::arch::x86_64::{__m256i, _mm256_mul_epu32};
+        let a_m: __m256i = core::mem::transmute(a);
+        let b_m: __m256i = core::mem::transmute(b);
+        core::mem::transmute(_mm256_mul_epu32(a_m, b_m))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn splat_u32_coeff(c: u32) -> std::simd::u64x4 {
+    unsafe { core::mem::transmute(std::simd::u32x8::splat(c)) }
+}
+
 /// Adds `∑ coeffs[g] * cols[g][r]` to the packed row `acc[r]` of every row `r`, the exact 64-bit
 /// products of the `G <= 4` terms summed and folded once (`x = hi * 2^31 + lo == hi + lo` modulo
 /// `P`).
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn accumulate_group<const G: usize>(
     acc: &mut [RowAcc],
     cols: [&[PackedBaseField]; G],
     coeffs: &[[u32; 4]; G],
 ) {
-    let c_splat: [[u64x8; 4]; G] = std::array::from_fn(|g| {
-        std::array::from_fn(|k| u64x8::splat(u64::from(coeffs[g][k])))
-    });
-    let mask32 = u64x8::splat(0xFFFF_FFFF);
-    let mod_p = u64x8::splat(u64::from(P));
+    use std::simd::u64x4;
+    let mod_p = u64x4::splat(u64::from(P));
+    for (k0, k1) in [(0usize, 1usize), (2usize, 3usize)] {
+        let c0: [u64x4; G] = std::array::from_fn(|g| splat_u32_coeff(coeffs[g][k0]));
+        let c1: [u64x4; G] = std::array::from_fn(|g| splat_u32_coeff(coeffs[g][k1]));
+        for (r, row_acc) in acc.iter_mut().enumerate() {
+            // SAFETY: `RowAcc` is `[[u64x8; 2]; 4]` and `u64x8` has the exact layout of `[u64x4; 2]`.
+            let row_halves: &mut [[[u64x4; 2]; 2]; 4] =
+                unsafe { &mut *(row_acc as *mut RowAcc as *mut [[[u64x4; 2]; 2]; 4]) };
+            for half in 0..2 {
+                // SAFETY: `PackedBaseField` (`u32x16`) has the exact layout of `[u64x4; 2]`.
+                let w: [u64x4; G] = std::array::from_fn(|g| unsafe {
+                    (*(&cols[g][r] as *const PackedBaseField as *const [u64x4; 2]))[half]
+                });
+                let mut pe0 = mul_u32_lanes(w[0], c0[0]);
+                let mut pe1 = mul_u32_lanes(w[0], c1[0]);
+                for g in 1..G {
+                    pe0 += mul_u32_lanes(w[g], c0[g]);
+                    pe1 += mul_u32_lanes(w[g], c1[g]);
+                }
+                row_halves[k0][0][half] += (pe0 & mod_p) + (pe0 >> 31);
+                row_halves[k1][0][half] += (pe1 & mod_p) + (pe1 >> 31);
+
+                let o0 = w[0] >> 32;
+                let mut po0 = mul_u32_lanes(o0, c0[0]);
+                let mut po1 = mul_u32_lanes(o0, c1[0]);
+                for g in 1..G {
+                    let og = w[g] >> 32;
+                    po0 += mul_u32_lanes(og, c0[g]);
+                    po1 += mul_u32_lanes(og, c1[g]);
+                }
+                row_halves[k0][1][half] += (po0 & mod_p) + (po0 >> 31);
+                row_halves[k1][1][half] += (po1 & mod_p) + (po1 >> 31);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn accumulate_group<const G: usize>(
+    acc: &mut [RowAcc],
+    cols: [&[PackedBaseField]; G],
+    coeffs: &[[u32; 4]; G],
+) {
     for (r, row_acc) in acc.iter_mut().enumerate() {
         let mut even = [u64x8::splat(0); G];
         let mut odd = [u64x8::splat(0); G];
         for g in 0..G {
             let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(cols[g][r]));
-            even[g] = w & mask32;
+            even[g] = w & u64x8::splat(0xFFFF_FFFF);
             odd[g] = w >> 32;
         }
         for k in 0..4 {
-            let mut pe = even[0] * c_splat[0][k];
-            let mut po = odd[0] * c_splat[0][k];
+            let mut pe = even[0] * u64x8::splat(u64::from(coeffs[0][k]));
+            let mut po = odd[0] * u64x8::splat(u64::from(coeffs[0][k]));
             for g in 1..G {
-                pe += even[g] * c_splat[g][k];
-                po += odd[g] * c_splat[g][k];
+                pe += even[g] * u64x8::splat(u64::from(coeffs[g][k]));
+                po += odd[g] * u64x8::splat(u64::from(coeffs[g][k]));
             }
-            row_acc[k][0] += (pe & mod_p) + (pe >> 31);
-            row_acc[k][1] += (po & mod_p) + (po >> 31);
+            row_acc[k][0] += (pe & u64x8::splat(u64::from(P))) + (pe >> 31);
+            row_acc[k][1] += (po & u64x8::splat(u64::from(P))) + (po >> 31);
         }
     }
 }
@@ -370,8 +435,10 @@ fn accumulate_numerators_on_subdomain(
     // Number of packed rows accumulated together in a pass over all the terms.
     const ROW_BLOCK: usize = 16;
 
-    let mut values =
-        unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(subdomain.size()) };
+    let pool = crate::prover::mempool::BaseColumnPool::<SimdBackend>::new();
+    let mut values = SecureColumnByCoords {
+        columns: std::array::from_fn(|_| pool.take_or_alloc(subdomain.log_size())),
+    };
 
     // Per-term data, shared by all chunks.
     let terms: Vec<(&[PackedBaseField], [u32; 4])> =
