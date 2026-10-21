@@ -258,6 +258,25 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         unimplemented!("striped extension is not supported by this backend")
     }
 
+    /// Writes stripes `first..first + count` of [`Self::evaluate`]'s output on `domain` (see
+    /// [`Self::evaluate_stripe_into`]), contiguous, into `dst`.
+    fn evaluate_stripes_into(
+        poly: &CircleCoefficients<Self>,
+        domain: CircleDomain,
+        twiddles: &TwiddleTree<Self>,
+        first: usize,
+        count: usize,
+        dst: &mut Col<Self, BaseField>,
+    ) {
+        use crate::prover::backend::Column;
+        let len = 1usize << poly.log_size();
+        let mut stripe = Col::<Self, BaseField>::zeros(len);
+        for k in 0..count {
+            Self::evaluate_stripe_into(poly, domain, twiddles, first + k, &mut stripe);
+            Self::copy_block(&stripe, 0, dst, k * len, len);
+        }
+    }
+
     /// Writes block `block` of [`Self::evaluate`]'s output on `domain`, of `2^log_block` rows
     /// (at most the size of `poly`), into `dst`: the evaluation on that subdomain.
     fn evaluate_block_into(

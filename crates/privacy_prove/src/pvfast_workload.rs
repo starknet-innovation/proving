@@ -40,11 +40,12 @@ pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out
     // the pool instead of each being injected into it from this thread (the sequential steps,
     // the interaction writers among them, waited on every injection).
     // Freed large blocks wait for reuse while the live memory and the idle blocks take at most
-    // 4500 MiB: every phase below the proof's peak (about 5 GiB locally, where the live memory alone
-    // fills the budget) reuses the blocks the last one freed instead of faulting in fresh pages,
-    // which took about 39 of the run's 307 CPU-seconds.
+    // 3200 MiB: every phase reuses the blocks the last one freed instead of faulting in fresh pages.
+    // At StarkWare's settings the live memory stays near 1 GiB in the circuit leg, so a larger
+    // budget only kept idle blocks resident (about 2 GiB of the 3.1 GiB peak); the Cairo leg's
+    // stripe pairs (see `keep_stripe_pair`) take some of it instead.
     #[cfg(unix)]
-    stwo::prover::backend::simd::column::LargeBlockCache::set_idle_budget(4500 << 20);
+    stwo::prover::backend::simd::column::LargeBlockCache::set_idle_budget(3200 << 20);
     let (version, compressed) = rayon::scope(|_| prove_to_bytes(input, witness_start, output_preimage))?;
     out.write_all(&version)?;
     out.write_all(&compressed)?;
@@ -60,6 +61,10 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
     );
     let precomputes = precomputes?;
     eprintln!("pvfast-phase cairo_leg");
+    // The Cairo leg stays below the circuit leg's peak: its heap trims are held (see `hold_trims`)
+    // and the heap is trimmed once, beside the verifier-circuit fill.
+    #[cfg(unix)]
+    stwo::prover::backend::simd::column::hold_trims(true);
     let prover_input: ProverInput = prover_input?;
     drop(input);
     // The circuit's preprocessing and its committed tree (both built on first use, see
@@ -90,13 +95,23 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
             eprintln!("pvfast-phase verifier_fill");
             // The circuit's variable count is known from its preprocessing (built beside the Cairo
             // proof): the fill reserves its values once.
-            let context = build_and_fill_cairo_verifier_circuit_with_capacity(
-                &precomputes.cairo_verifier_config,
-                proof,
-                aux,
-                output_hash,
-                precomputes.preprocessed_circuit.n_vars,
-                &precomputes.preprocessed_circuit.gate_counts,
+            #[cfg(unix)]
+            stwo::prover::backend::simd::column::hold_trims(false);
+            let (context, ()) = rayon::join(
+                || {
+                    build_and_fill_cairo_verifier_circuit_with_capacity(
+                        &precomputes.cairo_verifier_config,
+                        proof,
+                        aux,
+                        output_hash,
+                        precomputes.preprocessed_circuit.n_vars,
+                        &precomputes.preprocessed_circuit.gate_counts,
+                    )
+                },
+                || {
+                    #[cfg(unix)]
+                    stwo::prover::backend::simd::column::trim_heap_now();
+                },
             );
             Ok((context, zk_blinding_seed))
         },

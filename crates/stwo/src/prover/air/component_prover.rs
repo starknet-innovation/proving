@@ -103,6 +103,16 @@ impl<B: Backend> Poly<B> {
         self.coeffs.is_none() && self.source.is_some() && self.evals.values.is_empty()
     }
 
+    /// Whether the column keeps its coefficients and stripes 0 and 1 of its extension (its
+    /// evaluation on the first subdomain of twice the coefficients' size), for the composition.
+    pub fn holds_stripe_pair(&self) -> bool {
+        use crate::prover::backend::Column;
+        self.coeffs.as_ref().is_some_and(|coeffs| {
+            self.evals.values.len() == 2usize << coeffs.log_size()
+                && self.evals.values.len() < self.evals.domain.size()
+        })
+    }
+
     /// Stripe 0 of the column's extension (its evaluation on the first subdomain of the
     /// coefficients' size): borrowed where it is stored, regrown where the column has a source.
     pub fn stripe0(
@@ -266,10 +276,20 @@ impl<B: Backend> ComponentProvers<'_, B> {
             .iter()
             .flatten()
             .any(|poly| poly.evals.values.len() < poly.evals.domain.size());
-        let evaluation_mode = if extend {
-            EvaluationMode::ExtendToEvalDomain
-        } else {
-            EvaluationMode::infer(&components, log_blowup_factor)
+        // Trees that kept stripes 0 and 1 of their columns hold the first subdomain of twice the
+        // coefficients' size, which is the subdomain mode's evaluation domain when every
+        // component's constraints have degree 2: read it instead of extending the columns (the
+        // columns without a pair are extended to it, see `get_trace_columns`). The composition
+        // polynomial is the same: its evaluations on any domain of its size interpolate to it.
+        let pairs = trace.polys.iter().flatten().any(|poly| poly.holds_stripe_pair());
+        let evaluation_mode = match (extend, pairs, EvaluationMode::infer(&components, log_blowup_factor)) {
+            (false, _, mode) => mode,
+            (true, true, mode @ EvaluationMode::SubDomain { log_expansion })
+                if log_expansion + 1 == log_blowup_factor =>
+            {
+                mode
+            }
+            _ => EvaluationMode::ExtendToEvalDomain,
         };
         let max_log_size = self.components().composition_log_degree_bound();
 

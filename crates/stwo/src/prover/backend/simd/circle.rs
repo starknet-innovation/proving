@@ -920,6 +920,42 @@ impl PolyOps for SimdBackend {
         evaluate_block_into(poly, domain, twiddles, log_block, block, dst)
     }
 
+    /// The stripes in one transform: the coefficients are read once for all of them, each stripe
+    /// with the twiddles [`Self::evaluate_stripe_into`] uses for it.
+    fn evaluate_stripes_into(
+        poly: &CircleCoefficients<Self>,
+        domain: CircleDomain,
+        twiddles: &TwiddleTree<Self>,
+        first: usize,
+        count: usize,
+        dst: &mut Col<Self, BaseField>,
+    ) {
+        let fft_log_size = poly.log_size();
+        let len = 1usize << fft_log_size;
+        assert!(domain.log_size() >= fft_log_size);
+        assert_eq!(dst.len(), count * len);
+        if fft_log_size < MIN_FFT_LOG_SIZE {
+            let full = Self::evaluate(poly, domain, twiddles);
+            Self::copy_block(&full.values, first * len, dst, 0, count * len);
+            return;
+        }
+        // Every word of `dst` is written next: map its pages in one call (huge pages where the
+        // kernel allows) instead of one fault per page from every worker at once.
+        advise_pages(&dst.data, true);
+        let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
+        let stripe_twiddles = (first..first + count)
+            .map(|stripe| {
+                (0..(fft_log_size - 1))
+                    .map(|layer_i| {
+                        &line_twiddles[layer_i as usize][stripe << (fft_log_size - 2 - layer_i)
+                            ..(stripe + 1) << (fft_log_size - 2 - layer_i)]
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        fft_subdomains_into(poly, None, dst, &stripe_twiddles, rfft::Phases::All);
+    }
+
     fn copy_block(
         src: &Col<Self, BaseField>,
         src_start: usize,

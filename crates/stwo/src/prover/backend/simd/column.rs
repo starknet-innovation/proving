@@ -51,8 +51,27 @@ unsafe extern "C" {
 /// the end of a leg, not per free, so the next leg pays a few page faults, not system calls on
 /// every allocation. A no-op off glibc.
 pub fn trim_heap() {
+    if HOLD_TRIMS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    trim_heap_now();
+}
+
+/// [`trim_heap`] even while trims are held.
+pub fn trim_heap_now() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     malloc_trim(0);
+}
+
+/// While set, [`trim_heap`] does nothing. The Cairo leg sits below the proof's peak, which the
+/// circuit leg sets, so the pages a trim would hand back there are only faulted in again by the
+/// next phase: the workload holds the trims through the Cairo leg and trims once after it
+/// (rukafe0x's held Cairo-leg trims, rgr1_f9aebe6c).
+static HOLD_TRIMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds (or releases) [`trim_heap`].
+pub fn hold_trims(hold: bool) {
+    HOLD_TRIMS.store(hold, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Runs `f` with [`trim_heap`] beside it on rayon's pool, so that the trim, which walks every

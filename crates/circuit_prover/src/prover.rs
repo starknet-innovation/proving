@@ -167,9 +167,12 @@ where
     );
     mix_circuit_hash(channel, &circuit_hash);
     claim.mix_into(channel);
+    stwo::prover::PHASE_LEG.store(1, std::sync::atomic::Ordering::Relaxed);
+    stwo::prover::phase_marker("base_commit");
     tree_builder.commit(channel);
 
     // Draw interaction elements.
+    stwo::prover::phase_marker("interaction");
     let interaction_pow_nonce = SimdBackend::grind(channel, INTERACTION_POW_BITS);
     channel.mix_u64(interaction_pow_nonce);
     let interaction_elements = CircuitInteractionElements::draw(channel);
@@ -194,6 +197,7 @@ where
     assert_eq!(lookup_sum(&claim, &interaction_claim, &interaction_elements), QM31::zero());
 
     interaction_claim.mix_into(channel);
+    stwo::prover::phase_marker("int_commit");
     tree_builder.commit(channel);
     // Component provers.
     let circuit_components = CircuitComponents::new(

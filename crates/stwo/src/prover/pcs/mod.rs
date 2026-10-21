@@ -41,6 +41,9 @@ pub struct CommitmentSchemeProver<'a, B: BackendForChannel<MC>, MC: MerkleChanne
     pub config: PcsConfig,
     pub twiddles: &'a TwiddleTree<B>,
     pub store_polynomials_coefficients: bool,
+    /// Whether the trees committed next keep stripes 0 and 1 of their prefix columns for the
+    /// composition (see [`CommitmentTreeProver::new_striped`]).
+    pub keep_stripe_pair: bool,
     /// Pre-allocated base field column pool for polynomial evaluation during commit.
     pub base_column_pool: MaybeOwned<'a, BaseColumnPool<B>>,
 }
@@ -53,6 +56,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             config,
             twiddles,
             store_polynomials_coefficients: false,
+            keep_stripe_pair: false,
             base_column_pool: MaybeOwned::Owned(BaseColumnPool::new()),
         }
     }
@@ -68,6 +72,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             config,
             twiddles,
             store_polynomials_coefficients: false,
+            keep_stripe_pair: false,
             base_column_pool: MaybeOwned::Borrowed(base_column_pool),
         }
     }
@@ -86,7 +91,8 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     fn commit(&mut self, polynomials: ColumnVec<CircleCoefficients<B>>, channel: &mut MC::C) {
         let _span = span!(Level::INFO, "Commitment").entered();
         let lifting_log_size = self.config.lifting_log_size(self.trees.len());
-        let mut tree = CommitmentTreeProver::new_ex(
+        let n_columns = polynomials.len();
+        let mut tree = CommitmentTreeProver::new_ex_with_sources(
             polynomials,
             self.config.fri_config.log_blowup_factor,
             self.twiddles,
@@ -94,6 +100,8 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             lifting_log_size,
             &self.base_column_pool,
             true,
+            vec![None; n_columns],
+            self.keep_stripe_pair,
         );
         MC::mix_root(channel, tree.commitment.root());
         // Only newly owned ordinary commitments are considered. Externally supplied or borrowed
@@ -153,6 +161,24 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 }
                 #[cfg(not(feature = "parallel"))]
                 tree.polynomials.iter_mut().for_each(to_coefficients);
+            }
+        }
+    }
+
+    /// Whether some tree kept stripes 0 and 1 of its prefix columns (see `keep_stripe_pair`).
+    pub fn has_stripe_pairs(&self) -> bool {
+        self.trees.iter().any(|tree| tree.polynomials.iter().any(Poly::holds_stripe_pair))
+    }
+
+    /// Frees the stripe pairs the composition read: the columns are again the coefficients alone.
+    pub fn drop_stripe_pairs(&mut self) {
+        for tree in &mut self.trees.0 {
+            if let MaybeOwned::Owned(tree) = tree {
+                for poly in &mut tree.polynomials {
+                    if poly.holds_stripe_pair() {
+                        poly.evals.values = Col::<B, BaseField>::zeros(0);
+                    }
+                }
             }
         }
     }
@@ -746,6 +772,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             base_column_pool,
             keep_coefficients,
             vec![None; n_columns],
+            false,
         )
     }
 
@@ -771,6 +798,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             base_column_pool,
             false,
             sources,
+            false,
         )
     }
 
@@ -784,6 +812,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         base_column_pool: &BaseColumnPool<B>,
         keep_coefficients: bool,
         sources: Vec<Option<SharedTraceSource>>,
+        keep_pair: bool,
     ) -> Self {
         assert_eq!(sources.len(), polynomials.len());
         if B::STRIPES && can_stripe(&polynomials, log_blowup_factor, lifting_log_size) {
@@ -795,6 +824,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 base_column_pool,
                 keep_coefficients,
                 sources,
+                keep_pair,
             );
         }
         let span = span!(Level::INFO, "Extension").entered();
@@ -837,6 +867,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         base_column_pool: &BaseColumnPool<B>,
         keep_coef: bool,
         sources: Vec<Option<SharedTraceSource>>,
+        keep_pair: bool,
     ) -> Self {
         let _span = span!(Level::INFO, "Striped extension and Merkle").entered();
         // The witness and interaction writers leave freed temporaries in glibc's arenas: hand
@@ -895,9 +926,25 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                     }
                 })
                 .collect_vec();
+            // With `keep_pair` (a tree that keeps its coefficients), every stripe is evaluated and
+            // hashed with its neighbour, a double stripe at a time (see below): no stripe scratch.
+            let pair = keep_pair && keep_coef && sub == 0 && n_stripes >= 4;
+            // A large tree that keeps its coefficients (one stripe at a time) is committed the same
+            // way, keeping nothing.
+            let double = pair
+                || (keep_coef
+                    && sub == 0
+                    && n_stripes >= 4
+                    && 2 * whole_stripe_scratch > PARALLEL_STRIPES_SCRATCH_BYTES);
             let mut scratch = polynomials
                 .iter()
-                .map(|poly| base_column_pool.take_or_alloc(poly.log_size() - sub))
+                .map(|poly| {
+                    if double {
+                        Col::<B, BaseField>::zeros(0)
+                    } else {
+                        base_column_pool.take_or_alloc(poly.log_size() - sub)
+                    }
+                })
                 .collect_vec();
             let mut coeffs = polynomials.into_iter().map(Some).collect_vec();
 
@@ -906,6 +953,79 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             let order = (n_first..n_stripes).chain(0..n_first).collect_vec();
             let mut stripe_layers: Vec<Option<Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>>>> =
                 (0..n_stripes).map(|_| None).collect();
+            // With `keep_pair`, stripes 2k and 2k + 1 of every column are evaluated together, in one
+            // transform, into a column of twice the coefficients' size: the evaluation on the k-th
+            // subdomain of that size. They are hashed as one stripe of twice the height: a stripe's
+            // leaves are the rows of the columns' contiguous blocks, so the leaves of the two stripes
+            // are those of their concatenation, and every layer of the double stripe below its root
+            // is the two stripes' layers side by side. Stripes 0 and 1 come last, into the columns
+            // the earlier pairs gave back to the pool: a prefix column keeps them, and the
+            // composition reads them instead of extending the column again (see
+            // `CommitmentSchemeProver::drop_stripe_pairs`).
+            if double {
+                let log_sizes = coeffs.iter().map(|poly| poly.as_ref().unwrap().log_size()).collect_vec();
+                for first in (2..n_stripes).step_by(2).chain([0]) {
+                    let mut pair_values: Vec<Option<Col<B, BaseField>>> =
+                        (0..coeffs.len()).map(|_| None).collect();
+                    let fill_pair = |((poly, &domain), (eval, slot)): (
+                        (&Option<CircleCoefficients<B>>, &CircleDomain),
+                        (&Col<B, BaseField>, &mut Option<Col<B, BaseField>>),
+                    )| {
+                        let poly = poly.as_ref().unwrap();
+                        let len = 1usize << poly.log_size();
+                        let mut column = base_column_pool.take_or_alloc(poly.log_size() + 1);
+                        if eval.len() == domain.size() {
+                            B::copy_block(eval, first * len, &mut column, 0, 2 * len);
+                        } else {
+                            B::evaluate_stripes_into(poly, domain, twiddles, first, 2, &mut column);
+                        }
+                        *slot = Some(column);
+                    };
+                    #[cfg(feature = "parallel")]
+                    {
+                        use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator};
+                        coeffs
+                            .par_iter()
+                            .zip(domains.par_iter())
+                            .zip(evals.par_iter().zip(pair_values.par_iter_mut()))
+                            .for_each(fill_pair);
+                    }
+                    #[cfg(not(feature = "parallel"))]
+                    coeffs
+                        .iter()
+                        .zip(&domains)
+                        .zip(evals.iter().zip(pair_values.iter_mut()))
+                        .for_each(fill_pair);
+                    let columns = pair_values
+                        .iter()
+                        .map(|column| column.as_ref().unwrap())
+                        .sorted_by_key(|column| column.len())
+                        .collect_vec();
+                    let layers = B::build_layers_sparse(&columns, stripe_lifting_log_size + 1);
+                    drop(columns);
+                    let mut halves = [vec![], vec![]];
+                    for layer in layers.iter().take(stripe_lifting_log_size as usize + 1) {
+                        let half = layer.len() / 2;
+                        halves[0].push((0..half).map(|i| layer.at(i)).collect());
+                        halves[1].push((half..layer.len()).map(|i| layer.at(i)).collect());
+                    }
+                    drop(layers);
+                    let [low, high] = halves;
+                    stripe_layers[first] = Some(low);
+                    stripe_layers[first + 1] = Some(high);
+                    for (i, slot) in pair_values.iter_mut().enumerate() {
+                        let column = slot.take().unwrap();
+                        if pair && first == 0 && prefix[i] {
+                            evals[i] = column;
+                        } else {
+                            // A later pair (or, for stripes 0 and 1, a whole-extension column, which
+                            // keeps its whole extension) hands the column back.
+                            base_column_pool.give_back(log_sizes[i] + 1, column);
+                        }
+                    }
+                }
+            }
+            let order = if double { vec![] } else { order };
             // A tree that keeps its coefficients and whose stripe scratch is small (the composition
             // trees) fills and hashes several stripes at once: the stripes are independent, and one
             // stripe of a few columns leaves most workers idle.

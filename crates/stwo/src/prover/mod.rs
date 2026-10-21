@@ -37,6 +37,19 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     Ok(prove_ex(components, channel, commitment_scheme, false)?.proof)
 }
 
+/// The leg whose phases [`phase_marker`] names: 0 for the Cairo proof, 1 for the circuit proof.
+pub static PHASE_LEG: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Marks the start of a phase of the current leg on stderr (`pvfast-phase LEG_NAME`), which the
+/// evaluator times; no computation depends on it.
+pub fn phase_marker(name: &str) {
+    let leg = match PHASE_LEG.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => "cairo",
+        _ => "circuit",
+    };
+    eprintln!("pvfast-phase {leg}_{name}");
+}
+
 #[instrument(skip_all)]
 pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     components: &[&dyn ComponentProver<B>],
@@ -53,6 +66,7 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     // Evaluate and commit on composition polynomial.
     let random_coeff = channel.draw_secure_felt();
 
+    phase_marker("composition");
     let span = span!(Level::INFO, "Composition", class = "Composition").entered();
     let span1 =
         span!(Level::INFO, "Generation", class = "CompositionPolynomialGeneration").entered();
@@ -63,10 +77,13 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
         commitment_scheme.twiddles,
         commitment_scheme.config.fri_config.log_blowup_factor,
     );
+    drop(trace);
+    commitment_scheme.drop_stripe_pairs();
     span1.exit();
 
     // Commit on the Composition Polynomial by splitting its coeffs to two polynomialsof degree
     // half the size of the original polynomial, and commit on each half separately.
+    phase_marker("comp_commit");
     let mut tree_builder = commitment_scheme.tree_builder();
     let (left_comp_poly_half, right_comp_poly_half) = composition_poly.split_at_mid();
 
@@ -75,6 +92,7 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     tree_builder.commit(channel);
     span.exit();
 
+    phase_marker("tail");
     // Proof of work before the OODS point, then draw it.
     grind_smallest(channel, commitment_scheme.config.grinding.deep_bits);
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);

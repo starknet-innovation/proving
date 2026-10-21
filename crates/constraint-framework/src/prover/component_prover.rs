@@ -61,7 +61,46 @@ fn get_trace_columns<'a, B: Backend>(
             //
             // Ideally we'd slice to just those indices, but the type system requires
             // borrowing the entire evaluation.
-            component_polys.map_cols(|c| Cow::Borrowed(&c.evals))
+            //
+            // A column that keeps less than those indices (stripe 0 of a striped tree, or its
+            // coefficients alone) gets its first stripes regrown: the same values.
+            let need = eval_domain.size();
+            let regrow = |c: &'a &Poly<B>| -> Cow<'a, CircleEvaluation<B, BaseField, BitReversedOrder>> {
+                if c.evals.values.len() >= need {
+                    return Cow::Borrowed(&c.evals);
+                }
+                let coeffs = match &c.coeffs {
+                    Some(coeffs) => Cow::Borrowed(coeffs),
+                    None => Cow::Owned(c.regrown_coefficients()),
+                };
+                let len = 1usize << coeffs.log_size();
+                let count = need.div_ceil(len);
+                let owned;
+                let twiddles = match twiddles {
+                    Some(twiddles) => twiddles,
+                    None => {
+                        owned = B::precompute_twiddles(c.evals.domain.half_coset);
+                        &owned
+                    }
+                };
+                let mut values = stwo::prover::backend::Col::<B, BaseField>::zeros(count * len);
+                B::evaluate_stripes_into(&coeffs, c.evals.domain, twiddles, 0, count, &mut values);
+                let mut evaluation = CircleEvaluation::<B, BaseField, BitReversedOrder>::new(
+                    CanonicCoset::new(1).circle_domain(),
+                    stwo::prover::backend::Col::<B, BaseField>::zeros(2),
+                );
+                evaluation.values = values;
+                evaluation.domain = c.evals.domain;
+                Cow::Owned(evaluation)
+            };
+            #[cfg(not(feature = "parallel"))]
+            {
+                component_polys.map_cols(regrow)
+            }
+            #[cfg(feature = "parallel")]
+            {
+                component_polys.par_map_cols(regrow)
+            }
         }
         EvaluationMode::ExtendToEvalDomain => {
             let _span = span!(Level::INFO, "Constraint Extension").entered();

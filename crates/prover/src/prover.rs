@@ -315,7 +315,12 @@ where
     // Add the preprocessed trace commitment that was computed earlier to the commitment scheme.
     commitment_scheme.commit_tree(preprocessed_tree, channel);
 
-    // Base trace.
+    // Base trace. The base and interaction trees keep stripes 0 and 1 of their columns until the
+    // composition, which reads them instead of extending every column again; the live memory of
+    // the Cairo leg stays far below the proof's peak, which the circuit leg sets.
+    commitment_scheme.keep_stripe_pair = true;
+    stwo::prover::PHASE_LEG.store(0, std::sync::atomic::Ordering::Relaxed);
+    stwo::prover::phase_marker("base_commit");
     claim.mix_into::<MC>(channel);
     let span = span!(Level::INFO, "Compute base trace commitment").entered();
     let mut tree_builder = commitment_scheme.tree_builder();
@@ -324,6 +329,7 @@ where
     span.exit();
 
     // Draw interaction elements.
+    stwo::prover::phase_marker("interaction");
     let interaction_pow = SimdBackend::grind(channel, INTERACTION_POW_BITS);
     channel.mix_u64(interaction_pow);
     let interaction_elements = CommonLookupElements::draw(channel);
@@ -348,10 +354,12 @@ where
     );
     interaction_claim.mix_into(channel);
 
+    stwo::prover::phase_marker("int_commit");
     let span = span!(Level::INFO, "Compute interaction trace commitment").entered();
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_polys(interaction_trace_polys);
     tree_builder.commit(channel);
+    commitment_scheme.keep_stripe_pair = false;
     span.exit();
 
     // Component provers.

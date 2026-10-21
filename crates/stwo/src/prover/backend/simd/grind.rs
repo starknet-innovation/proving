@@ -93,11 +93,13 @@ fn g8(
     x: u8,
     y: u8,
 ) {
-    v[a] = add_grind_msg(v[a] + v[b], m_digest, low, high, x);
+    // The message word is added to `a` first: `a + m` does not wait for `b`, so each of the two
+    // additions on `b`'s path is one add instead of two (the same wrapping sum).
+    v[a] = add_grind_msg(v[a], m_digest, low, high, x) + v[b];
     v[d] = rot.rotate::<16>(v[d] ^ v[a]);
     v[c] += v[d];
     v[b] = rot.rotate::<12>(v[b] ^ v[c]);
-    v[a] = add_grind_msg(v[a] + v[b], m_digest, low, high, y);
+    v[a] = add_grind_msg(v[a], m_digest, low, high, y) + v[b];
     v[d] = rot.rotate::<8>(v[d] ^ v[a]);
     v[c] += v[d];
     v[b] = rot.rotate::<7>(v[b] ^ v[c]);
@@ -201,7 +203,7 @@ impl GrindPrefix {
         let d = self.rot.rotate::<16>(v[15] ^ a);
         let c = v[10] + d;
         let b = self.rot.rotate::<12>(v[5] ^ c);
-        let a = a + b + high;
+        let a = (a + high) + b;
         let d = self.rot.rotate::<8>(d ^ a);
         let c = c + d;
         let b = self.rot.rotate::<7>(b ^ c);
