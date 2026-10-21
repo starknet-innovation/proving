@@ -13,7 +13,19 @@ One private Starknet transaction, the full proof with recursion, timed in 10 pai
 | Time, median | 11.1 s | 5.4 s: 2.06× faster (95% interval 2.04× to 2.08×) |
 | Peak memory | 14.1 GiB | 3.0 GiB |
 
-Every proof was identical and verified. On all 16 programs of the prover's test corpus, Cheetah's proofs are identical to those of unmodified Stwo ([dd1787bc](https://github.com/starknet-innovation/proving/commit/dd1787bc9748f0afbbede34f47f91bbef64f6f6d)).
+Every proof was identical and verified.
+
+## Same proofs as unmodified Stwo
+
+On 21 October 2026, Cheetah, Chihuahua and unmodified Stwo ([dd1787bc](https://github.com/starknet-innovation/proving/commit/dd1787bc9748f0afbbede34f47f91bbef64f6f6d)) proved the same statements, and the results were compared byte for byte: 2,187 proofs, every statement identical across the three builds.
+
+- **The private transaction with recursion, at StarkWare's settings:** 6 statements (fresh nonces), 1 to 16 threads, AVX2 and portable x86-64 builds and Apple silicon. 72 proofs, all identical, all accepted by unmodified Stwo's verifier.
+- **The prover's 16-program test corpus** under three parameter sets (Stwo's 96-bit default, StarkWare's mainnet FRI settings, and Blake2s with blowup 4 and fold step 2): 540 proofs, all identical.
+- **Stwo's example AIRs** (wide Fibonacci, Plonk, BLAKE, a state machine) under five FRI settings, three Merkle hashes and both backends: 1,575 proofs, all identical.
+- **x86 and ARM agree:** each statement gives the same bytes on an AMD Ryzen 7 3700X (AVX2) and an Apple M5 Max (NEON).
+- **Stwo's unit tests** pass in all six prover crates.
+
+**For library users:** Cheetah's `PcsConfig` has one more field, `grinding`: proof of work before the DEEP and batching challenges, from the challenge's 100-provable-bit season. It is none by default, never serialized and never mixed into the channel, so it changes no proof. Code that writes a `PcsConfig` literal adds `grinding: Grinding::NONE` or uses a constructor. `ComponentProver` also requires `Sync`.
 
 ## What it is
 
