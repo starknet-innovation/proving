@@ -39,8 +39,11 @@ fn interpolate_in_turn(
     if !columns.first().is_some_and(|column| column.domain.log_size() > 16) {
         return SimdBackend::interpolate_columns(columns, twiddles);
     }
+    // The columns are interpolated side by side, each out of place through the pool: at 2^21 rows
+    // one column's transform leaves most workers idle, and blake_g_gate's columns, interpolated one
+    // after the other, were the last task of both the base trace and the interaction.
     let pool = BaseColumnPool::<SimdBackend>::new();
-    columns.into_iter().map(|column| SimdBackend::interpolate_pooled(column, twiddles, &pool)).collect()
+    SimdBackend::interpolate_columns_pooled(columns, twiddles, &pool)
 }
 
 pub struct TraceGenerator {

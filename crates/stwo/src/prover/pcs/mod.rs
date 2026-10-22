@@ -33,6 +33,7 @@ use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::secure_column::SecureColumnByCoords;
 use crate::prover::vcs_lifted::prover::MerkleProverLifted;
 
+mod patch_tests;
 pub mod quotient_ops;
 
 /// The prover side of a FRI polynomial commitment scheme. See [super].
@@ -1001,18 +1002,14 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                         .map(|column| column.as_ref().unwrap())
                         .sorted_by_key(|column| column.len())
                         .collect_vec();
-                    let layers = B::build_layers_sparse(&columns, stripe_lifting_log_size + 1);
+                    let mut layers = B::build_layers_sparse(&columns, stripe_lifting_log_size + 1);
                     drop(columns);
-                    let mut halves = [vec![], vec![]];
-                    for layer in layers.iter().take(stripe_lifting_log_size as usize + 1) {
-                        let half = layer.len() / 2;
-                        halves[0].push((0..half).map(|i| layer.at(i)).collect());
-                        halves[1].push((half..layer.len()).map(|i| layer.at(i)).collect());
-                    }
-                    drop(layers);
-                    let [low, high] = halves;
-                    stripe_layers[first] = Some(low);
-                    stripe_layers[first + 1] = Some(high);
+                    // Below its root, every layer of the double stripe is stripe `first`'s layer
+                    // followed by stripe `first + 1`'s: the concatenation the gather below builds.
+                    // The double's layers are kept whole in the first slot, the second left empty,
+                    // instead of being copied into halves on one thread.
+                    layers.truncate(stripe_lifting_log_size as usize + 1);
+                    stripe_layers[first] = Some(layers);
                     for (i, slot) in pair_values.iter_mut().enumerate() {
                         let column = slot.take().unwrap();
                         if pair && first == 0 && prefix[i] {
@@ -1172,7 +1169,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             base_column_pool.release_all_idle();
             // The second trim runs beside the gather of the upper levels.
             crate::prover::backend::simd::column::beside_trim_heap(move || {
-                let stripe_layers = stripe_layers.into_iter().map(Option::unwrap).collect_vec();
+                // A double stripe's layers fill its first slot only (see above).
+                let stripe_layers = stripe_layers.into_iter().flatten().collect_vec();
 
                 // Level `l` of the tree, up to the stripes' roots, is the concatenation of the stripes'
                 // levels `l`, in stripe order: gathered at its final size, on the pool.

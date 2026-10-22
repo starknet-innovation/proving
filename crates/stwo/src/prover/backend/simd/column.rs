@@ -95,7 +95,16 @@ pub(crate) fn advise_pages<T>(data: &[T], populate: bool) {
     const MADV_HUGEPAGE: core::ffi::c_int = 14;
     const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
     let (start, len) = whole_pages(data.as_ptr() as usize, std::mem::size_of_val(data));
-    advise_range(start, len, MADV_HUGEPAGE);
+    // A block of the cache was advised when it was mapped (see `LargeBlockCache::alloc`), and
+    // nothing clears the advice: asking again would only take the mmap lock for writing, which
+    // stalls every other worker's page faults.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let advised = LIVE_ANONYMOUS_BLOCKS.contains(data.as_ptr() as usize);
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let advised = false;
+    if !advised {
+        advise_range(start, len, MADV_HUGEPAGE);
+    }
     if populate {
         advise_range(start, len, MADV_POPULATE_WRITE);
     }
