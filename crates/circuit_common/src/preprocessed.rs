@@ -144,6 +144,7 @@ const SEQ_LOG_SIZE: u32 = 16;
 /// `BaseField::from(value)` for a compact column's value, inlined here: the same
 /// [`BaseField::reduce`] formula, so the result is identical, but the per-element conversion of a
 /// regrown column no longer goes through an out-of-line call and the loops over a column vectorize.
+#[cfg(feature = "prover")]
 #[inline(always)]
 fn field_of(value: usize) -> BaseField {
     let value = value as u64;
@@ -821,6 +822,7 @@ impl stwo::prover::TraceSource for PreprocessedColumnSource {
 
 /// Writes `field_of(column.at(row))` for the rows `first..first + dst.len()`, with the variant (and
 /// a fixed column's formula) matched once per call instead of once per row.
+#[cfg(feature = "prover")]
 fn write_compact_rows(column: &CompactColumn, first: usize, dst: &mut [BaseField]) {
     let rows = first..first + dst.len();
     match column {

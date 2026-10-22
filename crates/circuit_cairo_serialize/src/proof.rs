@@ -126,6 +126,8 @@ impl<H: MerkleHasherLifted<Hash = Blake2sHash>> CairoStarkProof<H> {
                 fri_config: CairoDeserialize::deserialize(data),
                 trace_lifting_log_size,
                 preprocessed_lifting_log_size,
+                // The Cairo verifier reads no grinding: StarkWare's settings grind none.
+                grinding: stwo::core::proof_of_work::Grinding::NONE,
             },
             commitments: CairoDeserialize::deserialize(data),
             sampled_values: CairoDeserialize::deserialize(data),

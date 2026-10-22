@@ -129,6 +129,7 @@ impl From<InfoEvaluator> for ComponentInfo {
 
 impl<E: FrameworkEval> FrameworkComponent<E> {
     /// Per trace column, whether the constraints read it at a nonzero mask offset.
+    #[cfg(feature = "prover")]
     pub(crate) fn shifted_columns(&self) -> TreeVec<Vec<bool>> {
         self.info
             .mask_offsets
