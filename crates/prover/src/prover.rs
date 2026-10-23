@@ -337,13 +337,19 @@ where
     // Interaction trace.
     // Each component's columns are interpolated in its writer's task as soon as it returns (the
     // same per-column interpolation `TreeBuilder::extend_evals` runs, in the same column order),
-    // on the workers the slowest writers leave idle.
+    // on the workers the slowest writers leave idle. The writers take their output columns from
+    // the interaction pool and the interpolation gives the evaluation buffers back to it, so a
+    // writer that starts later writes into pages an earlier one already mapped (see
+    // `stwo_constraint_framework::interaction_pool`); the buffers left idle once
+    // every writer is done go to the allocator's cache, as the commitment pool's do.
     let span = span!(Level::INFO, "Write interaction trace").entered();
+    let interaction_pool = stwo_constraint_framework::interaction_pool();
     let interpolate = |columns: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>| {
-        SimdBackend::interpolate_columns_pooled(columns, twiddles, base_column_pool)
+        SimdBackend::interpolate_columns_pooled(columns, twiddles, interaction_pool)
     };
     let (interaction_trace_polys, interaction_claim) =
         interaction_generator.write_interaction_trace_with(&interaction_elements, &interpolate);
+    interaction_pool.release_all_idle();
     span.exit();
 
     tracing::info!("Witness trace cells: {:?}", witness_trace_cells(&claim, &preprocessed_trace));

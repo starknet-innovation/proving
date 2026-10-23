@@ -987,6 +987,10 @@ const LARGE_MAX_LOG: u32 = 40;
 const LARGE_CLASSES: usize = ((LARGE_MAX_LOG - LARGE_MIN_LOG) * 4) as usize + 1;
 /// Idle blocks a class can hold.
 const LARGE_SLOTS: usize = 128;
+/// The most pieces of the requested size a larger idle block is carved into (see
+/// `LargeBlocks::split`): enough for a phase's run of same-sized columns, while most of a much
+/// larger block stays whole for the classes above.
+const SPLIT_PIECES: usize = 16;
 /// The most the live blocks and the idle ones take together while a block is kept idle.
 static LARGE_IDLE_BUDGET: AtomicUsize = AtomicUsize::new(0);
 /// The bytes of the live blocks of the cache's classes.
@@ -1127,9 +1131,17 @@ impl LargeBlocks {
     /// memory and the other idle blocks; the counters go up before the block is visible, so they
     /// never fall below what the slots hold.
     fn keep(&self, class: usize, block: usize) -> bool {
+        self.keep_ex(class, block, true)
+    }
+
+    /// [`Self::keep`]; without `budgeted`, the block is kept whatever the budget (a piece of a
+    /// block that was idle under it a moment ago, see [`Self::split`]), as long as its class has
+    /// a free slot.
+    fn keep_ex(&self, class: usize, block: usize, budgeted: bool) -> bool {
         let size = large_class_size(class);
         if self.idle.fetch_add(size, Ordering::Relaxed) + size + live_bytes()
             > LARGE_IDLE_BUDGET.load(Ordering::Relaxed)
+            && budgeted
         {
             self.idle.fetch_sub(size, Ordering::Relaxed);
             return false;
@@ -1143,6 +1155,67 @@ impl LargeBlocks {
         self.counts[class].fetch_sub(1, Ordering::Relaxed);
         self.idle.fetch_sub(size, Ordering::Relaxed);
         false
+    }
+
+    /// Serves a request of `class` whose own class is empty from an idle block of a larger class,
+    /// which is carved into pieces of the requested size: the first is returned, the others stay
+    /// idle in the requested class, and what is left (the block's size modulo the pieces, or
+    /// the part past [`SPLIT_PIECES`] pieces) stays idle in its own classes. The pages of every
+    /// piece are as resident as the block's were, so the request, and the next ones of its class,
+    /// are served without a fresh mapping and the page faults that follow one, while idle blocks
+    /// of other sizes sit in the cache: the interaction writers' columns are a quarter or an
+    /// eighth the size of the blocks the phases before them left idle, and a phase that asks for
+    /// a class the cache lacks asks for many of it. The largest idle block is carved first (the
+    /// block the budget would evict first); a block below twice the request is left alone. `None`
+    /// when no idle block is large enough. Where a block came from does not change the values
+    /// written into it.
+    fn split(&self, class: usize) -> Option<usize> {
+        let size = large_class_size(class);
+        if self.idle.load(Ordering::Relaxed) < 2 * size {
+            return None;
+        }
+        for big in (class + 1..LARGE_CLASSES).rev() {
+            let big_size = large_class_size(big);
+            if big_size < 2 * size || self.counts[big].load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            let Some(block) = self.take(big) else {
+                continue;
+            };
+            let pieces = (big_size / size).min(SPLIT_PIECES);
+            for i in 1..pieces {
+                let piece = block + i * size;
+                if !self.keep_ex(class, piece, false) {
+                    unsafe {
+                        munmap(piece as *mut core::ffi::c_void, size);
+                    }
+                }
+            }
+            // The rest, piece by piece from the largest: each piece is the value of the rest's
+            // three highest bits, which is a class size (the classes are the sizes of 1 MiB and
+            // up with at most three significant bits); a rest below 1 MiB is unmapped.
+            let mut offset = block + pieces * size;
+            let mut rest = big_size - pieces * size;
+            while rest > 0 {
+                let shift = (usize::BITS - rest.leading_zeros()).saturating_sub(3);
+                let piece = (rest >> shift) << shift;
+                let kept = match large_class(Layout::from_size_align(piece, 1).unwrap()) {
+                    Some(piece_class) if large_class_size(piece_class) == piece => {
+                        self.keep_ex(piece_class, offset, false)
+                    }
+                    _ => false,
+                };
+                if !kept {
+                    unsafe {
+                        munmap(offset as *mut core::ffi::c_void, piece);
+                    }
+                }
+                offset += piece;
+                rest -= piece;
+            }
+            return Some(block);
+        }
+        None
     }
 
     /// An idle block of the largest class that has one, with its size.
@@ -1189,6 +1262,14 @@ unsafe impl GlobalAlloc for LargeBlockCache {
             LIVE_ANONYMOUS_BLOCKS.register(block);
             return block as *mut u8;
         }
+        // A class with no idle block is served from a larger idle block, carved (see `split`),
+        // before anything is mapped fresh or evicted.
+        if let Some(block) = LARGE_BLOCKS.split(class) {
+            LARGE_LIVE.fetch_add(size, Ordering::Relaxed);
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            LIVE_ANONYMOUS_BLOCKS.register(block);
+            return block as *mut u8;
+        }
         while live_bytes() + LARGE_BLOCKS.idle.load(Ordering::Relaxed) + size
             > LARGE_IDLE_BUDGET.load(Ordering::Relaxed)
             && let Some((block, block_size)) = LARGE_BLOCKS.evict()
@@ -1196,28 +1277,64 @@ unsafe impl GlobalAlloc for LargeBlockCache {
             munmap(block as *mut core::ffi::c_void, block_size);
         }
         let align = if size >= HUGE_PAGE { HUGE_PAGE } else { 1 };
-        let len = size + align - 1;
-        let mapped = mmap(
-            std::ptr::null_mut(),
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if mapped as isize == -1 {
-            return std::ptr::null_mut();
-        }
-        LARGE_LIVE.fetch_add(size, Ordering::Relaxed);
-        // Trim the mapping to the aligned block; the trimmed ends were never touched.
-        let start = mapped as usize;
-        let block = (start + align - 1) & !(align - 1);
-        if block > start {
-            munmap(mapped, block - start);
-        }
-        if start + len > block + size {
-            munmap((block + size) as *mut core::ffi::c_void, start + len - block - size);
-        }
+        // A block of 2 MiB and up is first mapped at its exact size: the kernel places an
+        // anonymous mapping of that size on a huge-page boundary itself (since 6.7, for sizes
+        // that are a whole number of huge pages), and the block is then one mmap instead of a
+        // longer mapping trimmed by one or two munmaps, each of which takes the mmap lock for
+        // writing while every other worker's page fault waits. A mapping that comes back
+        // unaligned is given back and the longer mapping is trimmed as before.
+        let block = if align == HUGE_PAGE {
+            let mapped = mmap(
+                std::ptr::null_mut(),
+                size,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if mapped as isize == -1 {
+                return std::ptr::null_mut();
+            }
+            if mapped as usize % HUGE_PAGE == 0 {
+                Some(mapped as usize)
+            } else {
+                munmap(mapped, size);
+                None
+            }
+        } else {
+            None
+        };
+        let block = match block {
+            Some(block) => {
+                LARGE_LIVE.fetch_add(size, Ordering::Relaxed);
+                block
+            }
+            None => {
+                let len = size + align - 1;
+                let mapped = mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if mapped as isize == -1 {
+                    return std::ptr::null_mut();
+                }
+                LARGE_LIVE.fetch_add(size, Ordering::Relaxed);
+                // Trim the mapping to the aligned block; the trimmed ends were never touched.
+                let start = mapped as usize;
+                let block = (start + align - 1) & !(align - 1);
+                if block > start {
+                    munmap(mapped, block - start);
+                }
+                if start + len > block + size {
+                    munmap((block + size) as *mut core::ffi::c_void, start + len - block - size);
+                }
+                block
+            }
+        };
         // In `madvise` THP mode the alignment alone buys nothing: ask for huge pages, so the
         // block takes one fault per 2 MiB instead of 512. A hint; the block is correct either way.
         #[cfg(target_os = "linux")]

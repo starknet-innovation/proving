@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use itertools::{Itertools, multizip};
 use num_traits::Zero;
 #[cfg(feature = "parallel")]
@@ -13,9 +15,31 @@ use stwo::prover::backend::simd::column::{BaseColumn, SecureColumn};
 use stwo::prover::backend::simd::m31::{LOG_N_LANES, N_LANES, PackedBaseField};
 use stwo::prover::backend::simd::prefix_sum::inclusive_prefix_sum;
 use stwo::prover::backend::simd::qm31::{PackedSecureField, batch_inverse_packed_qm31};
+use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::secure_column::SecureColumnByCoords;
+
+/// The pool the interaction writers' output columns come from and go back to.
+///
+/// Every interaction column was allocated fresh and written by its writer, then interpolated out
+/// of place into a second fresh buffer: twice the interaction trace in pages the kernel had to
+/// zero and map inside the phase, on a window that already left workers idle. Through this pool
+/// the buffer a writer's columns were interpolated out of (which the prover's interpolation gives
+/// back here) becomes the next writer's output column, or the next column's coefficients, as the
+/// commitment's FFT buffers already circulate through its pool: the pages are resident, mapped by
+/// an earlier writer of the same phase. Every element of a taken buffer is written before it is
+/// read, exactly as the fresh buffer it replaces was, so no value depends on which buffer a column
+/// lands in. The prover releases the idle buffers once the phase's writers are done
+/// ([`BaseColumnPool::release_all_idle`]), so nothing stays resident past the phase that the
+/// allocator's cache would not have kept.
+static INTERACTION_POOL: LazyLock<BaseColumnPool<SimdBackend>> = LazyLock::new(BaseColumnPool::new);
+
+/// The pool the interaction writers draw their output columns from; the prover gives the
+/// buffers their interpolation frees back to it and releases it after the writers.
+pub fn interaction_pool() -> &'static BaseColumnPool<SimdBackend> {
+    &INTERACTION_POOL
+}
 
 // SIMD backend generator for logup interaction trace.
 pub struct LogupTraceGenerator {
@@ -23,6 +47,8 @@ pub struct LogupTraceGenerator {
     /// Current allocated interaction columns.
     trace: Vec<SecureColumnByCoords<SimdBackend>>,
     /// Denominator expressions (z + sum_i alpha^i * x_i) being generated for the current lookup.
+    /// Allocated by [`Self::new`], or on the first column that writes denominators
+    /// ([`Self::new_col`], [`Self::col_from_par_iter`]); [`Self::write_frac_cols`] never uses it.
     denom: SecureColumn,
     batch_inverse_buffer: Vec<PackedSecureField>,
 }
@@ -38,19 +64,39 @@ impl LogupTraceGenerator {
     ///
     /// Calling `finalize_last` on uninitialized LogupTraceGenerator leads to undefined behavior.
     pub unsafe fn uninitialized(log_size: u32) -> Self {
+        // The denominators and the inverse buffer (together eight times a column) are allocated
+        // by the first column that writes them: a writer that uses `write_frac_cols` alone never
+        // does, and its mapping of them only counted against the allocator's idle budget.
         let trace = vec![];
-        let denom = SecureColumn::uninitialized(1 << log_size);
-        let batch_inverse_buffer = unsafe { uninit_vec(1 << (log_size - LOG_N_LANES)) };
+        let denom = SecureColumn { data: vec![], length: 0 };
+        let batch_inverse_buffer = vec![];
         Self { log_size, trace, denom, batch_inverse_buffer }
+    }
+
+    /// The denominators and the inverse buffer, allocated (uninitialized, as by
+    /// [`Self::uninitialized`]) if this is the first column that writes them. Every row of the
+    /// denominators is written by the column's fractions before the batch inverse reads it.
+    fn ensure_denominators(&mut self) {
+        let log_size = self.log_size;
+        if self.denom.len() != 1 << log_size {
+            self.denom = unsafe { SecureColumn::uninitialized(1 << log_size) };
+        }
+        if self.batch_inverse_buffer.len() != 1 << (log_size - LOG_N_LANES) {
+            self.batch_inverse_buffer = unsafe { SecureColumn::uninitialized(1 << log_size) }.data;
+        }
     }
 
     /// Allocate a new lookup column.
     pub fn new_col(&mut self) -> LogupColGenerator<'_> {
         let log_size = self.log_size;
-        LogupColGenerator {
-            trace_gen: self,
-            numerator: unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(1 << log_size) },
-        }
+        self.ensure_denominators();
+        // Every value of the column is written (`write_frac`, every row) before `finalize_col`
+        // reads it: its buffer is taken unzeroed, from the interaction pool where one is idle.
+        let pool = interaction_pool();
+        let numerator = SecureColumnByCoords::<SimdBackend> {
+            columns: std::array::from_fn(|_| pool.take_or_fresh(log_size)),
+        };
+        LogupColGenerator { trace_gen: self, numerator }
     }
 
     pub fn col_from_iter(
@@ -84,11 +130,12 @@ impl LogupTraceGenerator {
         const CHUNK_SIZE: usize = 128;
         let n_rows: usize = 1 << (self.log_size - LOG_N_LANES);
         // Every value of the columns is written below (each task writes every row of its chunk of
-        // every column): their buffers are taken as the commitment's FFT buffers are, unzeroed.
-        let pool = stwo::prover::mempool::BaseColumnPool::<SimdBackend>::new();
+        // every column): their buffers are taken as the commitment's FFT buffers are, unzeroed,
+        // from the interaction pool where one is idle (see [`interaction_pool`]).
+        let pool = interaction_pool();
         let mut columns: Vec<_> = (0..n_columns)
             .map(|_| SecureColumnByCoords::<SimdBackend> {
-                columns: std::array::from_fn(|_| pool.take_or_alloc(self.log_size)),
+                columns: std::array::from_fn(|_| pool.take_or_fresh(self.log_size)),
             })
             .collect();
         let mut tasks: Vec<Vec<_>> =
@@ -142,6 +189,7 @@ impl LogupTraceGenerator {
     ) {
         let length = 1 << self.log_size;
         assert_eq!(iter.len() * N_LANES, length);
+        self.ensure_denominators();
 
         let (((c0, c1), c2), c3) = (self.denom.data.par_iter_mut())
             .zip(iter)

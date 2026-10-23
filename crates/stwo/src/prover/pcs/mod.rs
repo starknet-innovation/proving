@@ -968,13 +968,39 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 for first in (2..n_stripes).step_by(2).chain([0]) {
                     let mut pair_values: Vec<Option<Col<B, BaseField>>> =
                         (0..coeffs.len()).map(|_| None).collect();
+                    // The first double stripe finds no idle buffer of its sizes in the pool: its
+                    // columns of 2^(s+1) values (about 560 MiB for the Cairo base trace, most of
+                    // them below the large-block cache's 1 MiB) are allocated fresh, each growing
+                    // its worker's glibc arena with mprotect under the kernel's mmap lock, which
+                    // every other worker's page fault waits behind while the fill writes the
+                    // columns already allocated. The allocations are taken in a pass of their own
+                    // (on the same workers, so the arenas fill as before) and the fill, whose
+                    // faults then meet no mprotect, in the next.
+                    if first == 2 {
+                        #[cfg(feature = "parallel")]
+                        {
+                            use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator};
+                            pair_values.par_iter_mut().zip(log_sizes.par_iter()).for_each(
+                                |(slot, &log_size)| {
+                                    *slot = Some(base_column_pool.take_or_alloc(log_size + 1));
+                                },
+                            );
+                        }
+                        #[cfg(not(feature = "parallel"))]
+                        for (slot, &log_size) in pair_values.iter_mut().zip(&log_sizes) {
+                            *slot = Some(base_column_pool.take_or_alloc(log_size + 1));
+                        }
+                    }
                     let fill_pair = |((poly, &domain), (eval, slot)): (
                         (&Option<CircleCoefficients<B>>, &CircleDomain),
                         (&Col<B, BaseField>, &mut Option<Col<B, BaseField>>),
                     )| {
                         let poly = poly.as_ref().unwrap();
                         let len = 1usize << poly.log_size();
-                        let mut column = base_column_pool.take_or_alloc(poly.log_size() + 1);
+                        let mut column = match slot.take() {
+                            Some(column) => column,
+                            None => base_column_pool.take_or_alloc(poly.log_size() + 1),
+                        };
                         if eval.len() == domain.size() {
                             B::copy_block(eval, first * len, &mut column, 0, 2 * len);
                         } else {

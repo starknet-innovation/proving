@@ -762,6 +762,116 @@ impl CairoClaimGenerator {
         let mut qm_31_add_mul_opcode_result = None;
         let mut ret_opcode_result = None;
 
+        // The opcode writers' trace columns, allocated ahead of the writers (see
+        // `ComponentTrace::prealloc`) on the pool's workers, as the writers would have allocated
+        // them, but with no writer faulting beside the arena growth: each writer's
+        // `ComponentTrace::uninitialized` then takes its columns from the stash.
+        {
+            use stwo::prover::backend::simd::m31::{LOG_N_LANES, N_LANES};
+            use stwo_air_utils::trace::component_trace::ComponentTrace;
+            let mut ahead: Vec<Box<dyn Fn() + Send + Sync>> = Vec::new();
+            if let Some(generator) = &self.add_opcode {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::add_opcode::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.add_opcode_small {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::add_opcode_small::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.add_ap_opcode {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::add_ap_opcode::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.assert_eq_opcode {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::assert_eq_opcode::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.assert_eq_opcode_imm {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::assert_eq_opcode_imm::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.assert_eq_opcode_double_deref {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::assert_eq_opcode_double_deref::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.blake_compress_opcode {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::blake_compress_opcode::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.call_opcode_abs {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::call_opcode_abs::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.call_opcode_rel_imm {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::call_opcode_rel_imm::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.generic_opcode {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::generic_opcode::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.jnz_opcode_non_taken {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::jnz_opcode_non_taken::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.jnz_opcode_taken {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::jnz_opcode_taken::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.jump_opcode_abs {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::jump_opcode_abs::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.jump_opcode_double_deref {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::jump_opcode_double_deref::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.jump_opcode_rel {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::jump_opcode_rel::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.jump_opcode_rel_imm {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::jump_opcode_rel_imm::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.mul_opcode {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::mul_opcode::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.mul_opcode_small {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::mul_opcode_small::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.qm_31_add_mul_opcode {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::qm_31_add_mul_opcode::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.ret_opcode {
+                let size = std::cmp::max(generator.inputs.len().next_power_of_two(), N_LANES);
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::ret_opcode::N_TRACE_COLUMNS }>::prealloc(size.ilog2())));
+            }
+            if let Some(generator) = &self.blake_round {
+                let n_active_rows = generator.packed_inputs.lock().unwrap().len() * N_LANES
+                    + generator.remainder_inputs.lock().unwrap().len();
+                let packed_size = n_active_rows.div_ceil(N_LANES).max(1).next_power_of_two();
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::blake_round::N_TRACE_COLUMNS }>::prealloc(packed_size.ilog2() + LOG_N_LANES)));
+            }
+            if let Some(generator) = &self.blake_g {
+                let n_active_rows = generator.packed_inputs.lock().unwrap().len() * N_LANES
+                    + generator.remainder_inputs.lock().unwrap().len();
+                let packed_size = n_active_rows.div_ceil(N_LANES).max(1).next_power_of_two();
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::blake_g::N_TRACE_COLUMNS }>::prealloc(packed_size.ilog2() + LOG_N_LANES)));
+            }
+            if let Some(generator) = &self.triple_xor_32 {
+                let n_active_rows = generator.packed_inputs.lock().unwrap().len() * N_LANES
+                    + generator.remainder_inputs.lock().unwrap().len();
+                let packed_size = n_active_rows.div_ceil(N_LANES).max(1).next_power_of_two();
+                ahead.push(Box::new(move || ComponentTrace::<{ cairo_air::components::triple_xor_32::N_TRACE_COLUMNS }>::prealloc(packed_size.ilog2() + LOG_N_LANES)));
+            }
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            ahead.par_iter().for_each(|prealloc| prealloc());
+        }
+
         scope(|s| {
             if let Some(generator) = self.add_opcode {
                 s.spawn(|_| {

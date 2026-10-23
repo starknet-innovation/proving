@@ -51,6 +51,16 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
         self.pools.get_mut(&log_size).and_then(|mut pool| pool.pop())
     }
 
+    /// Takes a buffer of exactly `1 << log_size` elements from the pool, or allocates a fresh
+    /// uninitialized one of that size, with no other capacity: for a caller that writes every
+    /// element before reading it and gives the buffer back as it is (the interaction writers).
+    /// Unlike [`Self::take_or_alloc`], no larger idle buffer is shortened (which hands its tail
+    /// back to the kernel) and no capacity is reserved beyond the request.
+    pub fn take_or_fresh(&self, log_size: u32) -> Col<B, BaseField> {
+        self.try_take(log_size)
+            .unwrap_or_else(|| unsafe { Col::<B, BaseField>::uninitialized(1 << log_size) })
+    }
+
     /// Takes a buffer from the pool, or allocates a new uninitialized one if none is available.
     ///
     /// Without a buffer of the exact size, the smallest larger idle buffer is shortened to the

@@ -36,14 +36,26 @@ fn interpolate_in_turn(
     columns: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
     twiddles: &TwiddleTree<SimdBackend>,
 ) -> Vec<CircleCoefficients<SimdBackend>> {
+    let pool = BaseColumnPool::<SimdBackend>::new();
+    interpolate_in_turn_pooled(columns, twiddles, &pool)
+}
+
+/// [`interpolate_in_turn`] through `pool`: the coefficients of a column are written into an idle
+/// buffer of the pool where there is one, and the evaluation buffer goes back to it. The
+/// interaction writers pass the pool their columns came from, so the buffers circulate between
+/// the writers of the phase (see `stwo_constraint_framework::interaction_pool`).
+fn interpolate_in_turn_pooled(
+    columns: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    twiddles: &TwiddleTree<SimdBackend>,
+    pool: &BaseColumnPool<SimdBackend>,
+) -> Vec<CircleCoefficients<SimdBackend>> {
     if !columns.first().is_some_and(|column| column.domain.log_size() > 16) {
         return SimdBackend::interpolate_columns(columns, twiddles);
     }
     // The columns are interpolated side by side, each out of place through the pool: at 2^21 rows
     // one column's transform leaves most workers idle, and blake_g_gate's columns, interpolated one
     // after the other, were the last task of both the base trace and the interaction.
-    let pool = BaseColumnPool::<SimdBackend>::new();
-    SimdBackend::interpolate_columns_pooled(columns, twiddles, &pool)
+    SimdBackend::interpolate_columns_pooled(columns, twiddles, pool)
 }
 
 pub struct TraceGenerator {
@@ -387,12 +399,15 @@ where
     } = circuit_interaction_claim_generator;
     // The blake gate's interaction trace, the largest, is written beside the other components'
     // (each writer is parallel inside too): with the gate tuples kept narrow, their temporaries fit
-    // together under the proof's peak.
+    // together under the proof's peak. The writers' columns come from the interaction pool and
+    // their interpolation gives the evaluation buffers back to it; what is left idle once every
+    // writer is done goes to the allocator's cache.
+    let pool = stwo_constraint_framework::interaction_pool();
     let ((blake_polys, blake_sum), ()) = rayon::join(
         || {
             let (trace, claim) =
                 blake_g_gate.write_interaction_trace(&interaction_elements.common_lookup_elements);
-            (interpolate_in_turn(trace, twiddles), claim.claimed_sum)
+            (interpolate_in_turn_pooled(trace, twiddles, pool), claim.claimed_sum)
         },
         || rayon::scope(|s| {
         s.spawn(|_| {
@@ -402,7 +417,7 @@ where
                 &preprocessed_trace,
                 &interaction_elements.common_lookup_elements,
             );
-            all_polys.eq = interpolate_in_turn(trace, twiddles);
+            all_polys.eq = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.eq = claimed_sum;
         });
         s.spawn(|_| {
@@ -413,61 +428,62 @@ where
                 &preprocessed_trace,
                 &interaction_elements.common_lookup_elements,
             );
-            all_polys.qm31_ops = interpolate_in_turn(trace, twiddles);
+            all_polys.qm31_ops = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.qm31_ops = claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) =
                 triple_xor.write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.triple_xor = interpolate_in_turn(trace, twiddles);
+            all_polys.triple_xor = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.triple_xor = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) =
                 m_31_to_u_32.write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.m_31_to_u_32 = interpolate_in_turn(trace, twiddles);
+            all_polys.m_31_to_u_32 = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.m_31_to_u_32 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_8
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_8 = interpolate_in_turn(trace, twiddles);
+            all_polys.verify_bitwise_xor_8 = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.verify_bitwise_xor_8 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_12
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_12 = interpolate_in_turn(trace, twiddles);
+            all_polys.verify_bitwise_xor_12 = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.verify_bitwise_xor_12 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_4
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_4 = interpolate_in_turn(trace, twiddles);
+            all_polys.verify_bitwise_xor_4 = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.verify_bitwise_xor_4 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_7
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_7 = interpolate_in_turn(trace, twiddles);
+            all_polys.verify_bitwise_xor_7 = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.verify_bitwise_xor_7 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = verify_bitwise_xor_9
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.verify_bitwise_xor_9 = interpolate_in_turn(trace, twiddles);
+            all_polys.verify_bitwise_xor_9 = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.verify_bitwise_xor_9 = claim.claimed_sum;
         });
         s.spawn(|_| {
             let (trace, claim) = range_check_16
                 .write_interaction_trace(&interaction_elements.common_lookup_elements);
-            all_polys.range_check_16 = interpolate_in_turn(trace, twiddles);
+            all_polys.range_check_16 = interpolate_in_turn_pooled(trace, twiddles, pool);
             claimed_sums.range_check_16 = claim.claimed_sum;
         });
     }),
     );
     all_polys.blake_g_gate = blake_polys;
     claimed_sums.blake_g_gate = blake_sum;
+    pool.release_all_idle();
 
     // Commit the interaction columns.
     for polys in all_polys.into_array() {

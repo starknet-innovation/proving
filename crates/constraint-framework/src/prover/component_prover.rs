@@ -554,6 +554,11 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         // The first block's buffers: every value is written by `evaluate_block_into`'s FFT, so they
         // are taken as the commitment's evaluation buffers are, without zeroing them first.
         let fresh = stwo::prover::mempool::BaseColumnPool::<SimdBackend>::new();
+        // The per-job chunk buffers of the large blocks (below), pooled: a job takes its buffers
+        // from here (fresh ones are not zeroed: `finish_block_chunk_into` writes every word of a
+        // chunk before anything reads it) and gives them back when it ends, for the next job and
+        // the next block to reuse.
+        let chunk_pool = stwo::prover::mempool::BaseColumnPool::<SimdBackend>::new();
         // A large block's fft ends with independent chunks of its second phase: each chunk is
         // completed for every block column into small per-job buffers and its rows evaluated on
         // the same thread, instead of the second phase writing the whole block back to memory
@@ -615,8 +620,8 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                 let [c0, c1, c2, c3] = &mut accum.col.columns;
                 let [c0, c1, c2, c3] = [c0, c1, c2, c3].map(|c| &mut c.data[start..start + n_packed]);
                 let random_coeff_powers = &accum.random_coeff_powers;
-                let chunk_buffers = || {
-                    blocks.as_cols_ref().map_cols(
+                let chunk_buffers = || ChunkBuffers {
+                    buffers: blocks.as_cols_ref().map_cols(
                         |block: &Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>| {
                             block.as_ref().map(|_| {
                                 let mut buffer =
@@ -624,15 +629,15 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                                         CanonicCoset::new(1).circle_domain(),
                                         BaseColumn::zeros(2),
                                     );
-                                buffer.values = BaseColumn::zeros(1 << chunk_log);
+                                buffer.values = chunk_pool.take_or_alloc(chunk_log);
                                 buffer
                             })
                         },
-                    )
+                    ),
+                    pool: &chunk_pool,
+                    log_size: chunk_log,
                 };
-                let run_chunk = |buffers: &mut TreeVec<
-                    Vec<Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>>,
-                >,
+                let run_chunk = |chunk_buffers: &mut ChunkBuffers<'_>,
                                  (h, (((a, b), c), d)): (
                     usize,
                     (
@@ -643,6 +648,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                         &mut [PackedBaseField],
                     ),
                 )| {
+                    let buffers = &mut chunk_buffers.buffers;
                     for (buffer, block) in buffers.iter_mut().flatten().zip(blocks.iter().flatten()) {
                         if let (Some(buffer), Some(block)) = (buffer, block) {
                             finish_block_chunk_into(
@@ -716,6 +722,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
             }
         }
         drop(spare);
+        drop(chunk_pool);
         drop(whole);
         drop(regrown);
         fresh.release_all_idle();
@@ -795,4 +802,22 @@ fn accumulate_pointwise_cpu<E: FrameworkEval>(
         res.set(row, accum.at(row) + row_res * row_denom_inv)
     }
     res
+}
+
+/// The per-job buffers of the chunked second phase of a large block's fft, one per block column:
+/// taken from a pool when the job starts and given back to it when the job ends (see
+/// `evaluate_constraint_quotients_on_domain`).
+struct ChunkBuffers<'a> {
+    buffers: TreeVec<Vec<Option<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>>>,
+    pool: &'a stwo::prover::mempool::BaseColumnPool<SimdBackend>,
+    log_size: u32,
+}
+
+impl Drop for ChunkBuffers<'_> {
+    fn drop(&mut self) {
+        for buffer in self.buffers.iter_mut().flatten().flatten() {
+            let values = std::mem::replace(&mut buffer.values, BaseColumn::zeros(0));
+            self.pool.give_back(self.log_size, values);
+        }
+    }
 }

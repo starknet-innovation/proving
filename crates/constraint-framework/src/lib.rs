@@ -29,7 +29,7 @@ use preprocessed_columns::PreProcessedColumnId;
 pub use prover::{
     AssertEvaluator, CpuDomainEvaluator, FractionWriter, LogupColGenerator, LogupTraceGenerator,
     SimdDomainEvaluator, assert_constraints_on_polys, assert_constraints_on_trace,
-    relation_tracker,
+    interaction_pool, relation_tracker,
 };
 use stwo::core::Fraction;
 use stwo::core::fields::FieldExpOps;

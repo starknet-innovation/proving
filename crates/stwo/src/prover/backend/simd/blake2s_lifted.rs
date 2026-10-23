@@ -20,8 +20,8 @@ use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
 use crate::parallel_iter;
 use crate::prover::backend::simd::blake2s::{
-    INITIAL_STATE, compress_finalize, compress_unfinalized, deinterleave_u32x16, transpose_msgs,
-    untranspose_states,
+    INITIAL_STATE, compress_finalize_by_ref, compress_unfinalized_by_ref, deinterleave_u32x16,
+    transpose_hash_pairs, untranspose_states,
 };
 use crate::prover::backend::simd::column::BaseColumn;
 use crate::prover::backend::simd::m31::{N_LANES, PackedBaseField};
@@ -113,12 +113,10 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
         let mut res: Vec<Blake2sHash> = unsafe { uninit_vec(1 << log_size) };
 
         chunks_mut_iter(&mut res, 1 << LOG_N_LANES).enumerate().for_each(|(i, dst)| {
-            let state = INITIAL_STATE;
+            // The 16 messages are the 16 pairs of consecutive hashes, one word of each per vector.
             let prev_chunk_u32s = cast_slice::<_, u32>(&prev_layer[(i << 5)..((i + 1) << 5)]);
-            let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = array::from_fn(|j| {
-                u32x16::from_array(std::array::from_fn(|k| prev_chunk_u32s[16 * j + k]))
-            });
-            let state = compress_finalize(state, transpose_msgs(msgs), N_BYTES_IN_BLAKE_MESSAGE);
+            let msgs = transpose_hash_pairs(prev_chunk_u32s.try_into().unwrap());
+            let state = compress_finalize_by_ref(&INITIAL_STATE, &msgs, N_BYTES_IN_BLAKE_MESSAGE);
             store_states(untranspose_states(state), dst);
         });
         res
@@ -267,10 +265,13 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
                         array::from_fn(|coord| columns[coord].data[row + offset])
                     });
                     let packed = transpose_packed_leaf(inputs);
-                    let msgs = array::from_fn(|i| {
-                        packed[i / SECURE_EXTENSION_DEGREE][i % SECURE_EXTENSION_DEGREE].into_simd()
-                    });
-                    *state = compress_finalize(INITIAL_STATE, msgs, N_BYTES_IN_BLAKE_MESSAGE);
+                    let mut msgs = [u32x16::splat(0); N_FELTS_IN_BLAKE_MESSAGE];
+                    for (i, msg) in msgs.iter_mut().enumerate() {
+                        *msg = packed[i / SECURE_EXTENSION_DEGREE][i % SECURE_EXTENSION_DEGREE]
+                            .into_simd();
+                    }
+                    *state =
+                        compress_finalize_by_ref(&INITIAL_STATE, &msgs, N_BYTES_IN_BLAKE_MESSAGE);
                 }
                 let mut n_states = TILE;
                 while n_states > 1 {
@@ -337,10 +338,13 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
                     .chunks_exact(N_FELTS_IN_BLAKE_MESSAGE)
                     .enumerate()
                 {
-                    let msgs = array::from_fn(|i| message_word(chunk[i]));
-                    state = compress_unfinalized(
-                        state,
-                        msgs,
+                    let mut msgs = [u32x16::splat(0); N_FELTS_IN_BLAKE_MESSAGE];
+                    for (i, msg) in msgs.iter_mut().enumerate() {
+                        *msg = message_word(chunk[i]);
+                    }
+                    state = compress_unfinalized_by_ref(
+                        &state,
+                        &msgs,
                         (block as u64 + 1) * N_BYTES_IN_BLAKE_MESSAGE,
                     );
                 }
@@ -349,7 +353,7 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
                 for (i, column) in columns[last_chunk_index..].iter().enumerate() {
                     msgs[i] = message_word(column);
                 }
-                state = compress_finalize(state, msgs, u64::from(byte_count));
+                state = compress_finalize_by_ref(&state, &msgs, u64::from(byte_count));
                 store_states(untranspose_states(state), dst);
             });
         hashes.truncate(n_rows);
@@ -718,6 +722,11 @@ fn init_tile(
 
 /// Updates the states of a tile (states `first_state..first_state + tile.len()` of the pass) with
 /// the columns of `pass`.
+///
+/// The message blocks here and in the other hashing loops are assembled word by word into a local
+/// array and lent to the compressor: an `array::from_fn` block is built in a temporary and moved
+/// out, which the compiler keeps as a 1 KiB copy per block, and a by-value argument copies the
+/// block (and the 512-byte state) again.
 #[inline(always)]
 fn hash_pass_tile(
     columns: &[&Col<SimdBackend, BaseField>],
@@ -729,11 +738,13 @@ fn hash_pass_tile(
     // Lift the first chunk `columns[start..start + 16]`.
     for (k, state) in tile.iter_mut().enumerate() {
         let i = first_state + k;
-        let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = array::from_fn(|j| {
+        let mut msgs = [u32x16::splat(0); N_FELTS_IN_BLAKE_MESSAGE];
+        for (j, msg) in msgs.iter_mut().enumerate() {
             let log_ratio = pass.msg_log_ratios[j];
-            to_lifted_simd(columns[pass.start + j].data[i >> log_ratio].into_simd(), log_ratio, i)
-        });
-        *state = compress_unfinalized(*state, msgs, local_byte_count);
+            let word = columns[pass.start + j].data[i >> log_ratio].into_simd();
+            *msg = to_lifted_simd(word, log_ratio, i);
+        }
+        *state = compress_unfinalized_by_ref(state, &msgs, local_byte_count);
     }
     // Deal with the subsequent chunks in `columns[start + 16..end]`. Note that since `start < end`
     // and both are multiples of 16, we have `start + 16 <= end`. All columns in
@@ -744,9 +755,11 @@ fn hash_pass_tile(
         let rows: [&[PackedBaseField]; N_FELTS_IN_BLAKE_MESSAGE] =
             array::from_fn(|j| &chunk_columns[j].data[first_state..first_state + tile.len()]);
         for (k, state) in tile.iter_mut().enumerate() {
-            let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] =
-                array::from_fn(|j| rows[j][k].into_simd());
-            *state = compress_unfinalized(*state, msgs, local_byte_count);
+            let mut msgs = [u32x16::splat(0); N_FELTS_IN_BLAKE_MESSAGE];
+            for (j, msg) in msgs.iter_mut().enumerate() {
+                *msg = rows[j][k].into_simd();
+            }
+            *state = compress_unfinalized_by_ref(state, &msgs, local_byte_count);
         }
     }
 }
@@ -769,7 +782,7 @@ fn finalize_tile(
             let log_ratio = tail_log_ratios[j];
             msgs[j] = to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i);
         }
-        *state = compress_finalize(*state, msgs, byte_count);
+        *state = compress_finalize_by_ref(state, &msgs, byte_count);
     }
 }
 
@@ -785,18 +798,27 @@ fn hash_state_pair(
     for w in 0..N_FELTS_IN_BLAKE_STATE {
         (msgs[w], msgs[N_FELTS_IN_BLAKE_STATE + w]) = deinterleave_u32x16(first[w], second[w]);
     }
-    compress_finalize(INITIAL_STATE, msgs, N_BYTES_IN_BLAKE_MESSAGE)
+    compress_finalize_by_ref(&INITIAL_STATE, &msgs, N_BYTES_IN_BLAKE_MESSAGE)
 }
 
 /// Stores 16 untransposed hashes: the `k`-th vector holds the hashes `2 * k` and `2 * k + 1`.
+///
+/// `dst` holds exactly the 16 hashes. Each vector is written as one `[u32; 16]` (a pair of hashes,
+/// 64 bytes) by straight-line code: eight copies of a size the compiler knows, so two 32-byte
+/// stores each, instead of a loop the compiler turns into a `memcpy` call of a staged copy.
 #[inline(always)]
 fn store_states(untransposed: [u32x16; N_FELTS_IN_BLAKE_STATE], dst: &mut [Blake2sHash]) {
-    let dst_words = cast_slice_mut::<_, u32>(dst);
-    for (vector, words) in
-        untransposed.iter().zip(dst_words.chunks_exact_mut(N_FELTS_IN_BLAKE_MESSAGE))
-    {
-        words.copy_from_slice(&vector.to_array());
-    }
+    let dst: &mut [[u32; N_FELTS_IN_BLAKE_MESSAGE]; N_FELTS_IN_BLAKE_STATE] =
+        cast_slice_mut::<_, [u32; N_FELTS_IN_BLAKE_MESSAGE]>(dst).try_into().unwrap();
+    let [v0, v1, v2, v3, v4, v5, v6, v7] = untransposed;
+    dst[0] = v0.to_array();
+    dst[1] = v1.to_array();
+    dst[2] = v2.to_array();
+    dst[3] = v3.to_array();
+    dst[4] = v4.to_array();
+    dst[5] = v5.to_array();
+    dst[6] = v6.to_array();
+    dst[7] = v7.to_array();
 }
 
 impl PackLeavesOps for SimdBackend {
