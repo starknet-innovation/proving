@@ -75,6 +75,12 @@ pub struct Poly<B: Backend> {
     pub coeffs: Option<CircleCoefficients<B>>,
     pub evals: CircleEvaluation<B, BaseField, BitReversedOrder>,
     pub source: Option<SharedTraceSource>,
+    /// Stripes 0 and 1 of the extension of a column that keeps neither (see [`Self::pair`]),
+    /// computed once, by the first composition that reads them or ahead of it.
+    pub pair_cache: std::sync::OnceLock<CircleEvaluation<B, BaseField, BitReversedOrder>>,
+    /// Whether the column keeps stripes 0 and 1 of its extension and, until the composition has
+    /// read them, not its coefficients (see `CommitmentSchemeProver::release_pair_coefficients`).
+    pub pair_only: bool,
 }
 
 impl<B: Backend> Poly<B> {
@@ -82,7 +88,7 @@ impl<B: Backend> Poly<B> {
         coeffs: Option<CircleCoefficients<B>>,
         evals: CircleEvaluation<B, BaseField, BitReversedOrder>,
     ) -> Self {
-        Self { coeffs, evals, source: None }
+        Self { coeffs, evals, source: None, pair_cache: std::sync::OnceLock::new(), pair_only: false }
     }
 
     /// A column that stores no evaluation values and reproduces them from `source`.
@@ -94,7 +100,7 @@ impl<B: Backend> Poly<B> {
         );
         evals.values = Col::<B, BaseField>::zeros(0);
         evals.domain = domain;
-        Self { coeffs: None, evals, source: Some(source) }
+        Self { coeffs: None, evals, source: Some(source), pair_cache: std::sync::OnceLock::new(), pair_only: false }
     }
 
     /// Whether the column keeps neither its coefficients nor any of its evaluation values, and
@@ -103,11 +109,57 @@ impl<B: Backend> Poly<B> {
         self.coeffs.is_none() && self.source.is_some() && self.evals.values.is_empty()
     }
 
+    /// The log size of the column's coefficients.
+    pub fn coefficients_log_size(&self) -> u32 {
+        if self.pair_only {
+            return self.evals.values.len().ilog2() - 1;
+        }
+        if let Some(coeffs) = &self.coeffs {
+            return coeffs.log_size();
+        }
+        if let Some(source) = self.source.as_deref().filter(|_| self.evals.values.is_empty()) {
+            return source.log_size();
+        }
+        let log_blowup_factor = self.evals.domain.log_size() - self.evals.values.len().ilog2();
+        self.evals.domain.log_size() - log_blowup_factor
+    }
+
+    /// Stripes 0 and 1 of the column's extension (its evaluation on the first subdomain of twice
+    /// the coefficients' size, the values [`Self::holds_stripe_pair`] columns keep), for a column
+    /// that keeps less: computed once from its coefficients (regrown if it keeps none) and kept,
+    /// so every later read, by any component, borrows them.
+    pub fn pair(&self, twiddles: &TwiddleTree<B>) -> &CircleEvaluation<B, BaseField, BitReversedOrder> {
+        self.pair_cache.get_or_init(|| {
+            let coeffs = match &self.coeffs {
+                Some(coeffs) => std::borrow::Cow::Borrowed(coeffs),
+                None => std::borrow::Cow::Owned(self.regrown_coefficients()),
+            };
+            let len = 1usize << coeffs.log_size();
+            let mut values = Col::<B, BaseField>::zeros(2 * len);
+            B::evaluate_stripes_into(&coeffs, self.evals.domain, twiddles, 0, 2, &mut values);
+            let mut evaluation = CircleEvaluation::<B, BaseField, BitReversedOrder>::new(
+                CanonicCoset::new(1).circle_domain(),
+                Col::<B, BaseField>::zeros(2),
+            );
+            evaluation.values = values;
+            evaluation.domain = self.evals.domain;
+            evaluation
+        })
+    }
+
+    /// Whether [`Self::pair`] is the way the composition reads this column on a subdomain of
+    /// twice its coefficients' size: the column keeps less than those values.
+    pub fn wants_pair(&self) -> bool {
+        let log_size = self.coefficients_log_size();
+        self.evals.values.len() < 2usize << log_size && self.evals.domain.size() > 2usize << log_size
+    }
+
     /// Whether the column keeps its coefficients and stripes 0 and 1 of its extension (its
     /// evaluation on the first subdomain of twice the coefficients' size), for the composition.
     pub fn holds_stripe_pair(&self) -> bool {
         use crate::prover::backend::Column;
-        self.coeffs.as_ref().is_some_and(|coeffs| {
+        self.pair_only
+            || self.coeffs.as_ref().is_some_and(|coeffs| {
             self.evals.values.len() == 2usize << coeffs.log_size()
                 && self.evals.values.len() < self.evals.domain.size()
         })

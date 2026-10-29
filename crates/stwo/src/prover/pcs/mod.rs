@@ -45,6 +45,10 @@ pub struct CommitmentSchemeProver<'a, B: BackendForChannel<MC>, MC: MerkleChanne
     /// Whether the trees committed next keep stripes 0 and 1 of their prefix columns for the
     /// composition (see [`CommitmentTreeProver::new_striped`]).
     pub keep_stripe_pair: bool,
+    /// Whether the columns that keep stripe pairs give up their coefficients for the composition
+    /// (they are interpolated again from stripe 0, the pair's first half, once it has read the
+    /// pairs): the pairs then cost twice the coefficients' size instead of three times.
+    pub release_pair_coefficients: bool,
     /// Pre-allocated base field column pool for polynomial evaluation during commit.
     pub base_column_pool: MaybeOwned<'a, BaseColumnPool<B>>,
 }
@@ -58,6 +62,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             twiddles,
             store_polynomials_coefficients: false,
             keep_stripe_pair: false,
+            release_pair_coefficients: false,
             base_column_pool: MaybeOwned::Owned(BaseColumnPool::new()),
         }
     }
@@ -74,6 +79,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             twiddles,
             store_polynomials_coefficients: false,
             keep_stripe_pair: false,
+            release_pair_coefficients: false,
             base_column_pool: MaybeOwned::Borrowed(base_column_pool),
         }
     }
@@ -109,6 +115,12 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // preprocessed trees use commit_tree and retain their existing storage behavior.
         for poly in &mut tree.polynomials {
             poly.evals.values.release_zeroed_pages();
+            // The pair determines the column (its first half is stripe 0): the coefficients
+            // are interpolated again once the composition has read it (see `drop_stripe_pairs`).
+            if self.release_pair_coefficients && !poly.pair_only && poly.holds_stripe_pair() {
+                poly.coeffs = None;
+                poly.pair_only = true;
+            }
         }
         self.trees.push(MaybeOwned::Owned(tree));
     }
@@ -151,7 +163,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
                 let to_coefficients = |poly: &mut Poly<B>| {
-                    if poly.coeffs.is_none() && poly.evals.values.len() < poly.evals.domain.size() {
+                    if poly.coeffs.is_none()
+                        && !poly.pair_only
+                        && poly.evals.values.len() < poly.evals.domain.size()
+                    {
                         poly.coeffs = Some(poly.take_regrown_coefficients());
                     }
                 };
@@ -162,6 +177,18 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 }
                 #[cfg(not(feature = "parallel"))]
                 tree.polynomials.iter_mut().for_each(to_coefficients);
+            }
+        }
+        if self.release_pair_coefficients {
+            for tree in &mut self.trees.0 {
+                if let MaybeOwned::Owned(tree) = tree {
+                    for poly in &mut tree.polynomials {
+                        if !poly.pair_only && poly.holds_stripe_pair() {
+                            poly.coeffs = None;
+                            poly.pair_only = true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -175,11 +202,26 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     pub fn drop_stripe_pairs(&mut self) {
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
-                for poly in &mut tree.polynomials {
-                    if poly.holds_stripe_pair() {
+                let drop_pair = |poly: &mut Poly<B>| {
+                    if poly.pair_only {
+                        // The coefficients again, from stripe 0 (the pair's first half).
+                        let len = poly.evals.values.len() / 2;
+                        let mut stripe0 = Col::<B, BaseField>::zeros(len);
+                        B::copy_block(&poly.evals.values, 0, &mut stripe0, 0, len);
+                        poly.evals.values = stripe0;
+                        poly.pair_only = false;
+                        poly.coeffs = Some(poly.take_regrown_coefficients());
+                    } else if poly.holds_stripe_pair() {
                         poly.evals.values = Col::<B, BaseField>::zeros(0);
                     }
+                };
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+                    tree.polynomials.par_iter_mut().for_each(drop_pair);
                 }
+                #[cfg(not(feature = "parallel"))]
+                tree.polynomials.iter_mut().for_each(drop_pair);
             }
         }
     }

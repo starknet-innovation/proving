@@ -69,6 +69,14 @@ fn get_trace_columns<'a, B: Backend>(
                 if c.evals.values.len() >= need {
                     return Cow::Borrowed(&c.evals);
                 }
+                // A column read on the subdomain of twice its coefficients' size is evaluated
+                // there once and kept (see `Poly::pair`): the same values, whichever component
+                // reads it first.
+                if let Some(twiddles) = twiddles {
+                    if c.wants_pair() && need == 2usize << c.coefficients_log_size() {
+                        return Cow::Borrowed(c.pair(twiddles));
+                    }
+                }
                 let coeffs = match &c.coeffs {
                     Some(coeffs) => Cow::Borrowed(coeffs),
                     None => Cow::Owned(c.regrown_coefficients()),

@@ -40,12 +40,12 @@ pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out
     // the pool instead of each being injected into it from this thread (the sequential steps,
     // the interaction writers among them, waited on every injection).
     // Freed large blocks wait for reuse while the live memory and the idle blocks take at most
-    // 3200 MiB: every phase reuses the blocks the last one freed instead of faulting in fresh pages.
+    // 3000 MiB: every phase reuses the blocks the last one freed instead of faulting in fresh pages.
     // At StarkWare's settings the live memory stays near 1 GiB in the circuit leg, so a larger
     // budget only kept idle blocks resident (about 2 GiB of the 3.1 GiB peak); the Cairo leg's
     // stripe pairs (see `keep_stripe_pair`) take some of it instead.
     #[cfg(unix)]
-    stwo::prover::backend::simd::column::LargeBlockCache::set_idle_budget(3200 << 20);
+    stwo::prover::backend::simd::column::LargeBlockCache::set_idle_budget(3000 << 20);
     let (version, compressed) = rayon::scope(|_| prove_to_bytes(input, witness_start, output_preimage))?;
     out.write_all(&version)?;
     out.write_all(&compressed)?;
@@ -111,6 +111,16 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
                 || {
                     #[cfg(unix)]
                     stwo::prover::backend::simd::column::trim_heap_now();
+                    // The circuit composition reads the preprocessed columns on the subdomain of
+                    // twice their size: they are public, so their evaluations there are computed
+                    // here, on the workers the mostly sequential fill leaves idle, instead of on
+                    // the circuit leg's path (see `Poly::pair`).
+                    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+                    let tree = &**precomputes.circuit_preprocessed_tree;
+                    let twiddles: &stwo::prover::poly::twiddles::TwiddleTree<_> = &precomputes.twiddles;
+                    tree.polynomials.par_iter().filter(|poly| poly.wants_pair()).for_each(|poly| {
+                        let _ = poly.pair(twiddles);
+                    });
                 },
             );
             Ok((context, zk_blinding_seed))
