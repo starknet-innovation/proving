@@ -1,4 +1,5 @@
 pub mod consts;
+mod public_preprocessed_cache;
 #[cfg(test)]
 mod tests;
 
@@ -243,13 +244,27 @@ pub fn prepare_recursive_prover_precomputes()
         LazyCommitmentTree::new(move || {
             let _span = span!(Level::INFO, "prepare_circuit_preprocessed_tree").entered();
             let preprocessed_trace = preprocessed_circuit.preprocessed_trace.clone();
+            let source_columns = PreprocessedColumnSource::all(&preprocessed_trace);
+            let ids: Vec<String> = preprocessed_trace.ids().into_iter().map(|id| id.id).collect();
+            // The cache contains only the public circuit's Merkle subtree roots. Every live
+            // source column is fingerprinted before it is used, and all statement-dependent
+            // evaluations and openings still come from those sources. Other circuits fall back.
+            if let Some(tree) = public_preprocessed_cache::cached_tree(
+                source_columns.clone(),
+                &ids,
+                CIRCUIT_FRI_CONFIG.log_blowup_factor,
+                preprocessed_lifting_log_size,
+                &twiddles,
+                &base_column_pool,
+            ) {
+                return tree;
+            }
             let circuit_preprocessed_trace = preprocessed_trace.get_trace::<SimdBackend>();
             let circuit_preprocessed_trace_polys =
                 SimdBackend::interpolate_columns(circuit_preprocessed_trace, &twiddles);
             // The compact preprocessed columns stay resident for the circuit proof: the tree
             // regrows its columns from them instead of keeping a stripe of each extension.
-            let sources =
-                PreprocessedColumnSource::all(&preprocessed_trace).into_iter().map(Some).collect();
+            let sources = source_columns.into_iter().map(Some).collect();
             CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new_with_sources(
                 circuit_preprocessed_trace_polys,
                 CIRCUIT_FRI_CONFIG.log_blowup_factor,
