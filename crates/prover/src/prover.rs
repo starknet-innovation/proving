@@ -204,7 +204,7 @@ where
     )
 }
 
-pub fn prove_cairo_with_precompute<'a, MC: MerkleChannel>(
+pub fn prove_cairo_with_precompute<'a, MC: MerkleChannel + 'static>(
     base_column_pool: &BaseColumnPool<SimdBackend>,
     twiddles: &TwiddleTree<SimdBackend>,
     preprocessed_trace: Arc<PreProcessedTrace>,
@@ -241,6 +241,17 @@ where
         if preprocessed_tree.commitment.layers.is_empty() {
             let (trace, tree) = rayon::join(write_trace, || {
                 let _span = span!(Level::INFO, "Compute preprocessed trace commitment").entered();
+                // The tree is public: its Merkle nodes come from a checked cache when the trace
+                // matches it (see `cairo_preprocessed_cache`), on the workers the writers leave idle.
+                if let Some(tree) = crate::cairo_preprocessed_cache::cached_tree_for::<MC>(
+                    preprocessed_trace.clone(),
+                    prover_params.fri_config.log_blowup_factor,
+                    lifting_log_size,
+                    twiddles,
+                    base_column_pool,
+                ) {
+                    return tree;
+                }
                 let polys =
                     SimdBackend::interpolate_columns(gen_trace(preprocessed_trace.clone()), twiddles);
                 CommitmentTreeProver::<SimdBackend, MC>::new(

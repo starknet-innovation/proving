@@ -221,6 +221,9 @@ pub fn prepare_recursive_prover_precomputes()
                 );
                 // Warm the Pedersen points table before the Cairo leg's gen_trace reads it.
                 warm_pedersen_pp_trace(CAIRO_PROVER_PARAMS.preprocessed_trace);
+                // The Cairo preprocessed tree's cache is checked here, beside the twiddles, where
+                // workers are idle; the Cairo leg then only extends its stripe 0.
+                stwo_cairo_prover::cairo_preprocessed_cache::warm(cairo_preprocessed_trace.clone());
                 cairo_preprocessed_trace
             },
         );
