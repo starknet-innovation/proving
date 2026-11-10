@@ -378,6 +378,85 @@ fn twin_coset_weight_chunk(
         .collect()
 }
 
+/// `∑ factors[w] * words[w]`, lane by lane: the sum `eval_at_point_group` takes of a column's
+/// coefficient words with their basis factors, as the same field elements (canonical, in
+/// `[0, P)`). Per coordinate of the factors, the exact 64-bit products (each below 2^62) of four
+/// words are summed in `u64` lanes and folded once (`x = hi * 2^31 + lo == hi + lo` modulo `P`,
+/// below 2^34) into a wide accumulator, which is folded and reduced once at the end, instead of
+/// a reduced `QM31 * M31` product and a reduced `QM31` sum per word. The accumulators stay below
+/// 2^34 times the number of groups of four words, below 2^62 for any column of fewer than 2^30
+/// words.
+fn basis_dot(words: &[PackedBaseField], factors: &[SecureField]) -> PackedSecureField {
+    let modulus = u64x8::splat(u64::from(P));
+    let fold64 = |x: u64x8| (x & modulus) + (x >> 31);
+    // The even (low) and odd (high) `u32` lanes of a word as `u64` lanes. The x86 product reads
+    // only the low half of each lane, so the even lanes are not masked there.
+    let split = |v: PackedBaseField| {
+        let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(v));
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        let even = w;
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        let even = w & u64x8::splat(0xFFFF_FFFF);
+        [even, w >> 32]
+    };
+    // The product of the low halves of the lanes of `a` with `c` (below 2^31).
+    let mul32 = |a: u64x8, c: u32| -> u64x8 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            use std::arch::x86_64::{__m256i, _mm256_mul_epu32, _mm256_set1_epi32};
+            let [a0, a1]: [__m256i; 2] = transmute(a);
+            let c = _mm256_set1_epi32(c as i32);
+            transmute([_mm256_mul_epu32(a0, c), _mm256_mul_epu32(a1, c)])
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            a * u64x8::splat(u64::from(c))
+        }
+    };
+    let coordinates = |f: &SecureField| [f.0.0.0, f.0.1.0, f.1.0.0, f.1.1.0];
+    // Per coordinate, the even and the odd lanes.
+    let mut acc = [[u64x8::splat(0); 2]; 4];
+    let mut add_group = |words: [PackedBaseField; 4], factors: [[u32; 4]; 4]| {
+        let lanes = words.map(split);
+        for (k, acc) in acc.iter_mut().enumerate() {
+            let mut even = mul32(lanes[0][0], factors[0][k]);
+            let mut odd = mul32(lanes[0][1], factors[0][k]);
+            for j in 1..4 {
+                even += mul32(lanes[j][0], factors[j][k]);
+                odd += mul32(lanes[j][1], factors[j][k]);
+            }
+            acc[0] += fold64(even);
+            acc[1] += fold64(odd);
+        }
+    };
+    let factors = &factors[..words.len()];
+    let word_groups = words.chunks_exact(4);
+    let factor_groups = factors.chunks_exact(4);
+    let (word_rest, factor_rest) = (word_groups.remainder(), factor_groups.remainder());
+    for (words, factors) in zip(word_groups, factor_groups) {
+        add_group(
+            std::array::from_fn(|j| words[j]),
+            std::array::from_fn(|j| coordinates(&factors[j])),
+        );
+    }
+    if !word_rest.is_empty() {
+        // The missing terms are zero words with zero factors.
+        add_group(
+            std::array::from_fn(|j| {
+                word_rest.get(j).copied().unwrap_or_else(PackedBaseField::zero)
+            }),
+            std::array::from_fn(|j| factor_rest.get(j).map_or([0; 4], coordinates)),
+        );
+    }
+    // A sum below 2^62 folds to below 2^31 + 2^31 = 2P: one fold, then reduce to [0, P).
+    let pack = |[even, odd]: [u64x8; 2]| {
+        let packed = fold64(even) | (fold64(odd) << 32);
+        let lanes = bytemuck::cast::<[u64; 8], PackedBaseField>(packed.to_array());
+        PackedBaseField::reduce_simd(lanes.into_simd())
+    };
+    PackedSecureField::from_packed_m31s(acc.map(pack))
+}
+
 impl PolyOps for SimdBackend {
     // The twiddles type is i32, and not BaseField. This is because the fast AVX mul implementation
     //  requires one of the numbers to be shifted left by 1 bit. This is not a reduced
@@ -500,23 +579,11 @@ impl PolyOps for SimdBackend {
                 words
                     .par_chunks(CHUNK)
                     .zip(basis.par_chunks(CHUNK))
-                    .map(|(words, basis)| {
-                        let mut sum = PackedSecureField::zeroed();
-                        for (&word, &factor) in zip(words, basis) {
-                            sum += PackedSecureField::broadcast(factor) * word;
-                        }
-                        sum
-                    })
+                    .map(|(words, basis)| basis_dot(words, basis))
                     .sum()
             };
             #[cfg(not(feature = "parallel"))]
-            let sum = {
-                let mut sum = PackedSecureField::zeroed();
-                for (&word, &factor) in zip(words, &basis) {
-                    sum += PackedSecureField::broadcast(factor) * word;
-                }
-                sum
-            };
+            let sum = basis_dot(words, &basis);
             (sum * twiddle_lows).pointwise_sum()
         };
         #[cfg(feature = "parallel")]
@@ -2334,6 +2401,49 @@ impl PrefixPlan {
             },
         }
     }
+}
+
+/// The deferred-reduction basis dot is the reduced per-word sum, including extreme values (`P`
+/// words, the largest factors) and lengths that leave a partial group of four.
+#[test]
+fn basis_dot_matches_reduced_sum() {
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+
+    use crate::core::fields::cm31::CM31;
+    use crate::core::fields::qm31::QM31;
+
+    let mut rng = SmallRng::seed_from_u64(7);
+    let max = BaseField::from_u32_unchecked(P - 1);
+    for len in [1usize, 2, 3, 4, 5, 7, 8, 63, 64, 1000, 4096] {
+        for extreme in [false, true] {
+            let words: Vec<PackedBaseField> = (0..len)
+                .map(|_| {
+                    PackedBaseField::from_array(std::array::from_fn(|_| {
+                        if extreme { max } else { rng.random() }
+                    }))
+                })
+                .collect();
+            let factors: Vec<SecureField> = (0..len + 3)
+                .map(|_| {
+                    if extreme {
+                        QM31(CM31(max, max), CM31(max, max))
+                    } else {
+                        rng.random()
+                    }
+                })
+                .collect();
+            let mut expected = PackedSecureField::zeroed();
+            for (&word, &factor) in zip(&words, &factors) {
+                expected += PackedSecureField::broadcast(factor) * word;
+            }
+            assert_eq!(basis_dot(&words, &factors).to_array(), expected.to_array(), "len {len}");
+        }
+    }
+    // Unreduced words equal to `P` (zero) are accepted as the per-word products accept them.
+    let words = vec![unsafe { PackedBaseField::from_simd_unchecked(Simd::splat(P)) }; 9];
+    let factors: Vec<SecureField> = (0..9).map(|_| rng.random()).collect();
+    assert_eq!(basis_dot(&words, &factors).to_array(), [SecureField::zero(); N_LANES]);
 }
 
 #[cfg(test)]

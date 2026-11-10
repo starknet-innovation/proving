@@ -42,5 +42,6 @@ impl Backend for SimdBackend {}
 impl BackendForChannel<Blake2sMerkleChannel> for SimdBackend {}
 impl BackendForChannel<Blake2sM31MerkleChannel> for SimdBackend {}
 impl BackendForChannel<Keccak256MerkleChannel> for SimdBackend {}
+pub mod dot;
 #[cfg(not(target_arch = "wasm32"))]
 impl BackendForChannel<Poseidon252MerkleChannel> for SimdBackend {}

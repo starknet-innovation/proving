@@ -8,3 +8,4 @@ pub mod prelude;
 pub mod preprocessed_trace;
 pub mod range_checks;
 pub mod utils;
+pub mod witness_stack;

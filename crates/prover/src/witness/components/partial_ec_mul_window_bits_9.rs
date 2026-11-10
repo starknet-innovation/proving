@@ -38,13 +38,9 @@ impl ClaimGenerator {
         let log_size = packed_size.ilog2() + LOG_N_LANES;
         packed_inputs.resize(packed_size, *packed_inputs.first().unwrap());
 
-        // Decreasing this value may cause a stack-overflow during witness generation.
-        // NOTE: This is not autogened, when updating the code, re-add this.
-        // TODO(Ohad): remove.
-        const RAYON_THREAD_STACK_SIZE: usize = 1024 * 1024 * 8;
-        let pool =
-            rayon::ThreadPoolBuilder::new().stack_size(RAYON_THREAD_STACK_SIZE).build().unwrap();
-        let (trace, lookup_data, sub_component_inputs) = pool.install(|| {
+        // Needs 8 MiB stacks, or witness generation may overflow the stack (see
+        // `with_witness_stack`). NOTE: This is not autogened, when updating the code, re-add this.
+        let (trace, lookup_data, sub_component_inputs) = crate::witness::witness_stack::with_witness_stack(|| {
             write_trace_simd(
                 packed_inputs,
                 n_active_rows,

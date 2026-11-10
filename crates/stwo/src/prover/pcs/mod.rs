@@ -45,9 +45,9 @@ pub struct CommitmentSchemeProver<'a, B: BackendForChannel<MC>, MC: MerkleChanne
     /// Whether the trees committed next keep stripes 0 and 1 of their prefix columns for the
     /// composition (see [`CommitmentTreeProver::new_striped`]).
     pub keep_stripe_pair: bool,
-    /// Whether the columns that keep stripe pairs give up their coefficients for the composition
-    /// (they are interpolated again from stripe 0, the pair's first half, once it has read the
-    /// pairs): the pairs then cost twice the coefficients' size instead of three times.
+    /// Whether the columns that keep stripe pairs give up their coefficients (once the
+    /// composition has read the pairs they keep stripe 0, the pair's first half, which the tail
+    /// reads instead): the pairs then cost twice the coefficients' size instead of three times.
     pub release_pair_coefficients: bool,
     /// Pre-allocated base field column pool for polynomial evaluation during commit.
     pub base_column_pool: MaybeOwned<'a, BaseColumnPool<B>>,
@@ -115,8 +115,8 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // preprocessed trees use commit_tree and retain their existing storage behavior.
         for poly in &mut tree.polynomials {
             poly.evals.values.release_zeroed_pages();
-            // The pair determines the column (its first half is stripe 0): the coefficients
-            // are interpolated again once the composition has read it (see `drop_stripe_pairs`).
+            // The pair determines the column (its first half is stripe 0, which the column
+            // keeps once the composition has read the pair, see `drop_stripe_pairs`).
             if self.release_pair_coefficients && !poly.pair_only && poly.holds_stripe_pair() {
                 poly.coeffs = None;
                 poly.pair_only = true;
@@ -198,19 +198,27 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         self.trees.iter().any(|tree| tree.polynomials.iter().any(Poly::holds_stripe_pair))
     }
 
-    /// Frees the stripe pairs the composition read: the columns are again the coefficients alone.
+    /// Frees the stripe pairs the composition read: a column that kept its coefficients is again
+    /// the coefficients alone, one that gave them up keeps stripe 0 (the pair's first half).
     pub fn drop_stripe_pairs(&mut self) {
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
                 let drop_pair = |poly: &mut Poly<B>| {
                     if poly.pair_only {
-                        // The coefficients again, from stripe 0 (the pair's first half).
+                        // Stripe 0 determines the column: the samples, the quotients and the
+                        // decommitment read it as they read any column that keeps only stripe 0,
+                        // so the coefficients are not interpolated again. The pair is shortened
+                        // to its first half in place, and the pages of the second half are given
+                        // back (where the backend supports it; otherwise stripe 0 is copied).
                         let len = poly.evals.values.len() / 2;
-                        let mut stripe0 = Col::<B, BaseField>::zeros(len);
-                        B::copy_block(&poly.evals.values, 0, &mut stripe0, 0, len);
-                        poly.evals.values = stripe0;
+                        if poly.evals.values.truncate(len) {
+                            poly.evals.values.release_spare();
+                        } else {
+                            let mut stripe0 = Col::<B, BaseField>::zeros(len);
+                            B::copy_block(&poly.evals.values, 0, &mut stripe0, 0, len);
+                            poly.evals.values = stripe0;
+                        }
                         poly.pair_only = false;
-                        poly.coeffs = Some(poly.take_regrown_coefficients());
                     } else if poly.holds_stripe_pair() {
                         poly.evals.values = Col::<B, BaseField>::zeros(0);
                     }
@@ -307,7 +315,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             assert_eq!(columns.len(), sampled_points[tree_index].len());
             for (column_index, poly) in columns.iter().enumerate() {
                 let log_size = poly.evals.domain.log_size();
-                if poly.is_sourced() {
+                if poly.regrows_from_source() {
                     sourced.push((tree_index, column_index));
                     continue;
                 }
@@ -344,7 +352,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         let eval_value_group = |((log_size, point), members): ((u32, CirclePoint<SecureField>), Vec<(usize, usize, usize)>)| {
             let evaluations = members
                 .iter()
-                .map(|&(tree, column, _)| &polynomials[tree][column].evals)
+                .map(|&(tree, column, _)| polynomials[tree][column].resident_evals())
                 .collect_vec();
             let values = B::subdomain_eval_group(
                 CanonicCoset::new(log_size),
@@ -543,10 +551,14 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             samples.as_cols_ref().map_cols(|x| x.iter().map(|o| o.value).collect());
         channel.mix_felts(&sampled_values.clone().flatten_cols());
 
-        let columns = self.evaluations();
-        // Columns that store no values are reproduced from their sources: their stripes 0 in
-        // bounded batches, or their combination per size (see
-        // `compute_fri_quotients_with_regrowth`).
+        // The quotients read every column's resident values (a sourced column with evaluated
+        // stripes reads those, see `Poly::resident_evals`). Columns that store no values are
+        // reproduced from their sources: their stripes 0 in bounded batches, or their combination
+        // per size (see `compute_fri_quotients_with_regrowth`).
+        let columns = self
+            .trees
+            .as_ref()
+            .map(|tree| tree.polynomials.iter().map(Poly::resident_evals).collect_vec());
         let polynomials = self.polynomials();
         let sourced = |tree: usize, column: usize| -> &Poly<B> { polynomials[tree][column] };
         print_column_size_histogram::<B, MC>(&columns);
@@ -1390,7 +1402,9 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 }
             }
             // A column that keeps its coefficients and no stripe (see `prove_values`), or a sourced
-            // one, whose coefficients are regrown from its trace values: every row read is
+            // one, whose coefficients are regrown from its trace values even when its stripes 0 and
+            // 1 are evaluated (`Poly::resident_evals`: the prefix path's sums per block of rows cost
+            // more than this fold for these columns' rows): every row read is
             // evaluated from the coefficients at once, folding each tile's most shared bits once
             // for all the rows (`PolyOps::evaluate_rows_from_coefficients`).
             let fold_log_size = poly.coeffs.as_ref().map(|coeffs| coeffs.log_size()).or_else(|| {

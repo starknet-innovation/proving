@@ -12,7 +12,7 @@ use std::io::Write;
 
 use anyhow::{Result, anyhow, ensure};
 use circuit_cairo_verifier::verify::{
-    build_and_fill_cairo_verifier_circuit_with_capacity, prepare_cairo_proof_for_circuit_verifier,
+    fill_cairo_verifier_context, new_cairo_verifier_context, prepare_cairo_proof_for_circuit_verifier,
 };
 use circuit_common::finalize::{add_zk_blinding, pad_context};
 use circuit_prover::prover::{prepare_circuit_proof_for_circuit_verifier, prove_circuit_with_precompute};
@@ -46,10 +46,50 @@ pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out
     // stripe pairs (see `keep_stripe_pair`) take some of it instead.
     #[cfg(unix)]
     stwo::prover::backend::simd::column::LargeBlockCache::set_idle_budget(3000 << 20);
-    let (version, compressed) = rayon::scope(|_| prove_to_bytes(input, witness_start, output_preimage))?;
+    // The proof runs in a pool with the stacks the deep Cairo witness writers need (see
+    // `with_witness_stack`), the default thread count: they then run on its workers instead of
+    // each starting a pool of its own, one thread per core, beside the proof's busy workers.
+    use stwo_cairo_prover::witness::witness_stack::{WITNESS_STACK_SIZE, mark_witness_stack_thread};
+    let pool = rayon::ThreadPoolBuilder::new()
+        .stack_size(WITNESS_STACK_SIZE)
+        .start_handler(|_| mark_witness_stack_thread())
+        .build()
+        .map_err(|e| anyhow!("{e}"))?;
+    let (version, compressed) =
+        pool.install(|| rayon::scope(|_| prove_to_bytes(input, witness_start, output_preimage)))?;
     out.write_all(&version)?;
     out.write_all(&compressed)?;
     Ok(())
+}
+
+/// Maps in the pages of `ranges` on rayon's workers (`MADV_POPULATE_WRITE`, Linux only), 2 MiB
+/// at a time in the order a sequential writer reaches them (each range's chunks interleaved by
+/// their relative position), until `done` is set. It never reads or writes the memory, so the
+/// writer may run beside it; a page the writer reaches first is faulted in by the writer as before.
+fn populate_ahead(ranges: &[(usize, usize)], done: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    const CHUNK: usize = 2 << 20;
+    let mut chunks: Vec<(u64, usize, usize)> = vec![];
+    for &(start, len) in ranges {
+        for offset in (0..len).step_by(CHUNK) {
+            let position = (((offset as u128) << 32) / len as u128) as u64;
+            chunks.push((position, start + offset, CHUNK.min(len - offset)));
+        }
+    }
+    chunks.sort_unstable_by_key(|chunk| chunk.0);
+    let next = AtomicUsize::new(0);
+    (0..rayon::current_num_threads()).into_par_iter().for_each(|_| loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= chunks.len() || done.load(Ordering::Relaxed) {
+            return;
+        }
+        stwo::prover::backend::simd::column::populate_range(chunks[i].1, chunks[i].2);
+    });
 }
 
 /// The version prefix and the compressed recursive proof.
@@ -99,28 +139,55 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
             stwo::prover::backend::simd::column::hold_trims(false);
             let (context, ()) = rayon::join(
                 || {
-                    build_and_fill_cairo_verifier_circuit_with_capacity(
-                        &precomputes.cairo_verifier_config,
-                        proof,
-                        aux,
-                        output_hash,
+                    let mut context = new_cairo_verifier_context(
                         precomputes.preprocessed_circuit.n_vars,
                         &precomputes.preprocessed_circuit.gate_counts,
+                    );
+                    // The fill writes its reserved values and gates on one thread, which took each
+                    // of their first-touch page faults in turn: their pages are mapped in on the
+                    // idle workers instead, ahead of the fill (see `populate_ahead`).
+                    let ranges = context.reserved_ranges();
+                    let done = std::sync::atomic::AtomicBool::new(false);
+                    rayon::join(
+                        || {
+                            let context = fill_cairo_verifier_context(
+                                context,
+                                &precomputes.cairo_verifier_config,
+                                proof,
+                                aux,
+                                output_hash,
+                            );
+                            done.store(true, std::sync::atomic::Ordering::Relaxed);
+                            context
+                        },
+                        || populate_ahead(&ranges, &done),
                     )
+                    .0
                 },
                 || {
-                    #[cfg(unix)]
-                    stwo::prover::backend::simd::column::trim_heap_now();
-                    // The circuit composition reads the preprocessed columns on the subdomain of
-                    // twice their size: they are public, so their evaluations there are computed
-                    // here, on the workers the mostly sequential fill leaves idle, instead of on
-                    // the circuit leg's path (see `Poly::pair`).
-                    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-                    let tree = &**precomputes.circuit_preprocessed_tree;
-                    let twiddles: &stwo::prover::poly::twiddles::TwiddleTree<_> = &precomputes.twiddles;
-                    tree.polynomials.par_iter().filter(|poly| poly.wants_pair()).for_each(|poly| {
-                        let _ = poly.pair(twiddles);
-                    });
+                    // The trim, which walks every arena on one thread, runs beside the pair
+                    // evaluations instead of ahead of them.
+                    rayon::join(
+                        || {
+                            #[cfg(unix)]
+                            stwo::prover::backend::simd::column::trim_heap_now();
+                        },
+                        || {
+                            // The circuit composition reads the preprocessed columns on the
+                            // subdomain of twice their size: they are public, so their evaluations
+                            // there are computed here, on the workers the mostly sequential fill
+                            // leaves idle, instead of on the circuit leg's path (see `Poly::pair`).
+                            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+                            let tree = &**precomputes.circuit_preprocessed_tree;
+                            let twiddles: &stwo::prover::poly::twiddles::TwiddleTree<_> =
+                                &precomputes.twiddles;
+                            tree.polynomials.par_iter().filter(|poly| poly.wants_pair()).for_each(
+                                |poly| {
+                                    let _ = poly.pair(twiddles);
+                                },
+                            );
+                        },
+                    );
                 },
             );
             Ok((context, zk_blinding_seed))

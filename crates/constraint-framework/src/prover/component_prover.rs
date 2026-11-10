@@ -322,6 +322,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
             trace_cols,
             coords,
             random_coeff_powers,
+            &super::simd_domain::coeff_columns(random_coeff_powers),
             eval_log_size,
             denom_inv,
             window,
@@ -338,6 +339,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         trace_cols: &TreeVec<Vec<&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>>,
         coords: [&mut [PackedBaseField]; SECURE_EXTENSION_DEGREE],
         random_coeff_powers: &[SecureField],
+        coeff_columns: &[[BaseField; SECURE_EXTENSION_DEGREE]],
         eval_log_size: u32,
         denom_inv: &[BaseField],
         window: Option<(usize, isize)>,
@@ -399,6 +401,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                 eval.window = window;
                 eval.block = block;
                 eval.deferred = std::mem::take(deferred);
+                eval.coeff_columns = coeff_columns;
                 let mut eval = self_eval.evaluate(eval);
                 let row_res = eval.row_result();
                 *fracs = std::mem::take(&mut eval.logup.fracs);
@@ -493,6 +496,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
         let [mut accum] =
             evaluation_accumulator.columns([(eval_domain.log_size(), self.n_constraints())]);
         accum.random_coeff_powers.reverse();
+        let coeff_columns = super::simd_domain::coeff_columns(&accum.random_coeff_powers);
         let owned;
         let twiddles = match trace.twiddles {
             Some(twiddles) => twiddles,
@@ -678,6 +682,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                         &columns,
                         [a, b, c, d],
                         random_coeff_powers,
+                        &coeff_columns,
                         eval_domain.log_size(),
                         &denom_inv,
                         None,
@@ -714,6 +719,7 @@ impl<E: FrameworkEval + Sync> FrameworkComponent<E> {
                     &columns,
                     coords,
                     &accum.random_coeff_powers,
+                    &coeff_columns,
                     eval_domain.log_size(),
                     &denom_inv,
                     None,

@@ -109,6 +109,22 @@ impl<B: Backend> Poly<B> {
         self.coeffs.is_none() && self.source.is_some() && self.evals.values.is_empty()
     }
 
+    /// The column's values on a prefix of its domain, as the out-of-domain samples and the
+    /// quotients read them: its own, or, for a sourced column whose stripes 0 and 1 were
+    /// evaluated for the composition (see [`Self::pair`]), those.
+    pub fn resident_evals(&self) -> &CircleEvaluation<B, BaseField, BitReversedOrder> {
+        match self.pair_cache.get() {
+            Some(pair) if self.is_sourced() => pair,
+            _ => &self.evals,
+        }
+    }
+
+    /// Whether the out-of-domain samples and the quotients reproduce the column's values from its
+    /// source: it is sourced and holds no evaluated stripes (see [`Self::resident_evals`]).
+    pub fn regrows_from_source(&self) -> bool {
+        self.is_sourced() && self.pair_cache.get().is_none()
+    }
+
     /// The log size of the column's coefficients.
     pub fn coefficients_log_size(&self) -> u32 {
         if self.pair_only {

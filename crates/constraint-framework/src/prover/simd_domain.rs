@@ -9,6 +9,7 @@ use stwo::core::utils::offset_bit_reversed_circle_domain_index;
 use stwo::prover::backend::Column;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::column::VeryPackedBaseColumn;
+use stwo::prover::backend::simd::dot::VeryPackedM31Dot;
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 use stwo::prover::backend::simd::very_packed_m31::{
     LOG_N_VERY_PACKED_ELEMS, VeryPackedBaseField, VeryPackedSecureField,
@@ -43,6 +44,26 @@ pub struct SimdDomainEvaluator<'a> {
     /// Base-field constraints not yet added to `row_res`, with their coefficient indices (see
     /// [`Self::flush_deferred`]).
     pub deferred: Vec<(VeryPackedBaseField, u32)>,
+    /// When not empty, [`coeff_columns`] of `random_coeff_powers`: secure-field constraints are
+    /// deferred too, as their four coordinates, and a deferred index is `4 * constraint + k`.
+    pub coeff_columns: &'a [[BaseField; SECURE_EXTENSION_DEGREE]],
+}
+
+/// Per constraint and basis element `e_k` of the secure field (`k` in `0..4`), the coordinates of
+/// `coeff * e_k`: a secure value with coordinates `v_k` times `coeff` is `∑ v_k * (coeff * e_k)`,
+/// so each coordinate of the product is a sum of base field products.
+pub fn coeff_columns(random_coeff_powers: &[SecureField]) -> Vec<[BaseField; SECURE_EXTENSION_DEGREE]> {
+    let one = BaseField::from(1);
+    let zero = BaseField::from(0);
+    random_coeff_powers
+        .iter()
+        .flat_map(|&coeff| {
+            (0..SECURE_EXTENSION_DEGREE).map(move |k| {
+                let e = SecureField::from_m31_array(std::array::from_fn(|i| if i == k { one } else { zero }));
+                (coeff * e).to_m31_array()
+            })
+        })
+        .collect()
 }
 
 /// The deferred constraints added to the row result at a time: their values stay in L1.
@@ -60,14 +81,19 @@ impl<'a> SimdDomainEvaluator<'a> {
         if self.deferred.is_empty() {
             return;
         }
+        // The products of a coordinate are summed exactly in 64-bit lanes and reduced once.
         let coords = self.row_res.into_very_packed_m31s();
+        let deferred = &self.deferred;
         let coords: [VeryPackedBaseField; SECURE_EXTENSION_DEGREE] = std::array::from_fn(|j| {
-            let mut acc = coords[j];
-            for &(value, index) in &self.deferred {
-                let coeff = self.random_coeff_powers[index as usize].to_m31_array()[j];
-                acc += value * VeryPackedBaseField::broadcast(coeff);
+            let mut acc = VeryPackedM31Dot::new(coords[j]);
+            if self.coeff_columns.is_empty() {
+                let powers = self.random_coeff_powers;
+                acc.add_products(deferred.iter().map(|&(v, e)| (v, powers[e as usize].to_m31_array()[j])));
+            } else {
+                let columns = self.coeff_columns;
+                acc.add_products(deferred.iter().map(|&(v, e)| (v, columns[e as usize][j])));
             }
-            acc
+            acc.reduce()
         });
         self.row_res = VeryPackedSecureField::from_very_packed_m31s(coords);
         self.deferred.clear();
@@ -105,6 +131,7 @@ impl<'a> SimdDomainEvaluator<'a> {
             block: 0,
             logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size),
             deferred: Vec::new(),
+            coeff_columns: &[],
         }
     }
 
@@ -129,6 +156,7 @@ impl<'a> SimdDomainEvaluator<'a> {
             block: 0,
             logup,
             deferred: Vec::new(),
+            coeff_columns: &[],
         }
     }
 
@@ -217,10 +245,20 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
         // A base-field constraint (its upper coordinates are known zeros once inlined) is
         // deferred; a secure-field one is added at once.
         let value = Self::EF::from(constraint);
+        let stride = if self.coeff_columns.is_empty() { 1 } else { SECURE_EXTENSION_DEGREE };
+        let index = (self.constraint_index * stride) as u32;
         match as_base(&value) {
             Some(base) => {
-                self.deferred.push((base, self.constraint_index as u32));
-                if self.deferred.len() == DEFERRED_CHUNK {
+                self.deferred.push((base, index));
+                if self.deferred.len() >= DEFERRED_CHUNK {
+                    self.flush_deferred();
+                }
+            }
+            None if stride != 1 => {
+                for (k, coord) in value.into_very_packed_m31s().into_iter().enumerate() {
+                    self.deferred.push((coord, index + k as u32));
+                }
+                if self.deferred.len() >= DEFERRED_CHUNK {
                     self.flush_deferred();
                 }
             }
@@ -315,11 +353,17 @@ fn combine_by_coordinates(
     let start = usize::from(!values.is_empty() && alpha_powers[0] == SecureField::from(BaseField::from(1)));
     let z = z.to_m31_array();
     VeryPackedSecureField::from_very_packed_m31s(std::array::from_fn(|j| {
-        let mut acc = if start == 1 && j == 0 { values[0] } else { VeryPackedBaseField::zero() };
-        for (value, power) in values[start..].iter().zip(&alpha_powers[start..]) {
-            acc += *value * VeryPackedBaseField::broadcast(power.to_m31_array()[j]);
+        // Summed exactly in 64-bit lanes and reduced once: the same field element.
+        let init = if start == 1 && j == 0 { values[0] } else { VeryPackedBaseField::zero() };
+        if values.len() <= start {
+            // No product: the value as it is (a raw `P` stays `P`, as before).
+            return init - VeryPackedBaseField::broadcast(z[j]);
         }
-        acc - VeryPackedBaseField::broadcast(z[j])
+        let mut acc = VeryPackedM31Dot::new(init);
+        acc.add_products(
+            values[start..].iter().zip(&alpha_powers[start..]).map(|(v, p)| (*v, p.to_m31_array()[j])),
+        );
+        acc.reduce() - VeryPackedBaseField::broadcast(z[j])
     }))
 }
 
@@ -397,3 +441,5 @@ fn offset_rows(first: usize, domain_log_size: u32, eval_log_size: u32, offset: i
         )));
     rows
 }
+
+mod coeff_columns_patch_tests;

@@ -223,6 +223,29 @@ impl<Value: IValue> Context<Value> {
         self.values.reserve(n);
     }
 
+    /// The address ranges (start, bytes) of the reserved room for values and gates, the spare
+    /// capacity of their vectors: for a caller that maps their pages in ahead of the writes.
+    pub fn reserved_ranges(&mut self) -> Vec<(usize, usize)> {
+        fn range<T>(v: &mut Vec<T>) -> (usize, usize) {
+            let spare = v.spare_capacity_mut();
+            (spare.as_ptr() as usize, std::mem::size_of_val(spare))
+        }
+        let c = &mut self.circuit;
+        vec![
+            range(&mut self.values),
+            range(&mut c.add),
+            range(&mut c.sub),
+            range(&mut c.mul),
+            range(&mut c.pointwise_mul),
+            range(&mut c.eq),
+            range(&mut c.triple_xor),
+            range(&mut c.m31_to_u32),
+            range(&mut c.blake_g_gate),
+            range(&mut c.permutation),
+            range(&mut c.output),
+        ]
+    }
+
     /// Reserves room for `counts` more gates of each kind, in the order add, sub, mul,
     /// pointwise_mul, eq, triple_xor, m31_to_u32, blake_g_gate, permutation, output: a gate vector
     /// filled to that size is then written once instead of being copied at every growth.

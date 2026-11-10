@@ -120,6 +120,19 @@ pub(crate) fn release_pages<T>(spare: &[std::mem::MaybeUninit<T>]) {
     advise_range(start, len, MADV_DONTNEED);
 }
 
+/// Maps in the whole pages inside `[start, start + len)` (`MADV_POPULATE_WRITE`) without reading
+/// or writing them, so that a later write finds them resident. What the range holds does not
+/// change, so this may run while another thread writes into the range. A hint: a no-op off Linux.
+pub fn populate_range(start: usize, len: usize) {
+    const PAGE: usize = 4096;
+    const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
+    let first = (start + PAGE - 1) & !(PAGE - 1);
+    let end = (start + len) & !(PAGE - 1);
+    if end > first {
+        advise_range(first, end - first, MADV_POPULATE_WRITE);
+    }
+}
+
 /// The whole 4 KiB pages inside `[addr, addr + bytes)`, or an empty range for a buffer below
 /// 2 MiB, which is not worth a system call.
 fn whole_pages(addr: usize, bytes: usize) -> (usize, usize) {

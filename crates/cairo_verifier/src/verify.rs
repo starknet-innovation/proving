@@ -158,11 +158,29 @@ pub fn build_and_fill_cairo_verifier_circuit_with_capacity(
     n_vars: usize,
     gate_counts: &[usize; 10],
 ) -> FinalizedContext<QM31> {
-    let config = &verifier_config.proof_config;
+    let context = new_cairo_verifier_context(n_vars, gate_counts);
+    fill_cairo_verifier_context(context, verifier_config, proof, serialized_aux_data, output_hash)
+}
 
+/// The empty context of [`build_and_fill_cairo_verifier_circuit_with_capacity`], its values and
+/// gates reserved.
+pub fn new_cairo_verifier_context(n_vars: usize, gate_counts: &[usize; 10]) -> Context<QM31> {
     let mut context = Context::new(N_RESERVED);
     context.reserve_vars(n_vars);
     context.reserve_gates(gate_counts);
+    context
+}
+
+/// Fills a context from [`new_cairo_verifier_context`]: the rest of
+/// [`build_and_fill_cairo_verifier_circuit_with_capacity`].
+pub fn fill_cairo_verifier_context(
+    mut context: Context<QM31>,
+    verifier_config: &CairoVerifierConfig,
+    proof: Proof<QM31>,
+    serialized_aux_data: Vec<M31>,
+    output_hash: Blake2sHash,
+) -> FinalizedContext<QM31> {
+    let config = &verifier_config.proof_config;
     let statement = CairoStatement::<QM31>::new(
         &mut context,
         serialized_aux_data,
