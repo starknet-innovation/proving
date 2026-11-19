@@ -1,4 +1,4 @@
-//! Sums of products of very packed base field values with base field constants, reduced once.
+//! Dot products of very packed M31 values with M31 constants, reduced once.
 
 use std::simd::{u32x16, u64x8};
 
@@ -6,23 +6,17 @@ use super::m31::{MODULUS, PackedM31};
 use super::very_packed_m31::VeryPackedM31;
 use crate::core::fields::m31::{M31, P};
 
-/// The products added between two folds of a [`VeryPackedM31Dot`]: a folded lane is below 2^34
-/// and each product of two values in `[0, P]` below `(2^31 - 1)^2`, so four of them still fit.
+/// Products between folds: a folded lane is < 2^34, each product < (2^31 - 1)^2; four fit.
 const PRODUCTS_PER_FOLD: usize = 4;
 
-/// `init + ∑ values[i] * coeffs[i]` lane by lane, as exact 64-bit sums: each product is one
-/// widening multiply and one 64-bit add instead of a reduced field product and a reduced field
-/// sum. The lanes are folded (`hi * 2^31 + lo == hi + lo` modulo `P`) every few products and
-/// reduced into `[0, P)` once, by [`Self::reduce`]: the same field element as the reduced sum.
-///
-/// On AVX2 the lanes are kept as the even and the odd `u32` lanes of each 256-bit half (one
-/// `vpmuludq` per four products), elsewhere as the lower and upper eight lanes of each packed
-/// value, zero-extended.
+/// `init + ∑ values[i] * coeffs[i]` per lane as exact u64 sums, folded every few products
+/// (`hi * 2^31 + lo == hi + lo` mod `P`) and reduced once by [`Self::reduce`]. AVX2 keeps each
+/// half's even and odd u32 lanes; elsewhere the low and high eight lanes.
 #[derive(Copy, Clone, Debug)]
 pub struct VeryPackedM31Dot([u64x8; 4]);
 
 impl VeryPackedM31Dot {
-    /// The sum of no products: `init`, every lane in `[0, P]`.
+    /// Starts at `init` (lanes in `[0, P]`).
     #[inline(always)]
     pub fn new(init: VeryPackedM31) -> Self {
         let mut acc = [u64x8::splat(0); 4];
@@ -51,12 +45,12 @@ impl VeryPackedM31Dot {
         }
     }
 
-    /// The sum, every lane reduced into `[0, P)`.
+    /// The sum, lanes in `[0, P)`.
     #[inline(always)]
     pub fn reduce(self) -> VeryPackedM31 {
         let fold = |x: u64x8| (x & u64x8::splat(P as u64)) + (x >> 31);
         VeryPackedM31::from_fn(|p| {
-            // Two folds take a lane below `2^31 + 8`; one conditional subtraction reduces it.
+            // Two folds give < 2^31 + 8; one conditional subtraction reduces.
             let lanes = join(fold(fold(self.0[2 * p])), fold(fold(self.0[2 * p + 1])));
             use std::simd::cmp::SimdOrd;
             // SAFETY: every lane is in `[0, P)`.
@@ -64,7 +58,7 @@ impl VeryPackedM31Dot {
         })
     }
 
-    /// Keeps every lane below 2^34 (the same value modulo `P`).
+    /// Folds every lane below 2^34 (same value mod `P`).
     #[inline(always)]
     fn fold(&mut self) {
         for x in &mut self.0 {
@@ -87,8 +81,7 @@ cfg_if::cfg_if! {
         use std::arch::x86_64::{__m256i, _mm256_mul_epu32};
         use std::mem::transmute;
 
-        /// The even and the odd lanes of each half of `v`, zero-extended:
-        /// `[even(h0), even(h1)], [odd(h0), odd(h1)]`.
+        /// Even and odd lanes of each half: `[even(h0), even(h1)], [odd(h0), odd(h1)]`.
         #[inline(always)]
         fn split(v: u32x16) -> [u64x8; 2] {
             let [h0, h1]: [std::simd::u64x4; 2] = unsafe { transmute::<u32x16, _>(v) };
@@ -96,7 +89,7 @@ cfg_if::cfg_if! {
             [join4(h0 & mask, h1 & mask), join4(h0 >> 32, h1 >> 32)]
         }
 
-        /// The inverse of [`split`], each lane below 2^32.
+        /// Inverse of [`split`] (lanes < 2^32).
         #[inline(always)]
         fn join(even: u64x8, odd: u64x8) -> u32x16 {
             let packed = even | (odd << 32);
@@ -108,7 +101,7 @@ cfg_if::cfg_if! {
             unsafe { transmute::<[std::simd::u64x4; 2], u64x8>([a, b]) }
         }
 
-        /// `split(v) * coeff`, exact: one `vpmuludq` per four lanes.
+        /// `split(v) * coeff`, exact.
         #[inline(always)]
         fn mul_lanes(v: u32x16, coeff: u32) -> [u64x8; 2] {
             let [h0, h1]: [__m256i; 2] = unsafe { transmute::<u32x16, _>(v) };
@@ -122,7 +115,7 @@ cfg_if::cfg_if! {
     } else {
         use std::simd::num::SimdUint;
 
-        /// The lower and the upper eight lanes of `v`, zero-extended.
+        /// Low and high eight lanes, zero-extended.
         #[inline(always)]
         fn split(v: u32x16) -> [u64x8; 2] {
             let lo = std::simd::simd_swizzle!(v, [0, 1, 2, 3, 4, 5, 6, 7]);
@@ -130,14 +123,14 @@ cfg_if::cfg_if! {
             [lo.cast::<u64>(), hi.cast::<u64>()]
         }
 
-        /// The inverse of [`split`], each lane below 2^32.
+        /// Inverse of [`split`] (lanes < 2^32).
         #[inline(always)]
         fn join(lo: u64x8, hi: u64x8) -> u32x16 {
             let (lo, hi) = (lo.cast::<u32>(), hi.cast::<u32>());
             std::simd::simd_swizzle!(lo, hi, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
         }
 
-        /// `split(v) * coeff`, exact (widening multiplies).
+        /// `split(v) * coeff`, exact.
         #[inline(always)]
         fn mul_lanes(v: u32x16, coeff: u32) -> [u64x8; 2] {
             let [lo, hi] = split(v);

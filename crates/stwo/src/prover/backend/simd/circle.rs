@@ -378,19 +378,45 @@ fn twin_coset_weight_chunk(
         .collect()
 }
 
-/// `∑ factors[w] * words[w]`, lane by lane: the sum `eval_at_point_group` takes of a column's
-/// coefficient words with their basis factors, as the same field elements (canonical, in
-/// `[0, P)`). Per coordinate of the factors, the exact 64-bit products (each below 2^62) of four
-/// words are summed in `u64` lanes and folded once (`x = hi * 2^31 + lo == hi + lo` modulo `P`,
-/// below 2^34) into a wide accumulator, which is folded and reduced once at the end, instead of
-/// a reduced `QM31 * M31` product and a reduced `QM31` sum per word. The accumulators stay below
-/// 2^34 times the number of groups of four words, below 2^62 for any column of fewer than 2^30
-/// words.
+/// `∑ weights[w] * values[w]` per lane, reduced as in [`basis_dot`]; exact below 2^30 words.
+fn weighted_dot(weights: &[PackedSecureField], values: &[PackedBaseField]) -> PackedSecureField {
+    let low_half = u64x8::splat(0xFFFF_FFFF);
+    let modulus = u64x8::splat(u64::from(P));
+    let fold64 = |x: u64x8| (x & modulus) + (x >> 31);
+    let split = |v: PackedBaseField| {
+        let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(v));
+        [w & low_half, w >> 32]
+    };
+    let mut acc = [[u64x8::splat(0); 2]; 4];
+    for (weights, values) in weights.chunks(4).zip(values.chunks(4)) {
+        let mut sum = [[u64x8::splat(0); 2]; 4];
+        for (weight, &value) in zip(weights, values) {
+            let value = split(value);
+            for (sum, weight) in sum.iter_mut().zip(weight.into_packed_m31s()) {
+                let weight = split(weight);
+                sum[0] += value[0] * weight[0];
+                sum[1] += value[1] * weight[1];
+            }
+        }
+        for (acc, sum) in acc.iter_mut().zip(sum) {
+            acc[0] += fold64(sum[0]);
+            acc[1] += fold64(sum[1]);
+        }
+    }
+    let pack = |[even, odd]: [u64x8; 2]| {
+        let packed = fold64(even) | (fold64(odd) << 32);
+        let lanes = bytemuck::cast::<[u64; 8], PackedBaseField>(packed.to_array());
+        PackedBaseField::reduce_simd(lanes.into_simd())
+    };
+    PackedSecureField::from_packed_m31s(acc.map(pack))
+}
+
+/// `∑ factors[w] * words[w]` per lane in `[0, P)`: each four exact u64 products are folded
+/// (`hi * 2^31 + lo == hi + lo` mod `P`, < 2^34) into a sum < 2^62 below 2^30 words.
 fn basis_dot(words: &[PackedBaseField], factors: &[SecureField]) -> PackedSecureField {
     let modulus = u64x8::splat(u64::from(P));
     let fold64 = |x: u64x8| (x & modulus) + (x >> 31);
-    // The even (low) and odd (high) `u32` lanes of a word as `u64` lanes. The x86 product reads
-    // only the low half of each lane, so the even lanes are not masked there.
+    // Even and odd u32 lanes as u64 (AVX2 multiplies low halves: no mask).
     let split = |v: PackedBaseField| {
         let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(v));
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -399,7 +425,7 @@ fn basis_dot(words: &[PackedBaseField], factors: &[SecureField]) -> PackedSecure
         let even = w & u64x8::splat(0xFFFF_FFFF);
         [even, w >> 32]
     };
-    // The product of the low halves of the lanes of `a` with `c` (below 2^31).
+    // Low halves of `a`'s lanes times `c` (< 2^31).
     let mul32 = |a: u64x8, c: u32| -> u64x8 {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         unsafe {
@@ -414,7 +440,7 @@ fn basis_dot(words: &[PackedBaseField], factors: &[SecureField]) -> PackedSecure
         }
     };
     let coordinates = |f: &SecureField| [f.0.0.0, f.0.1.0, f.1.0.0, f.1.1.0];
-    // Per coordinate, the even and the odd lanes.
+    // [coordinate][even, odd].
     let mut acc = [[u64x8::splat(0); 2]; 4];
     let mut add_group = |words: [PackedBaseField; 4], factors: [[u32; 4]; 4]| {
         let lanes = words.map(split);
@@ -440,7 +466,7 @@ fn basis_dot(words: &[PackedBaseField], factors: &[SecureField]) -> PackedSecure
         );
     }
     if !word_rest.is_empty() {
-        // The missing terms are zero words with zero factors.
+        // Padded with zero words and factors.
         add_group(
             std::array::from_fn(|j| {
                 word_rest.get(j).copied().unwrap_or_else(PackedBaseField::zero)
@@ -448,7 +474,7 @@ fn basis_dot(words: &[PackedBaseField], factors: &[SecureField]) -> PackedSecure
             std::array::from_fn(|j| factor_rest.get(j).map_or([0; 4], coordinates)),
         );
     }
-    // A sum below 2^62 folds to below 2^31 + 2^31 = 2P: one fold, then reduce to [0, P).
+    // < 2^62 folds to < 2P, then one reduction to [0, P).
     let pack = |[even, odd]: [u64x8; 2]| {
         let packed = fold64(even) | (fold64(odd) << 32);
         let lanes = bytemuck::cast::<[u64; 8], PackedBaseField>(packed.to_array());
@@ -745,8 +771,7 @@ impl PolyOps for SimdBackend {
                 .collect::<Vec<_>>();
             for (accumulator, eval) in accumulators.iter_mut().zip(evals) {
                 let values = &eval.values.data[start..start + chunk_len];
-                *accumulator += zip(&chunk_weights, values)
-                    .fold(PackedSecureField::zero(), |sum, (weight, value)| sum + *weight * *value);
+                *accumulator += weighted_dot(&chunk_weights, values);
             }
             accumulators
         };
@@ -790,8 +815,7 @@ impl PolyOps for SimdBackend {
             let weights = twin_coset_weight_chunk(&setup, chunk_index, chunk_len);
             for (accumulator, eval) in accumulators.iter_mut().zip(evals) {
                 let values = &eval.values.data[start..start + chunk_len];
-                *accumulator += zip(&weights, values)
-                    .fold(PackedSecureField::zero(), |sum, (weight, value)| sum + *weight * *value);
+                *accumulator += weighted_dot(&weights, values);
             }
             accumulators
         };
@@ -910,7 +934,7 @@ impl PolyOps for SimdBackend {
     }
 
     fn prepare_source_reads(log_size: u32, domain: CircleDomain, targets: &[(usize, Vec<usize>)]) {
-        if log_size >= 10 {
+        if log_size >= 10 && RunPlan::get(log_size, domain, targets, PlanInput::TraceCoset).is_none() {
             PrefixPlan::get(log_size, domain, targets, PlanInput::TraceCoset);
         }
     }
@@ -987,8 +1011,7 @@ impl PolyOps for SimdBackend {
         evaluate_block_into(poly, domain, twiddles, log_block, block, dst)
     }
 
-    /// The stripes in one transform: the coefficients are read once for all of them, each stripe
-    /// with the twiddles [`Self::evaluate_stripe_into`] uses for it.
+    /// Several [`Self::evaluate_stripe_into`] stripes in one pass over the coefficients.
     fn evaluate_stripes_into(
         poly: &CircleCoefficients<Self>,
         domain: CircleDomain,
@@ -1006,8 +1029,7 @@ impl PolyOps for SimdBackend {
             Self::copy_block(&full.values, first * len, dst, 0, count * len);
             return;
         }
-        // Every word of `dst` is written next: map its pages in one call (huge pages where the
-        // kernel allows) instead of one fault per page from every worker at once.
+        // All of `dst` is written next: map its pages in one call, not a fault per page.
         advise_pages(&dst.data, true);
         let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
         let stripe_twiddles = (first..first + count)
@@ -1608,12 +1630,10 @@ pub fn evaluate_rows_from_coefficients(
             };
             for (block, acc) in plan.blocks.iter().zip(acc.iter_mut()) {
                 let lanes = &leaf_lanes[block.leaf * low..(block.leaf + 1) * low];
-                // One weight per lane, zipped with the lanes: the loop carries no bounds checks
-                // and each weight broadcasts straight from memory.
+                // Zipped with the lanes: no bounds checks.
                 let weights = &block.low_weights[..low];
                 let mut groups = lanes.chunks_exact(4).zip(weights.chunks_exact(4));
-                // The first group: lane 0 has weight one and is taken as it is (`split` already
-                // masked both halves, so no mask is needed), and the sums start from its fold.
+                // Lane 0 has weight one and `split` already masked it: taken as is.
                 let (group, w) = groups.next().unwrap();
                 let mut sum_even = group[0][0];
                 let mut sum_odd = group[0][1];
@@ -1995,8 +2015,14 @@ fn evaluate_from_values(
     input: PlanInput,
 ) -> Vec<Vec<BaseField>> {
     let n = log_size;
-    let plan = PrefixPlan::get(n, domain, targets, input);
     let n_vecs = 1usize << (n - LOG_N_LANES);
+    if bary && input != PlanInput::Coefficients {
+        if let Some(plan) = RunPlan::get(n, domain, targets, input) {
+            let values = prefix.unwrap_or(&scratch.data[..n_vecs]);
+            return evaluate_from_runs(&plan, n, &values[..n_vecs], targets);
+        }
+    }
+    let plan = PrefixPlan::get(n, domain, targets, input);
     // 1. The first five inverse layers of chunk `index` (two vectors): the loop body of
     //    `ifft::ifft_lower_with_vecwise` for its first five layers.
     let twiddles = if input == PlanInput::Coefficients { vec![] } else { plan.twiddles() };
@@ -2163,6 +2189,7 @@ static PREFIX_PLANS: std::sync::LazyLock<
 pub fn clear_stripe_caches() {
     SUBDOMAIN_TWIDDLES.lock().unwrap().clear();
     PREFIX_PLANS.lock().unwrap().clear();
+    RUN_PLANS.lock().unwrap().clear();
     COEFFICIENT_PLANS.lock().unwrap().clear();
 }
 
@@ -2296,7 +2323,7 @@ impl PrefixPlan {
         };
         let sub_twiddles = SimdBackend::subdomain_twiddles(subdomain.half_coset);
         let twiddles = domain_line_twiddles_from_tree(subdomain, &sub_twiddles.itwiddles);
-        // The blocks are independent: built in parallel, collected in target and row order.
+        // Blocks in target and row order.
         let mut specs: Vec<(usize, usize, usize, &[usize])> = vec![];
         for (target, (stripe, rows)) in targets.iter().enumerate() {
             let mut start = 0;
@@ -2350,9 +2377,7 @@ impl PrefixPlan {
                     own: factors.iter().map(|f| [f[4], f[3], f[2], f[1], f[0]]).collect(),
                 }
         };
-        #[cfg(feature = "parallel")]
-        let mut blocks: Vec<PrefixBlock> = specs.par_iter().map(make_block).collect();
-        #[cfg(not(feature = "parallel"))]
+        // Sequential: see `decommit_striped`.
         let mut blocks: Vec<PrefixBlock> = specs.iter().map(make_block).collect();
         drop(twiddles);
         let tile_bits = 6.min(n - low);
@@ -2372,9 +2397,6 @@ impl PrefixPlan {
                 run
             };
             let n_runs = (n_blocks << (n - low)) / tile;
-            #[cfg(feature = "parallel")]
-            let runs: Vec<[u32; 64]> = (0..n_runs).into_par_iter().map(run).collect();
-            #[cfg(not(feature = "parallel"))]
             let runs: Vec<[u32; 64]> = (0..n_runs).map(run).collect();
             let tile_weights: Vec<u32> = if tile == 64 {
                 runs.into_flattened()
@@ -2403,8 +2425,238 @@ impl PrefixPlan {
     }
 }
 
-/// The deferred-reduction basis dot is the reduced per-word sum, including extreme values (`P`
-/// words, the largest factors) and lengths that leave a partial group of four.
+/// Cached [`RunPlan::get`] results (`None`: use a [`PrefixPlan`]).
+static RUN_PLANS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, Option<std::sync::Arc<RunPlan>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// A [`PrefixPlan`] for long aligned runs of 2^R rows, which share every factor from the R-th on:
+/// R inverse layers per chunk, then one weighted pass per run folds the rest.
+struct RunPlan {
+    sub_twiddles: std::sync::Arc<TwiddleTree<SimdBackend>>,
+    subdomain: CircleDomain,
+    /// R, the log size of a run and of a chunk.
+    run_bits: u32,
+    /// Per run, its blocks of 32 rows.
+    runs: Vec<Vec<RunBlock>>,
+    /// [`fold_weights`] as `[group of 4 chunks][run][chunk]`.
+    weights: Vec<u32>,
+    scale: BaseField,
+}
+
+struct RunBlock {
+    target: usize,
+    rows: std::ops::Range<usize>,
+    /// Factors of layers R - 1 down to 5 (2^R values to 32).
+    mid: Vec<BaseField>,
+    /// Each row's own factors, highest first.
+    own: Vec<[BaseField; 5]>,
+}
+
+impl RunPlan {
+    /// The cheapest run size's plan, `None` for runs of 32. Cost model: 4 per run, 6 per layer > 5.
+    fn get(
+        n: u32,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+        input: PlanInput,
+    ) -> Option<std::sync::Arc<Self>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (n, domain.log_size(), domain.half_coset.initial_index.0, targets, input).hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some(plan) = RUN_PLANS.lock().unwrap().get(&key) {
+            return plan.clone();
+        }
+        let n_runs = |r: u32| -> usize {
+            targets.iter().map(|(_, rows)| rows.chunk_by(|a, b| a >> r == b >> r).count()).sum()
+        };
+        let run_bits = (PrefixPlan::LOW..=10.min(n - 2))
+            .min_by_key(|&r| n_runs(r) * 4 + (r - PrefixPlan::LOW) as usize * 6)
+            .unwrap();
+        // Planned outside the lock.
+        let plan = (run_bits > PrefixPlan::LOW)
+            .then(|| std::sync::Arc::new(Self::new(n, domain, targets, input, run_bits)));
+        RUN_PLANS.lock().unwrap().entry(key).or_insert(plan).clone()
+    }
+
+    fn new(
+        n: u32,
+        domain: CircleDomain,
+        targets: &[(usize, Vec<usize>)],
+        input: PlanInput,
+        run_bits: u32,
+    ) -> Self {
+        let (low, r) = (PrefixPlan::LOW as usize, run_bits as usize);
+        let subdomain = match input {
+            PlanInput::TraceCoset => CanonicCoset::new(n).circle_domain(),
+            _ => domain.split(domain.log_size() - n).0,
+        };
+        let sub_twiddles = SimdBackend::subdomain_twiddles(subdomain.half_coset);
+        let twiddles = domain_line_twiddles_from_tree(subdomain, &sub_twiddles.itwiddles);
+        let mut specs: Vec<(usize, usize, usize, &[usize])> = vec![];
+        for (target, (stripe, rows)) in targets.iter().enumerate() {
+            let mut start = 0;
+            for run in rows.chunk_by(|a, b| a >> r == b >> r) {
+                specs.push((target, *stripe, start, run));
+                start += run.len();
+            }
+        }
+        // A row's factors: y, x, then x doubled.
+        let factors_at = |stripe: usize, row: usize| -> Vec<BaseField> {
+            let point = domain.at(bit_reverse_index((stripe << n) + row, domain.log_size()));
+            let mut x = point.x;
+            let mut factors = vec![point.y];
+            for _ in 1..n {
+                factors.push(x);
+                x = CirclePoint::double_x(x);
+            }
+            factors
+        };
+        let make_run = |&(target, stripe, start, run): &(usize, usize, usize, &[usize])| {
+            let mut blocks = vec![];
+            let mut first = start;
+            let mut shared = vec![];
+            for block in run.chunk_by(|a, b| a >> low == b >> low) {
+                let factors: Vec<Vec<BaseField>> = block.iter().map(|&row| factors_at(stripe, row)).collect();
+                if shared.is_empty() {
+                    shared = factors[0][r..].to_vec();
+                }
+                blocks.push(RunBlock {
+                    target,
+                    rows: first..first + block.len(),
+                    mid: factors[0][low..r].iter().rev().copied().collect(),
+                    own: factors.iter().map(|f| [f[4], f[3], f[2], f[1], f[0]]).collect(),
+                });
+                first += block.len();
+            }
+            // Layers above R use the run's shared factors.
+            let coeffs: Vec<Vec<BaseField>> = (0..n as usize - r)
+                .map(|layer| {
+                    twiddles[r - 1 + layer]
+                        .iter()
+                        .map(|&dbl| shared[layer] * BaseField::from_u32_unchecked(dbl >> 1))
+                        .collect()
+                })
+                .collect();
+            (blocks, fold_weights(&coeffs))
+        };
+        let runs: Vec<(Vec<RunBlock>, Vec<BaseField>)> = specs.iter().map(make_run).collect();
+        drop(twiddles);
+        let n_runs = runs.len();
+        let mut weights = vec![0u32; n_runs << (n as usize - r)];
+        for (i, w) in weights.iter_mut().enumerate() {
+            let (group, run, chunk) = (i / (4 * n_runs), i / 4 % n_runs, i % 4);
+            *w = runs[run].1[group * 4 + chunk].0;
+        }
+        Self {
+            sub_twiddles,
+            subdomain,
+            run_bits,
+            runs: runs.into_iter().map(|(blocks, _)| blocks).collect(),
+            weights,
+            scale: BaseField::from(1u32 << n).inverse(),
+        }
+    }
+}
+
+/// [`evaluate_from_values`] with a [`RunPlan`]: R inverse layers per chunk, one exact weighted sum
+/// per run, layers R - 1 to 5 per block, the last five per row.
+fn evaluate_from_runs(
+    plan: &RunPlan,
+    n: u32,
+    values: &[PackedBaseField],
+    targets: &[(usize, Vec<usize>)],
+) -> Vec<Vec<BaseField>> {
+    let r = plan.run_bits as usize;
+    // Folded group sums < 2^36, so a run's < 2^(n - R + 34); the last fold leaves < 2P.
+    assert!(n <= 28 && r < n as usize - 1);
+    let vecs = 1usize << (r - LOG_N_LANES as usize);
+    let n_runs = plan.runs.len();
+    let twiddles = domain_line_twiddles_from_tree(plan.subdomain, &plan.sub_twiddles.itwiddles);
+    let low_half = u64x8::splat(0xFFFF_FFFF);
+    let modulus = u64x8::splat(u64::from(P));
+    let fold64 = |x: u64x8| (x & modulus) + (x >> 31);
+    let mut acc = vec![u64x8::splat(0); n_runs * 2 * vecs];
+    let mut lanes = vec![u64x8::splat(0); 4 * 2 * vecs];
+    let mut chunk = vec![PackedBaseField::zero(); vecs];
+    for group in 0..1usize << (n as usize - r - 2) {
+        for c in 0..4 {
+            let j = group * 4 + c;
+            chunk.copy_from_slice(&values[j * vecs..(j + 1) * vecs]);
+            // Layers 0 to 4, two vectors at a time.
+            for p in 0..vecs / 2 {
+                let index = j * vecs / 2 + p;
+                let (val0, val1) = ifft::vecwise_ibutterflies(
+                    chunk[2 * p],
+                    chunk[2 * p + 1],
+                    std::array::from_fn(|i| twiddles[0][index * 8 + i]),
+                    std::array::from_fn(|i| twiddles[1][index * 4 + i]),
+                    std::array::from_fn(|i| twiddles[2][index * 2 + i]),
+                );
+                (chunk[2 * p], chunk[2 * p + 1]) =
+                    ifft::simd_ibutterfly(val0, val1, std::simd::u32x16::splat(twiddles[3][index]));
+            }
+            // Layers 5 to R - 1 pair vectors `2^(layer - 4)` apart.
+            for layer in PrefixPlan::LOW as usize..r {
+                let half = 1usize << (layer - 4);
+                for base in (0..vecs).step_by(2 * half) {
+                    let twiddle = twiddles[layer - 1][(j * vecs + base) >> (layer - 3)];
+                    let twiddle = std::simd::u32x16::splat(twiddle);
+                    for v in base..base + half {
+                        (chunk[v], chunk[v + half]) =
+                            ifft::simd_ibutterfly(chunk[v], chunk[v + half], twiddle);
+                    }
+                }
+            }
+            for (v, &value) in chunk.iter().enumerate() {
+                let w = u64x8::from_array(bytemuck::cast::<PackedBaseField, [u64; 8]>(value));
+                lanes[(c * vecs + v) * 2] = w & low_half;
+                lanes[(c * vecs + v) * 2 + 1] = w >> 32;
+            }
+        }
+        let weights = &plan.weights[group * n_runs * 4..(group + 1) * n_runs * 4];
+        for (w, acc) in weights.chunks_exact(4).zip(acc.chunks_exact_mut(2 * vecs)) {
+            let w = [0, 1, 2, 3].map(|c| u64x8::splat(u64::from(w[c])));
+            for (k, acc) in acc.iter_mut().enumerate() {
+                // The mask makes this a 32x32->64 multiply.
+                let mut sum = (lanes[k] & low_half) * w[0];
+                for c in 1..4 {
+                    sum += (lanes[c * 2 * vecs + k] & low_half) * w[c];
+                }
+                *acc += fold64(sum);
+            }
+        }
+    }
+    let pack = |even: u64x8, odd: u64x8| {
+        let packed = fold64(even) | (fold64(odd) << 32);
+        let lanes = bytemuck::cast::<[u64; 8], PackedBaseField>(packed.to_array());
+        PackedBaseField::reduce_simd(lanes.into_simd())
+    };
+    let mut out: Vec<Vec<BaseField>> =
+        targets.iter().map(|(_, rows)| vec![BaseField::zero(); rows.len()]).collect();
+    for (blocks, acc) in plan.runs.iter().zip(acc.chunks_exact(2 * vecs)) {
+        let run_values: Vec<PackedBaseField> = acc.chunks_exact(2).map(|eo| pack(eo[0], eo[1])).collect();
+        for block in blocks {
+            let mut v = run_values.clone();
+            let mut len = vecs;
+            for &factor in &block.mid {
+                len /= 2;
+                let factor = PackedBaseField::broadcast(factor);
+                for i in 0..len {
+                    v[i] = v[i] + v[i + len] * factor;
+                }
+            }
+            let values: Vec<BaseField> = v[..2].iter().flat_map(|p| p.to_array()).collect();
+            for (k, own) in block.rows.clone().zip(&block.own) {
+                out[block.target][k] = fold(&values, own) * plan.scale;
+            }
+        }
+    }
+    out
+}
+
+/// [`basis_dot`] equals the reduced sum, for extreme values and partial groups of four.
 #[test]
 fn basis_dot_matches_reduced_sum() {
     use rand::rngs::SmallRng;
@@ -2440,10 +2692,85 @@ fn basis_dot_matches_reduced_sum() {
             assert_eq!(basis_dot(&words, &factors).to_array(), expected.to_array(), "len {len}");
         }
     }
-    // Unreduced words equal to `P` (zero) are accepted as the per-word products accept them.
+    // Unreduced `P` words count as zero.
     let words = vec![unsafe { PackedBaseField::from_simd_unchecked(Simd::splat(P)) }; 9];
     let factors: Vec<SecureField> = (0..9).map(|_| rng.random()).collect();
     assert_eq!(basis_dot(&words, &factors).to_array(), [SecureField::zero(); N_LANES]);
+}
+
+/// [`weighted_dot`] equals the reduced sum, for extreme values and partial groups of four.
+#[test]
+fn weighted_dot_matches_reduced_sum() {
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+
+    let mut rng = SmallRng::seed_from_u64(9);
+    let max = BaseField::from_u32_unchecked(P - 1);
+    for len in [1usize, 3, 4, 6, 255, 256] {
+        for extreme in [false, true] {
+            let values: Vec<PackedBaseField> = (0..len)
+                .map(|i| match (extreme, i % 2) {
+                    (true, 0) => PackedBaseField::broadcast(max),
+                    (true, _) => unsafe { PackedBaseField::from_simd_unchecked(Simd::splat(P)) },
+                    _ => PackedBaseField::from_array(std::array::from_fn(|_| rng.random())),
+                })
+                .collect();
+            let weights: Vec<PackedSecureField> = (0..len)
+                .map(|_| match extreme {
+                    true => PackedSecureField::broadcast(SecureField::from_m31(max, max, max, max)),
+                    false => PackedSecureField::from_array(std::array::from_fn(|_| rng.random())),
+                })
+                .collect();
+            let expected = zip(&weights, &values)
+                .fold(PackedSecureField::zero(), |sum, (weight, value)| sum + *weight * *value);
+            assert_eq!(weighted_dot(&weights, &values).to_array(), expected.to_array(), "len {len}");
+        }
+    }
+}
+
+/// [`RunPlan`] rows (full runs, partial runs, lone rows, several stripes) match the extension.
+#[test]
+fn run_plan_rows_match_the_extension() {
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+
+    let mut rng = SmallRng::seed_from_u64(22);
+    for (n, run_log) in [(10, 6), (12, 8), (13, 9), (13, 7), (13, 5)] {
+        let domain = CanonicCoset::new(n + 2).circle_domain();
+        let twiddles =
+            SimdBackend::precompute_twiddles(CanonicCoset::new(n + 3).circle_domain().half_coset);
+        let coeffs = CircleCoefficients::<SimdBackend>::new(
+            (0..1 << n).map(|_| rng.random::<BaseField>()).collect(),
+        );
+        let extension = coeffs.evaluate_with_twiddles(domain, &twiddles).values.to_cpu();
+        let trace = coeffs.evaluate_with_twiddles(CanonicCoset::new(n).circle_domain(), &twiddles);
+        let stripe0 = BaseColumn::from_iter(extension[..1 << n].iter().copied());
+        let targets: Vec<(usize, Vec<usize>)> = (1..4)
+            .map(|stripe| {
+                let mut rows = vec![];
+                for _ in 0..3 {
+                    let start = rng.random_range(0..1usize << (n - run_log)) << run_log;
+                    rows.extend(start..start + (1 << run_log));
+                }
+                let start = rng.random_range(0..1usize << (n - run_log)) << run_log;
+                rows.extend((start..start + (1 << run_log)).step_by(3));
+                rows.extend((0..4).map(|_| rng.random_range(0..1usize << n)));
+                rows.sort();
+                rows.dedup();
+                (stripe, rows)
+            })
+            .collect();
+        let mut scratch = BaseColumn::zeros(1 << n);
+        for (input, values) in [(PlanInput::Stripe0, &stripe0), (PlanInput::TraceCoset, &trace.values)] {
+            assert_eq!(RunPlan::get(n, domain, &targets, input).is_some(), run_log > 5, "n {n}");
+            let rows = evaluate_from_values(n, domain, &targets, Some(&values.data[..]), &mut scratch, true, input);
+            for ((stripe, rows), values) in targets.iter().zip(rows) {
+                for (&row, value) in rows.iter().zip(values) {
+                    assert_eq!(value, extension[(stripe << n) + row], "n {n} stripe {stripe} row {row}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

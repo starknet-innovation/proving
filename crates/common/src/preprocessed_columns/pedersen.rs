@@ -268,20 +268,20 @@ fn create_table_rows(window_bits: usize) -> Vec<SimpleAffinePoint> {
 }
 
 fn rows_to_columns(rows: &[SimpleAffinePoint]) -> [Vec<BaseField>; PEDERSEN_TABLE_N_COLUMNS] {
+    // Each row is converted once, and `get_m31(i)` is `get_limbs()[i]` without the other limbs.
+    let felts: Vec<[Felt252; 2]> = rows.into_par_iter().map(|r| [r.x.into(), r.y.into()]).collect();
     // Process each column in parallel.
     let columns_vec: Vec<Vec<BaseField>> = (0..PEDERSEN_TABLE_N_COLUMNS)
         .into_par_iter()
         .map(|col_idx| {
             let mut column = Vec::with_capacity(rows.len());
-            for row in rows {
+            for [x_f252, y_f252] in &felts {
                 let value = if col_idx < FELT252_N_WORDS {
                     // X coordinate limbs
-                    let x_f252: Felt252 = row.x.into();
-                    x_f252.get_limbs()[col_idx]
+                    x_f252.get_m31(col_idx)
                 } else {
                     // Y coordinate limbs
-                    let y_f252: Felt252 = row.y.into();
-                    y_f252.get_limbs()[col_idx - FELT252_N_WORDS]
+                    y_f252.get_m31(col_idx - FELT252_N_WORDS)
                 };
                 column.push(value);
             }
@@ -292,4 +292,17 @@ fn rows_to_columns(rows: &[SimpleAffinePoint]) -> [Vec<BaseField>; PEDERSEN_TABL
     columns_vec.try_into().unwrap_or_else(|v: Vec<_>| {
         panic!("Expected {} columns, got {}", PEDERSEN_TABLE_N_COLUMNS, v.len())
     })
+}
+
+/// Every column holds the limbs of its coordinate, as when each column converted every row.
+#[test]
+fn rows_to_columns_matches_the_per_column_conversion() {
+    let rows = create_table_rows(9);
+    for (col_idx, column) in rows_to_columns(&rows).iter().enumerate() {
+        let expected = rows.iter().map(|row| {
+            let felt: Felt252 = if col_idx < FELT252_N_WORDS { row.x } else { row.y }.into();
+            felt.get_limbs()[col_idx % FELT252_N_WORDS]
+        });
+        assert!(expected.eq(column.iter().copied()), "column {col_idx}");
+    }
 }

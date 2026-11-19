@@ -295,7 +295,9 @@ impl LogupColGenerator<'_> {
         let chunks_iter = {
             let denom_inv_chunks = self.trace_gen.batch_inverse_buffer.par_chunks(chunk_size);
             let numerator_chunks = self.numerator.par_chunks_mut(chunk_size);
-            (numerator_chunks, denom_inv_chunks).into_par_iter()
+            (numerator_chunks, denom_inv_chunks)
+                .into_par_iter()
+                .with_min_len(if self.trace_gen.log_size < 17 { usize::MAX } else { 1 })
         };
 
         #[cfg(not(feature = "parallel"))]
@@ -337,6 +339,9 @@ impl LogupColGenerator<'_> {
             self.numerator.columns.each_mut().map(|s| &mut s.data);
         (coord0, coord1, coord2, coord3, &mut self.trace_gen.denom.data)
             .into_par_iter()
+            // A column under 2^17 rows is one job (also in `finalize_col`): a writer waiting in a
+            // join runs what it steals, often a whole other writer. Values do not depend on it.
+            .with_min_len(if self.trace_gen.log_size < 17 { usize::MAX } else { 1 })
             .map(|(n0, n1, n2, n3, d)| FractionWriter { numerator: [n0, n1, n2, n3], denom: d })
     }
 }

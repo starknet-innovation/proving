@@ -1,16 +1,9 @@
-//! A checked cache of the Cairo preprocessed tree's public Merkle boundary (graph lead
-//! rgr1_c1b229e4, odinfree).
+//! A checked cache of the public Cairo preprocessed tree's upper Merkle layers.
 //!
-//! The Cairo preprocessed trace is public and fixed (`CAIRO_PROVER_PARAMS.preprocessed_trace`):
-//! its commitment is the same for every statement. Hashing its 2^23-leaf extension took the
-//! longer branch of the Cairo leg's first join (beside the base-trace writers). This cache keeps
-//! the tree's nodes at a shallow depth, regenerated from the ordinary builder, and leaves the
-//! layers below empty: the striped decommitment already regrows every queried stripe and rehashes
-//! the leaf blocks under the queried nodes (see `MerkleProverLifted::omitted_leaf_positions`),
-//! as the frontier's circuit-tree cache does. A hit requires every live column's values to match
-//! the exported fingerprint; any mismatch falls back to the ordinary builder. The columns keep
-//! exactly what `CommitmentTreeProver::new` keeps for this tree: stripe 0 of every large column,
-//! the whole extension and coefficients of every small one.
+//! Lower layers are omitted: decommitment regrows queried stripes and rehashes their leaf blocks
+//! (`MerkleProverLifted::omitted_leaf_positions`). A hit requires the live columns to match the
+//! exported fingerprint; otherwise the ordinary builder runs. Columns keep what
+//! `CommitmentTreeProver::new` keeps: stripe 0 of large columns, everything for small ones.
 
 mod data;
 
@@ -39,8 +32,7 @@ use crate::witness::preprocessed_trace::gen_trace;
 pub type CairoTree = CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>;
 type Evaluation = CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>;
 
-/// [`cached_cairo_tree`] for a prover generic over its Merkle channel: `None` for any channel but
-/// the one the boundary was exported with.
+/// [`cached_cairo_tree`] for a generic `MC`: `None` unless it is the exported channel.
 pub fn cached_tree_for<MC: MerkleChannel + 'static>(
     trace: Arc<PreProcessedTrace>,
     log_blowup: u32,
@@ -58,8 +50,7 @@ where
     tree.downcast::<CommitmentTreeProver<SimdBackend, MC>>().ok().map(|tree| *tree)
 }
 
-/// The live columns, checked against the export, and the cached nodes, decoded: prepared by
-/// [`warm`] beside the twiddles (whose setup leaves workers idle), taken by the Cairo leg.
+/// Checked live columns and decoded cached nodes, prepared by [`warm`] for the Cairo leg.
 struct Warm {
     trace: Arc<PreProcessedTrace>,
     evals: Vec<Evaluation>,
@@ -68,9 +59,8 @@ struct Warm {
 
 static WARM: std::sync::Mutex<Option<Warm>> = std::sync::Mutex::new(None);
 
-/// Checks the live columns against the export and decodes the cached nodes ahead of the Cairo
-/// leg, which then only interpolates and extends stripe 0 (see [`cached_cairo_tree`]). Call it
-/// after the Pedersen table is warm (`warm_pedersen_pp_trace`): `gen_trace` reads it.
+/// Prepares [`Warm`] ahead of the Cairo leg. Call it after `warm_pedersen_pp_trace`: `gen_trace`
+/// reads the Pedersen table.
 pub fn warm(trace: Arc<PreProcessedTrace>) {
     let checked = checked(trace);
     if let (Some(warm), Ok(mut slot)) = (checked, WARM.lock()) {
@@ -92,7 +82,7 @@ fn checked(trace: Arc<PreProcessedTrace>) -> Option<Warm> {
     Some(Warm { trace, evals, commitment: commitment? })
 }
 
-/// The Cairo preprocessed tree from the checked cache, or `None` (the caller then builds it).
+/// The tree from the checked cache, or `None` (the caller builds it).
 pub fn cached_cairo_tree(
     trace: Arc<PreProcessedTrace>,
     log_blowup: u32,
@@ -103,7 +93,7 @@ pub fn cached_cairo_tree(
     if log_blowup != data::LOG_BLOWUP || lifting != data::LIFTING {
         return None;
     }
-    // Only columns warmed from this very trace are taken.
+    // Only columns warmed from this trace.
     let warmed = WARM.lock().ok().and_then(|mut slot| slot.take());
     let Warm { evals, commitment, .. } = match warmed {
         Some(warm) if Arc::ptr_eq(&warm.trace, &trace) => warm,
@@ -116,7 +106,7 @@ pub fn cached_cairo_tree(
             let log_size = poly.log_size();
             let domain = CanonicCoset::new(log_size + log_blowup).circle_domain();
             if log_size >= 10 {
-                // A prefix column of a striped tree: stripe 0 only, no coefficients.
+                // Striped: stripe 0 only, no coefficients.
                 let mut values = pool.take_or_alloc(log_size);
                 SimdBackend::evaluate_stripe_into(&poly, domain, twiddles, 0, &mut values);
                 let mut evals = CircleEvaluation::new(
@@ -136,11 +126,8 @@ pub fn cached_cairo_tree(
     Some(CommitmentTreeProver { polynomials, commitment })
 }
 
-/// One digest of every column's log size and a sample of its raw M31 words (little-endian, in the
-/// stored bit-reversed order): the first 2^10 words and every 2^8-th word after them. The columns
-/// are generated from the same code the export ran, and a wrong boundary cannot pass: the proof
-/// would commit to another root, which the verifier and the pinned statement reject. The check
-/// only has to notice another variant of the trace, and hashing every word held the setup up.
+/// Digest of each column's log size and a sample of its raw LE words (the first 2^10, then every
+/// 2^8-th). A sample suffices: a wrong boundary yields a root the verifier rejects.
 pub fn fingerprint(evals: &[Evaluation]) -> [u8; 32] {
     let digests: Vec<Blake2sHash> = evals
         .par_iter()

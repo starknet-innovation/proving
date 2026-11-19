@@ -174,7 +174,7 @@ pub fn compress_finalize(state: [u32x16; 8], last_block: [u32x16; 16], t: u64) -
     compress_finalize_by_ref(&state, &last_block, t)
 }
 
-/// [`compress_unfinalized`] on borrowed state and message words (see [`compress16_by_ref`]).
+/// [`compress_unfinalized`] by reference (see [`compress16_by_ref`]).
 #[inline(always)]
 pub fn compress_unfinalized_by_ref(
     state: &[u32x16; 8],
@@ -192,7 +192,7 @@ pub fn compress_unfinalized_by_ref(
     )
 }
 
-/// [`compress_finalize`] on borrowed state and message words (see [`compress16_by_ref`]).
+/// [`compress_finalize`] by reference (see [`compress16_by_ref`]).
 #[inline(always)]
 pub fn compress_finalize_by_ref(
     state: &[u32x16; 8],
@@ -402,8 +402,7 @@ pub fn transpose_msgs(mut data: [u32x16; 16]) -> [u32x16; 16] {
     data
 }
 
-/// Transposes 8 rows of 8 words: the `w`-th vector of the result holds word `w` of every row.
-/// 24 shuffles (8 `vpunpck{l,h}dq`, 8 `vpunpck{l,h}qdq`, 8 `vperm2i128`).
+/// Transposes 8 rows of 8 words (24 shuffles): output vector `w` holds word `w` of every row.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn transpose_8x8_avx2_rows(r: [__m256i; 8]) -> [__m256i; 8] {
@@ -441,20 +440,14 @@ unsafe fn transpose_8x8_avx2_rows(r: [__m256i; 8]) -> [__m256i; 8] {
     ]
 }
 
-/// The 16 messages of 32 consecutive hashes (`words`, 8 words each): message `i` is the hashes
-/// `2i` and `2i + 1`, and the `w`-th vector of the result holds word `w` of every message, as
-/// [`transpose_msgs`] of the 16 vectors of 16 consecutive words would.
-///
-/// With AVX2 the messages are assembled from the hash rows by four 8x8 transposes (the even hashes
-/// give words 0..8, the odd hashes words 8..16; the first and last 16 hashes give the two lane
-/// halves): 96 shuffles instead of the 256 of the four deinterleave rounds of `transpose_msgs`.
+/// The 16 messages of 32 consecutive 8-word hashes (message `i` is hashes `2i` and `2i + 1`),
+/// transposed as [`transpose_msgs`] would. AVX2 uses four 8x8 transposes (96 shuffles, not 256).
 #[inline(always)]
 pub fn transpose_hash_pairs(words: &[u32; 256]) -> [u32x16; 16] {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe {
         use std::arch::x86_64::_mm256_loadu_si256;
-        // SAFETY: hash `k` (`k < 32`) is the 8 words at `8 * k`, in bounds of the 256; unaligned
-        // loads.
+        // SAFETY: hash `k < 32` is the 8 words at `8 * k`, within the 256; unaligned loads.
         let hash = |k: usize| -> __m256i { _mm256_loadu_si256(words.as_ptr().add(8 * k).cast()) };
         let even_lo = transpose_8x8_avx2_rows(array::from_fn(|i| hash(2 * i)));
         let even_hi = transpose_8x8_avx2_rows(array::from_fn(|i| hash(16 + 2 * i)));
@@ -701,12 +694,7 @@ pub fn compress16(
     compress16_by_ref(&h_vecs, &msg_vecs, count_low, count_high, lastblock, lastnode)
 }
 
-/// [`compress16`] on borrowed state and message words.
-///
-/// The 8-lane halves read the state and the messages through pointers, so a borrow is all they
-/// need: a caller whose arrays are in memory already (a tile's state, a message block it has just
-/// assembled) hands them over as they are, where the by-value arguments of [`compress16`] are
-/// copied into the call first (512 + 1024 bytes, one `memcpy` each). Same words, same result.
+/// [`compress16`] on borrowed words, which skips copying by-value arguments. Same result.
 #[inline(always)]
 pub fn compress16_by_ref(
     h_vecs: &[u32x16; 8],

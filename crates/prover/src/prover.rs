@@ -241,8 +241,7 @@ where
         if preprocessed_tree.commitment.layers.is_empty() {
             let (trace, tree) = rayon::join(write_trace, || {
                 let _span = span!(Level::INFO, "Compute preprocessed trace commitment").entered();
-                // The tree is public: its Merkle nodes come from a checked cache when the trace
-                // matches it (see `cairo_preprocessed_cache`), on the workers the writers leave idle.
+                // Public tree: use the checked cache when the trace matches.
                 if let Some(tree) = crate::cairo_preprocessed_cache::cached_tree_for::<MC>(
                     preprocessed_trace.clone(),
                     prover_params.fri_config.log_blowup_factor,
@@ -326,9 +325,8 @@ where
     // Add the preprocessed trace commitment that was computed earlier to the commitment scheme.
     commitment_scheme.commit_tree(preprocessed_tree, channel);
 
-    // Base trace. The base and interaction trees keep stripes 0 and 1 of their columns until the
-    // composition, which reads them instead of extending every column again; the live memory of
-    // the Cairo leg stays far below the proof's peak, which the circuit leg sets.
+    // Base trace.
+    // Keep stripe pairs for the composition (the Cairo leg is below the peak).
     commitment_scheme.keep_stripe_pair = true;
     stwo::prover::PHASE_LEG.store(0, std::sync::atomic::Ordering::Relaxed);
     stwo::prover::phase_marker("base_commit");
@@ -348,11 +346,8 @@ where
     // Interaction trace.
     // Each component's columns are interpolated in its writer's task as soon as it returns (the
     // same per-column interpolation `TreeBuilder::extend_evals` runs, in the same column order),
-    // on the workers the slowest writers leave idle. The writers take their output columns from
-    // the interaction pool and the interpolation gives the evaluation buffers back to it, so a
-    // writer that starts later writes into pages an earlier one already mapped (see
-    // `stwo_constraint_framework::interaction_pool`); the buffers left idle once
-    // every writer is done go to the allocator's cache, as the commitment pool's do.
+    // on the workers the slowest writers leave idle.
+    // Columns cycle through the interaction pool, so later writers reuse mapped pages.
     let span = span!(Level::INFO, "Write interaction trace").entered();
     let interaction_pool = stwo_constraint_framework::interaction_pool();
     let interpolate = |columns: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>| {

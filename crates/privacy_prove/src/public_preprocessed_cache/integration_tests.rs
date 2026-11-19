@@ -8,7 +8,7 @@ fn regenerated_public_tree_matches_cache_and_changed_live_rows_miss() {
 
     use super::*;
 
-    // Changes a real public source without changing its size, ID, or any other source.
+    // Changes one real source, keeping its size and ID.
     struct ChangedRow {
         source: SharedTraceSource,
         row: usize,
@@ -50,8 +50,7 @@ fn regenerated_public_tree_matches_cache_and_changed_live_rows_miss() {
     )
     .expect("the complete live fixed circuit matches its public cache");
 
-    // Construct the reference directly, bypassing the cache-enabled privacy helper.
-    // Comparing every upper node prevents a circular test of the cached root alone.
+    // A reference built without the cache; every upper node is compared, not just the root.
     let coefficients = SimdBackend::interpolate_columns(trace.get_trace(), &twiddles);
     let ordinary = CachedTree::new_with_sources(
         coefficients,
@@ -86,8 +85,7 @@ fn regenerated_public_tree_matches_cache_and_changed_live_rows_miss() {
     drop(cached);
     pool.release_all_idle();
 
-    // A late column and its last row evade a sampled first-subtree guard. All of
-    // these cases keep the complete metadata, requiring content checking to miss.
+    // A late column's last row; metadata is intact, so only the content check can miss.
     let column = sources.len() - 1;
     let last_row = (1usize << sources[column].log_size()) - 1;
     for row in [0, 4095, 4096, last_row] {
@@ -101,8 +99,7 @@ fn regenerated_public_tree_matches_cache_and_changed_live_rows_miss() {
         );
     }
 
-    // The first two fixed columns share the same size. Swapping only their live
-    // contents leaves all metadata intact and must still miss the cache.
+    // Swapping two same-size columns keeps all metadata and must still miss.
     let mut swapped = sources;
     swapped.swap(0, 1);
     assert!(matches_metadata(&swapped, &ids, data::LOG_BLOWUP, data::LIFTING));

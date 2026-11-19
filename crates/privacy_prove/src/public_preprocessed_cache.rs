@@ -1,8 +1,6 @@
-//! A checked cache of the fixed recursive circuit's public preprocessing.
+//! A checked cache of the fixed recursive circuit's public preprocessed Merkle boundary.
 //!
-//! The boundary hashes are public, input-independent values regenerated from the ordinary
-//! commitment builder. A hit requires the complete ordered source contents to match, not just
-//! the circuit's dimensions or its advertised root. Other sources use the ordinary builder.
+//! A hit requires every source's full contents to match; otherwise the ordinary builder runs.
 
 mod data;
 
@@ -25,10 +23,7 @@ use stwo::prover::{CommitmentTreeProver, Poly, SharedTraceSource, TraceSource};
 
 type CachedTree = CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>;
 
-/// Reuses public Merkle boundary nodes only after checking all of their source data.
-///
-/// The large columns have the same source-backed representation as `new_with_sources`.
-/// Small columns retain their full extension and coefficients, as that constructor does.
+/// Reuses the boundary nodes after checking all source data; columns as in `new_with_sources`.
 pub(crate) fn cached_tree(
     sources: Vec<SharedTraceSource>,
     ids: &[String],
@@ -90,9 +85,7 @@ fn matches_metadata(
             .all(|(source, expected)| source.log_size() == expected)
 }
 
-/// The exporter's canonical digest: log size as a little-endian u32, followed by every trace
-/// value's raw M31 word as a little-endian u32, in source order. Bounded scratch avoids
-/// materializing the large columns just to recognize them.
+/// The exporter's digest: LE log size, then every raw word LE in source order, in bounded scratch.
 fn fingerprint(source: &dyn TraceSource) -> Blake2sHash {
     let mut state = Blake2sHasher::new();
     state.update(&source.log_size().to_le_bytes());
@@ -122,7 +115,7 @@ const BASE85_DIGITS: [u8; 256] = {
     digits
 };
 
-/// Five positional base85 digits encode one little-endian u32 hash word.
+/// Five base85 digits encode one LE u32 hash word.
 fn decode_word(encoded: &[u8]) -> Option<[u8; 4]> {
     if encoded.len() != 5 {
         return None;
@@ -167,7 +160,7 @@ fn cached_commitment() -> Option<MerkleProverLifted<SimdBackend, Blake2sMerkleHa
     if layers[0][0].0 != data::ROOT {
         return None;
     }
-    // The ordinary decommitment reconstructs the missing lower layers from source rows.
+    // Decommitment regrows the lower layers from source rows.
     layers.resize_with(data::LIFTING as usize + 1, Vec::new);
     Some(MerkleProverLifted { layers })
 }

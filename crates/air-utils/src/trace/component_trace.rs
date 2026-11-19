@@ -10,17 +10,16 @@ use stwo::prover::poly::circle::CircleEvaluation;
 
 use super::row_iterator::{ParRowIterMut, RowIterMut};
 
-/// Columns allocated ahead of the witness writers by [`ComponentTrace::prealloc`], by their packed
-/// length: [`ComponentTrace::uninitialized`] takes them before it allocates.
+/// [`ComponentTrace::prealloc`] columns by packed length, for [`ComponentTrace::uninitialized`].
 static PREALLOCATED: std::sync::Mutex<Vec<(usize, Vec<Vec<PackedM31>>)>> =
     std::sync::Mutex::new(Vec::new());
 
 thread_local! {
-    /// Set while [`ComponentTrace::prealloc`] allocates: its columns are fresh, never taken back.
+    /// Set while [`ComponentTrace::prealloc`] allocates, so it never takes stashed columns.
     static ALLOCATING_AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// `n` columns of `len` packed values from [`PREALLOCATED`], when it holds that many.
+/// `N` columns of `len` packed values from [`PREALLOCATED`], if it has them.
 fn take_preallocated<const N: usize>(len: usize) -> Option<[Vec<PackedM31>; N]> {
     let mut stash = PREALLOCATED.lock().unwrap();
     let (_, columns) = stash.iter_mut().find(|(stashed_len, columns)| *stashed_len == len && columns.len() >= N)?;
@@ -116,15 +115,9 @@ impl<const N: usize> ComponentTrace<N> {
         Self { data, log_size }
     }
 
-    /// Allocates the columns of a trace of `2^log_size` rows ahead of its writer, on the calling
-    /// thread: the writers run side by side, and a column each of them allocates then grows its
-    /// thread's glibc arena with `mprotect` under the kernel's mmap lock, which every other
-    /// writer's page fault waits behind (about 3,000 such calls in the Cairo trace, with 4 to 5
-    /// of 16 threads waiting at a time). Allocated one after the other here, before the writers
-    /// start, the same columns cost the same calls without the waiting; the writers' pages fault
-    /// in parallel as before. The columns are uninitialized until [`Self::uninitialized`] hands
-    /// them to the writer of a trace of this size, which fills them; proof bytes do not depend on
-    /// where a column's memory comes from.
+    /// Allocates a `2^log_size`-row trace's columns ahead of its writer, so parallel writers do not
+    /// contend on the mmap lock growing their arenas. Uninitialized until [`Self::uninitialized`]
+    /// hands them to a writer, which fills them.
     pub fn prealloc(log_size: u32) {
         ALLOCATING_AHEAD.with(|ahead| ahead.set(true));
         let trace = unsafe { ComponentTrace::<N>::uninitialized(log_size) };

@@ -37,11 +37,10 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     Ok(prove_ex(components, channel, commitment_scheme, false)?.proof)
 }
 
-/// The leg whose phases [`phase_marker`] names: 0 for the Cairo proof, 1 for the circuit proof.
+/// [`phase_marker`]'s leg: 0 for Cairo, 1 for the circuit.
 pub static PHASE_LEG: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// Marks the start of a phase of the current leg on stderr (`pvfast-phase LEG_NAME`), which the
-/// evaluator times; no computation depends on it.
+/// Prints `pvfast-phase LEG_NAME` to stderr for the evaluator's timing; nothing depends on it.
 pub fn phase_marker(name: &str) {
     let leg = match PHASE_LEG.load(core::sync::atomic::Ordering::Relaxed) {
         0 => "cairo",

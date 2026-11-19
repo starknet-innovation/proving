@@ -178,3 +178,74 @@ fn stripe0_and_evaluated_pairs_open_as_regrown_columns() {
     }
     verifier.verify_values(sampled_points, proof, channel).unwrap();
 }
+
+/// A tree whose lower Merkle layers are not stored (as the cached preprocessed trees) decommits
+/// every row of the leaf block under each queried node: a sourced column with evaluated stripes
+/// reads those rows from its stripes in aligned runs (`RunPlan`). The rows and the decommitment
+/// are those of the same tree read from its sources, and of the tree with its layers stored.
+#[test]
+fn omitted_layers_decommit_evaluated_pairs_as_sources() {
+    use super::*;
+    use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+    use crate::prover::air::component_prover::TraceSource;
+    use crate::prover::backend::simd::SimdBackend;
+
+    struct ValuesSource(Vec<BaseField>);
+    impl TraceSource for ValuesSource {
+        fn log_size(&self) -> u32 {
+            self.0.len().ilog2()
+        }
+        fn write_values(&self, dst: &mut [BaseField]) {
+            dst.copy_from_slice(&self.0);
+        }
+    }
+    let (log_blowup_factor, lifting_log_size, sizes) = (2, 14, [12u32, 11, 10, 12, 6]);
+    let twiddles = SimdBackend::precompute_twiddles(
+        CanonicCoset::new(lifting_log_size + 1).circle_domain().half_coset,
+    );
+    let queries = [3, 700, 701, 5000, 9000, 12288, 16383];
+    let decommit = |evaluate_pairs: bool, omitted: usize| {
+        let polys = sizes
+            .iter()
+            .enumerate()
+            .map(|(column, &log_size)| {
+                CircleCoefficients::<SimdBackend>::new(
+                    (0..1u32 << log_size)
+                        .map(|i| BaseField::from((7 + 41 * column as u32 + 13 * i * i) % 2003))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let sources = polys
+            .iter()
+            .map(|poly| -> Option<SharedTraceSource> {
+                (poly.log_size() >= 10).then(|| {
+                    let domain = CanonicCoset::new(poly.log_size()).circle_domain();
+                    std::sync::Arc::new(ValuesSource(
+                        poly.evaluate_with_twiddles(domain, &twiddles).values.to_cpu(),
+                    )) as SharedTraceSource
+                })
+            })
+            .collect();
+        let pool = BaseColumnPool::new();
+        let mut tree = CommitmentTreeProver::<SimdBackend, Blake2sMerkleChannel>::new_with_sources(
+            polys, log_blowup_factor, &twiddles, false, lifting_log_size, &pool, sources,
+        );
+        assert_eq!(tree.polynomials.iter().filter(|poly| poly.is_sourced()).count(), 4);
+        if evaluate_pairs {
+            for poly in tree.polynomials.iter().filter(|poly| poly.wants_pair()) {
+                let _ = poly.pair(&twiddles);
+            }
+        }
+        let n_layers = tree.commitment.layers.len();
+        for layer in &mut tree.commitment.layers[n_layers - omitted..] {
+            *layer = Vec::new();
+        }
+        let (values, decommitment) = tree.decommit(&queries, &twiddles, &pool, log_blowup_factor);
+        (values, decommitment.decommitment.hash_witness)
+    };
+    let reference = decommit(false, 0);
+    for (evaluate_pairs, omitted) in [(true, 0), (false, 9), (true, 9), (true, 7)] {
+        assert_eq!(decommit(evaluate_pairs, omitted), reference, "{evaluate_pairs} {omitted}");
+    }
+}

@@ -40,10 +40,7 @@ fn interpolate_in_turn(
     interpolate_in_turn_pooled(columns, twiddles, &pool)
 }
 
-/// [`interpolate_in_turn`] through `pool`: the coefficients of a column are written into an idle
-/// buffer of the pool where there is one, and the evaluation buffer goes back to it. The
-/// interaction writers pass the pool their columns came from, so the buffers circulate between
-/// the writers of the phase (see `stwo_constraint_framework::interaction_pool`).
+/// [`interpolate_in_turn`] through `pool`, which takes the evaluation buffers back for reuse.
 fn interpolate_in_turn_pooled(
     columns: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
     twiddles: &TwiddleTree<SimdBackend>,
@@ -52,9 +49,7 @@ fn interpolate_in_turn_pooled(
     if !columns.first().is_some_and(|column| column.domain.log_size() > 16) {
         return SimdBackend::interpolate_columns(columns, twiddles);
     }
-    // The columns are interpolated side by side, each out of place through the pool: at 2^21 rows
-    // one column's transform leaves most workers idle, and blake_g_gate's columns, interpolated one
-    // after the other, were the last task of both the base trace and the interaction.
+    // Side by side: one column's transform leaves most workers idle.
     SimdBackend::interpolate_columns_pooled(columns, twiddles, pool)
 }
 
@@ -399,9 +394,7 @@ where
     } = circuit_interaction_claim_generator;
     // The blake gate's interaction trace, the largest, is written beside the other components'
     // (each writer is parallel inside too): with the gate tuples kept narrow, their temporaries fit
-    // together under the proof's peak. The writers' columns come from the interaction pool and
-    // their interpolation gives the evaluation buffers back to it; what is left idle once every
-    // writer is done goes to the allocator's cache.
+    // together under the proof's peak.
     let pool = stwo_constraint_framework::interaction_pool();
     let ((blake_polys, blake_sum), ()) = rayon::join(
         || {

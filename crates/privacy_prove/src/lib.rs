@@ -190,7 +190,6 @@ pub fn prepare_recursive_prover_precomputes()
 -> Result<Arc<RecursiveProverPrecomputes>, Box<dyn Error>> {
     let _span = span!(Level::INFO, "prepare_privacy_recursiveprover_precomputes").entered();
 
-    let cairo_verifier_config = get_cairo_verifier_config()?;
     let circuit_config = get_recursive_circuit_config();
     let proof_config = get_proof_config();
 
@@ -205,14 +204,18 @@ pub fn prepare_recursive_prover_precomputes()
 
     // The circuit's preprocessing is built on first use, after the Cairo proof.
     let preprocessed_circuit = Arc::new(LazyPreprocessedCircuit::new());
-    let (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree) = {
+    let (cairo_verifier_config, twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree) = {
         // The twiddles and the Cairo preprocessed trace are independent as well.
-        let (twiddles, cairo_preprocessed_trace) = rayon::join(
+        let ((cairo_verifier_config, twiddles), cairo_preprocessed_trace) = rayon::join(
             || {
+                // The verifier config (a single-threaded parse) is independent: built here.
+                let cairo_verifier_config = get_cairo_verifier_config().map_err(|e| e.to_string());
                 info!("Prepare the twiddles");
-                SimdBackend::precompute_twiddles(
+                let twiddles = SimdBackend::precompute_twiddles(
                     CanonicCoset::new(max_domain_size).circle_domain().half_coset,
-                )
+                );
+                eprintln!("pvfast-phase setup_twiddles");
+                (cairo_verifier_config, twiddles)
             },
             || {
                 info!("Prepare the cairo prover preprocessed trace");
@@ -221,8 +224,8 @@ pub fn prepare_recursive_prover_precomputes()
                 );
                 // Warm the Pedersen points table before the Cairo leg's gen_trace reads it.
                 warm_pedersen_pp_trace(CAIRO_PROVER_PARAMS.preprocessed_trace);
-                // The Cairo preprocessed tree's cache is checked here, beside the twiddles, where
-                // workers are idle; the Cairo leg then only extends its stripe 0.
+                eprintln!("pvfast-phase setup_pedersen");
+                // Check the Cairo tree cache here, where workers are idle.
                 stwo_cairo_prover::cairo_preprocessed_cache::warm(cairo_preprocessed_trace.clone());
                 cairo_preprocessed_trace
             },
@@ -233,7 +236,7 @@ pub fn prepare_recursive_prover_precomputes()
             polynomials: vec![],
             commitment: MerkleProverLifted { layers: vec![] },
         };
-        (twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)
+        (cairo_verifier_config?, twiddles, cairo_preprocessed_trace, cairo_preprocessed_tree)
     };
 
     info!("Prepare the circuit prover preprocessed trace and tree (built on first use)");
@@ -249,9 +252,7 @@ pub fn prepare_recursive_prover_precomputes()
             let preprocessed_trace = preprocessed_circuit.preprocessed_trace.clone();
             let source_columns = PreprocessedColumnSource::all(&preprocessed_trace);
             let ids: Vec<String> = preprocessed_trace.ids().into_iter().map(|id| id.id).collect();
-            // The cache contains only the public circuit's Merkle subtree roots. Every live
-            // source column is fingerprinted before it is used, and all statement-dependent
-            // evaluations and openings still come from those sources. Other circuits fall back.
+            // Cached subtree roots, used only when every source matches; openings use the sources.
             if let Some(tree) = public_preprocessed_cache::cached_tree(
                 source_columns.clone(),
                 &ids,

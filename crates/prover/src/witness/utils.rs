@@ -343,6 +343,11 @@ pub trait AddInputs {
     fn add_input(&self, input: &Self::InputType, _relation_index: usize);
 }
 
+/// Lookup tables (`range_check_*`, `verify_bitwise_xor_*`) count inputs with atomic increments in
+/// a parallel loop. Calls up to this size run on the caller's thread: split, they contend on the
+/// table and the writer waits on joins, running other writers' work, so its wave ends late.
+const MAX_IN_ORDER_PACKED_INPUTS: usize = 1 << 12;
+
 pub fn add_inputs<C, Packed, Unpacked>(
     component: &C,
     packed_inputs: &[Packed],
@@ -354,7 +359,16 @@ pub fn add_inputs<C, Packed, Unpacked>(
     Unpacked: Pack<SimdType = Packed>,
 {
     let full_packed_inputs = num_inputs / N_LANES;
-    component.add_packed_inputs(&packed_inputs[..full_packed_inputs], relation_index);
+    let full = &packed_inputs[..full_packed_inputs];
+    // A one-element parallel iterator is never split: same inputs, same order, on this thread.
+    let name = std::any::type_name::<C>();
+    if full.len() <= MAX_IN_ORDER_PACKED_INPUTS
+        && (name.contains("::range_check_") || name.contains("::verify_bitwise_xor_"))
+    {
+        full.chunks(1).for_each(|packed| component.add_packed_inputs(packed, relation_index));
+    } else {
+        component.add_packed_inputs(full, relation_index);
+    }
     let remainder = num_inputs % N_LANES;
     if remainder > 0 {
         let last_block = packed_inputs[full_packed_inputs];

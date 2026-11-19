@@ -149,10 +149,8 @@ where
         if values.is_empty() { circuits::ivalue::take_released_values() } else { None };
     let values = released_values.as_deref().unwrap_or(values);
 
-    // Base trace. The base and interaction trees keep stripes 0 and 1 of their columns for the
-    // composition (see `keep_stripe_pair`), which then reads them instead of extending them again;
-    // the base tree's columns keep the pairs instead of their coefficients until then (see
-    // `release_pair_coefficients`).
+    // Base trace.
+    // Keep stripe pairs for the composition; base columns hold them instead of coefficients.
     commitment_scheme.keep_stripe_pair = true;
     commitment_scheme.release_pair_coefficients = true;
     let mut tree_builder = commitment_scheme.tree_builder();
@@ -175,9 +173,7 @@ where
     stwo::prover::PHASE_LEG.store(1, std::sync::atomic::Ordering::Relaxed);
     stwo::prover::phase_marker("base_commit");
     tree_builder.commit(channel);
-    // Only the base tree's columns give up their coefficients for the composition: the base
-    // tree's pairs and coefficients would otherwise be resident beside the interaction tree's
-    // commitment, the circuit leg's peak, while the interaction tree's are dropped right after.
+    // Only the base tree: its pairs and coefficients would both be resident at the peak.
     commitment_scheme.release_pair_coefficients = false;
 
     // Draw interaction elements.

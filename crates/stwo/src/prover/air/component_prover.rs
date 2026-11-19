@@ -75,11 +75,9 @@ pub struct Poly<B: Backend> {
     pub coeffs: Option<CircleCoefficients<B>>,
     pub evals: CircleEvaluation<B, BaseField, BitReversedOrder>,
     pub source: Option<SharedTraceSource>,
-    /// Stripes 0 and 1 of the extension of a column that keeps neither (see [`Self::pair`]),
-    /// computed once, by the first composition that reads them or ahead of it.
+    /// [`Self::pair`]'s stripes 0 and 1, computed once, for a column that keeps neither.
     pub pair_cache: std::sync::OnceLock<CircleEvaluation<B, BaseField, BitReversedOrder>>,
-    /// Whether the column keeps stripes 0 and 1 of its extension and, until the composition has
-    /// read them, not its coefficients (see `CommitmentSchemeProver::release_pair_coefficients`).
+    /// Holds stripes 0 and 1 instead of coefficients until the composition reads them.
     pub pair_only: bool,
 }
 
@@ -109,9 +107,7 @@ impl<B: Backend> Poly<B> {
         self.coeffs.is_none() && self.source.is_some() && self.evals.values.is_empty()
     }
 
-    /// The column's values on a prefix of its domain, as the out-of-domain samples and the
-    /// quotients read them: its own, or, for a sourced column whose stripes 0 and 1 were
-    /// evaluated for the composition (see [`Self::pair`]), those.
+    /// The values OODS samples and quotients read: its own, or a sourced column's [`Self::pair`].
     pub fn resident_evals(&self) -> &CircleEvaluation<B, BaseField, BitReversedOrder> {
         match self.pair_cache.get() {
             Some(pair) if self.is_sourced() => pair,
@@ -119,13 +115,12 @@ impl<B: Backend> Poly<B> {
         }
     }
 
-    /// Whether the out-of-domain samples and the quotients reproduce the column's values from its
-    /// source: it is sourced and holds no evaluated stripes (see [`Self::resident_evals`]).
+    /// Whether OODS samples and quotients regrow the values from the source (no pair cached).
     pub fn regrows_from_source(&self) -> bool {
         self.is_sourced() && self.pair_cache.get().is_none()
     }
 
-    /// The log size of the column's coefficients.
+    /// Log size of the coefficients.
     pub fn coefficients_log_size(&self) -> u32 {
         if self.pair_only {
             return self.evals.values.len().ilog2() - 1;
@@ -140,10 +135,8 @@ impl<B: Backend> Poly<B> {
         self.evals.domain.log_size() - log_blowup_factor
     }
 
-    /// Stripes 0 and 1 of the column's extension (its evaluation on the first subdomain of twice
-    /// the coefficients' size, the values [`Self::holds_stripe_pair`] columns keep), for a column
-    /// that keeps less: computed once from its coefficients (regrown if it keeps none) and kept,
-    /// so every later read, by any component, borrows them.
+    /// Stripes 0 and 1 of the extension (the first subdomain of twice the coefficients' size), for
+    /// a column that keeps less: computed once (regrowing coefficients if needed) and shared.
     pub fn pair(&self, twiddles: &TwiddleTree<B>) -> &CircleEvaluation<B, BaseField, BitReversedOrder> {
         self.pair_cache.get_or_init(|| {
             let coeffs = match &self.coeffs {
@@ -163,15 +156,13 @@ impl<B: Backend> Poly<B> {
         })
     }
 
-    /// Whether [`Self::pair`] is the way the composition reads this column on a subdomain of
-    /// twice its coefficients' size: the column keeps less than those values.
+    /// Whether the composition reads this column through [`Self::pair`] (it keeps less).
     pub fn wants_pair(&self) -> bool {
         let log_size = self.coefficients_log_size();
         self.evals.values.len() < 2usize << log_size && self.evals.domain.size() > 2usize << log_size
     }
 
-    /// Whether the column keeps its coefficients and stripes 0 and 1 of its extension (its
-    /// evaluation on the first subdomain of twice the coefficients' size), for the composition.
+    /// Whether the column keeps stripes 0 and 1 for the composition.
     pub fn holds_stripe_pair(&self) -> bool {
         use crate::prover::backend::Column;
         self.pair_only
@@ -344,11 +335,8 @@ impl<B: Backend> ComponentProvers<'_, B> {
             .iter()
             .flatten()
             .any(|poly| poly.evals.values.len() < poly.evals.domain.size());
-        // Trees that kept stripes 0 and 1 of their columns hold the first subdomain of twice the
-        // coefficients' size, which is the subdomain mode's evaluation domain when every
-        // component's constraints have degree 2: read it instead of extending the columns (the
-        // columns without a pair are extended to it, see `get_trace_columns`). The composition
-        // polynomial is the same: its evaluations on any domain of its size interpolate to it.
+        // Kept stripe pairs are the subdomain mode's domain for degree-2 constraints: read them
+        // (columns without one are extended, see `get_trace_columns`). Same composition polynomial.
         let pairs = trace.polys.iter().flatten().any(|poly| poly.holds_stripe_pair());
         let evaluation_mode = match (extend, pairs, EvaluationMode::infer(&components, log_blowup_factor)) {
             (false, _, mode) => mode,

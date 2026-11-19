@@ -1,6 +1,6 @@
-//! [`super::VeryPackedM31Dot`] against the reduced field sum it replaces, word for word.
+//! [`super::VeryPackedM31Dot`] against the reduced field sum.
 
-/// Random lanes in `[0, P]` (often `P`, the raw zero, or `P - 1`), 1 to 39 products.
+/// Random lanes in `[0, P]` (often `P` or `P - 1`), 1 to 39 products.
 #[test]
 fn dot_matches_field_sum() {
     use rand::rngs::SmallRng;
@@ -35,14 +35,14 @@ fn dot_matches_field_sum() {
         for &(v, c) in &terms {
             want += v * VeryPackedM31::broadcast(c);
         }
-        // With a product, the reduced field sum's words are canonical too: the same words.
+        // With a product, both sides are canonical: same words.
         let raw = |x: VeryPackedM31| x.0.map(|p| p.into_simd().to_array());
         assert!(raw(got).iter().flatten().all(|&x| x < P));
         assert_eq!(raw(got), raw(want));
     }
 }
 
-/// Every combination of edge words (`P` is the raw zero), one and two products, word for word.
+/// All combinations of edge words, with one and two products.
 #[test]
 fn dot_edge_words() {
     use super::VeryPackedM31Dot;

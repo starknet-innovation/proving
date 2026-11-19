@@ -49,9 +49,8 @@ pub struct SimdDomainEvaluator<'a> {
     pub coeff_columns: &'a [[BaseField; SECURE_EXTENSION_DEGREE]],
 }
 
-/// Per constraint and basis element `e_k` of the secure field (`k` in `0..4`), the coordinates of
-/// `coeff * e_k`: a secure value with coordinates `v_k` times `coeff` is `∑ v_k * (coeff * e_k)`,
-/// so each coordinate of the product is a sum of base field products.
+/// Per constraint and basis element `e_k` (`k` in `0..4`), the coordinates of `coeff * e_k`: a
+/// secure `∑ v_k * e_k` times `coeff` is `∑ v_k * (coeff * e_k)`, a sum of base field products.
 pub fn coeff_columns(random_coeff_powers: &[SecureField]) -> Vec<[BaseField; SECURE_EXTENSION_DEGREE]> {
     let one = BaseField::from(1);
     let zero = BaseField::from(0);

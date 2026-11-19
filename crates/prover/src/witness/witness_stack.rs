@@ -2,24 +2,20 @@
 
 use std::cell::Cell;
 
-/// Stack size those writers need, or witness generation may overflow the stack.
+/// Stack size those writers need.
 pub const WITNESS_STACK_SIZE: usize = 1024 * 1024 * 8;
 
 thread_local! {
-    /// Set on the threads of a pool built with [`WITNESS_STACK_SIZE`] stacks.
+    /// Set on threads with [`WITNESS_STACK_SIZE`] stacks.
     static HAS_WITNESS_STACK: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Marks the calling thread as running on a [`WITNESS_STACK_SIZE`] stack: call it from the
-/// `start_handler` of a rayon pool built with `stack_size(WITNESS_STACK_SIZE)`.
+/// Marks this thread. Call it from the `start_handler` of a [`WITNESS_STACK_SIZE`] pool.
 pub fn mark_witness_stack_thread() {
     HAS_WITNESS_STACK.with(|marked| marked.set(true));
 }
 
-/// Runs a deep witness writer where its stack is large enough: inline on a marked thread (its
-/// parallel work stays in that thread's pool), otherwise in a pool of such stacks built for it, as
-/// the writers always did. Inline, the writers no longer start and drop a pool of one thread per
-/// core beside the busy workers of the proof's own pool.
+/// Runs `op` inline on a marked thread, otherwise in a new pool with large enough stacks.
 pub fn with_witness_stack<R: Send>(op: impl FnOnce() -> R + Send) -> R {
     if HAS_WITNESS_STACK.with(|marked| marked.get()) {
         return op();

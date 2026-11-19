@@ -15,6 +15,7 @@ use crate::memory::MemoryEntry;
 pub mod adapter;
 pub mod builtins;
 pub mod decode;
+pub mod json;
 pub mod memory;
 pub mod opcodes;
 pub mod relocator;

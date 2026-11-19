@@ -113,7 +113,7 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
         let mut res: Vec<Blake2sHash> = unsafe { uninit_vec(1 << log_size) };
 
         chunks_mut_iter(&mut res, 1 << LOG_N_LANES).enumerate().for_each(|(i, dst)| {
-            // The 16 messages are the 16 pairs of consecutive hashes, one word of each per vector.
+            // Message `i` is hashes `2i` and `2i + 1`.
             let prev_chunk_u32s = cast_slice::<_, u32>(&prev_layer[(i << 5)..((i + 1) << 5)]);
             let msgs = transpose_hash_pairs(prev_chunk_u32s.try_into().unwrap());
             let state = compress_finalize_by_ref(&INITIAL_STATE, &msgs, N_BYTES_IN_BLAKE_MESSAGE);
@@ -722,11 +722,7 @@ fn init_tile(
 
 /// Updates the states of a tile (states `first_state..first_state + tile.len()` of the pass) with
 /// the columns of `pass`.
-///
-/// The message blocks here and in the other hashing loops are assembled word by word into a local
-/// array and lent to the compressor: an `array::from_fn` block is built in a temporary and moved
-/// out, which the compiler keeps as a 1 KiB copy per block, and a by-value argument copies the
-/// block (and the 512-byte state) again.
+/// Message blocks are built in place and lent, not moved (`array::from_fn` costs 1 KiB copies).
 #[inline(always)]
 fn hash_pass_tile(
     columns: &[&Col<SimdBackend, BaseField>],
@@ -802,10 +798,7 @@ fn hash_state_pair(
 }
 
 /// Stores 16 untransposed hashes: the `k`-th vector holds the hashes `2 * k` and `2 * k + 1`.
-///
-/// `dst` holds exactly the 16 hashes. Each vector is written as one `[u32; 16]` (a pair of hashes,
-/// 64 bytes) by straight-line code: eight copies of a size the compiler knows, so two 32-byte
-/// stores each, instead of a loop the compiler turns into a `memcpy` call of a staged copy.
+/// Straight-line fixed-size stores: a loop here compiles to a `memcpy` call.
 #[inline(always)]
 fn store_states(untransposed: [u32x16; N_FELTS_IN_BLAKE_STATE], dst: &mut [Blake2sHash]) {
     let dst: &mut [[u32; N_FELTS_IN_BLAKE_MESSAGE]; N_FELTS_IN_BLAKE_STATE] =

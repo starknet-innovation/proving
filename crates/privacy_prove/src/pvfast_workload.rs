@@ -36,19 +36,16 @@ pub fn setup() -> Result<()> {
 /// Prove mode. `input` is the whole prepared input; `input[witness_start..]` is the
 /// `stwo_cairo_adapter::ProverInput` JSON. Writes the version-prefixed compressed proof to `out`.
 pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out: &mut impl Write) -> Result<()> {
+    // Before this: worker start and input read, outside the proof.
+    eprintln!("pvfast-phase setup");
     // The proof runs on a worker of rayon's pool, so that its parallel steps start from inside
     // the pool instead of each being injected into it from this thread (the sequential steps,
     // the interaction writers among them, waited on every injection).
     // Freed large blocks wait for reuse while the live memory and the idle blocks take at most
-    // 3000 MiB: every phase reuses the blocks the last one freed instead of faulting in fresh pages.
-    // At StarkWare's settings the live memory stays near 1 GiB in the circuit leg, so a larger
-    // budget only kept idle blocks resident (about 2 GiB of the 3.1 GiB peak); the Cairo leg's
-    // stripe pairs (see `keep_stripe_pair`) take some of it instead.
+    // 3000 MiB (more only keeps idle blocks resident): phases reuse freed blocks, not fresh pages.
     #[cfg(unix)]
     stwo::prover::backend::simd::column::LargeBlockCache::set_idle_budget(3000 << 20);
-    // The proof runs in a pool with the stacks the deep Cairo witness writers need (see
-    // `with_witness_stack`), the default thread count: they then run on its workers instead of
-    // each starting a pool of its own, one thread per core, beside the proof's busy workers.
+    // Stacks for the deep witness writers, so they run here (see `with_witness_stack`).
     use stwo_cairo_prover::witness::witness_stack::{WITNESS_STACK_SIZE, mark_witness_stack_thread};
     let pool = rayon::ThreadPoolBuilder::new()
         .stack_size(WITNESS_STACK_SIZE)
@@ -62,10 +59,8 @@ pub fn prove(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt], out
     Ok(())
 }
 
-/// Maps in the pages of `ranges` on rayon's workers (`MADV_POPULATE_WRITE`, Linux only), 2 MiB
-/// at a time in the order a sequential writer reaches them (each range's chunks interleaved by
-/// their relative position), until `done` is set. It never reads or writes the memory, so the
-/// writer may run beside it; a page the writer reaches first is faulted in by the writer as before.
+/// Pre-faults `ranges` (`MADV_POPULATE_WRITE`, Linux only) in 2 MiB chunks, in writer order, until
+/// `done`. Never reads or writes the memory, so the writer may run beside it.
 fn populate_ahead(ranges: &[(usize, usize)], done: &std::sync::atomic::AtomicBool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -96,13 +91,20 @@ fn populate_ahead(ranges: &[(usize, usize)], done: &std::sync::atomic::AtomicBoo
 fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]) -> Result<(Vec<u8>, Vec<u8>)> {
     // The input is parsed beside the precomputes: the two are independent.
     let (precomputes, prover_input) = rayon::join(
-        || prepare_recursive_prover_precomputes().map_err(|e| anyhow!("{e}")),
-        || serde_json::from_slice::<ProverInput>(&input[witness_start..]),
+        || {
+            let precomputes = prepare_recursive_prover_precomputes().map_err(|e| anyhow!("{e}"));
+            eprintln!("pvfast-phase setup_wait");
+            precomputes
+        },
+        || {
+            let parsed = stwo_cairo_adapter::json::prover_input_from_slice(&input[witness_start..]);
+            eprintln!("pvfast-phase setup_parsed");
+            parsed
+        },
     );
     let precomputes = precomputes?;
     eprintln!("pvfast-phase cairo_leg");
-    // The Cairo leg stays below the circuit leg's peak: its heap trims are held (see `hold_trims`)
-    // and the heap is trimmed once, beside the verifier-circuit fill.
+    // Hold heap trims until the fill: the Cairo leg stays below the peak.
     #[cfg(unix)]
     stwo::prover::backend::simd::column::hold_trims(true);
     let prover_input: ProverInput = prover_input?;
@@ -143,9 +145,7 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
                         precomputes.preprocessed_circuit.n_vars,
                         &precomputes.preprocessed_circuit.gate_counts,
                     );
-                    // The fill writes its reserved values and gates on one thread, which took each
-                    // of their first-touch page faults in turn: their pages are mapped in on the
-                    // idle workers instead, ahead of the fill (see `populate_ahead`).
+                    // The fill is single-threaded: idle workers pre-fault its pages.
                     let ranges = context.reserved_ranges();
                     let done = std::sync::atomic::AtomicBool::new(false);
                     rayon::join(
@@ -165,18 +165,14 @@ fn prove_to_bytes(input: Vec<u8>, witness_start: usize, output_preimage: &[Felt]
                     .0
                 },
                 || {
-                    // The trim, which walks every arena on one thread, runs beside the pair
-                    // evaluations instead of ahead of them.
+                    // The single-threaded trim runs beside the pair evaluations.
                     rayon::join(
                         || {
                             #[cfg(unix)]
                             stwo::prover::backend::simd::column::trim_heap_now();
                         },
                         || {
-                            // The circuit composition reads the preprocessed columns on the
-                            // subdomain of twice their size: they are public, so their evaluations
-                            // there are computed here, on the workers the mostly sequential fill
-                            // leaves idle, instead of on the circuit leg's path (see `Poly::pair`).
+                            // Public columns: compute their `Poly::pair` beside the fill.
                             use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
                             let tree = &**precomputes.circuit_preprocessed_tree;
                             let twiddles: &stwo::prover::poly::twiddles::TwiddleTree<_> =
